@@ -1,0 +1,123 @@
+name: CI
+
+# One workflow. A per-repo workflow exists here only when it needs a credential,
+# a trigger, or a permission a pytest cannot have (`crucible/AGENTS.md`, the RULE
+# and not a count). Nothing here needs any of the three yet, so everything this
+# repository guards about itself is a test in `tests/`.
+#
+# This repository is PRIVATE, so these minutes are metered against the org
+# allowance. Budget: <= 5 min per PR. Keeping that true is what keeps the meter
+# immaterial — sixteen workflows per repo is how a fleet spends 66% of its
+# metered minutes on one private repo.
+#
+# NO CodeQL job, and that is a measured decision rather than an omission: code
+# scanning on a private repository requires GitHub Advanced Security, and
+# `security_and_analysis.code_security` reads `disabled` on the org's private
+# repos (measured 2026-09-13 against `nousergon/alpha-engine-config`). A CodeQL
+# workflow here would fail on every run with an entitlement error, which is
+# worse than absent — it trains the operator to merge past red. The static
+# surface this repository does gate on is `ruff` (E, F, I, UP, B) plus a
+# blocking `pip-audit` over the exported lockfile. Re-examine if GHAS is ever
+# enabled for private repos: `alpha-engine-config-I10647`.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  pull_request:
+    # EVERY base branch, not just `main`. A stacked PR targets the branch it
+    # stacks on, so `branches: [main]` means `gh pr checks` reports "no checks
+    # reported" and the PR merges unmeasured. A lane where a defect lands with
+    # no CI is worse than a slow lane (measured on crucible-PR8, 2026-09-01).
+    branches: ['**']
+    # No `paths-ignore` on `pull_request`, deliberately. GitHub records a
+    # workflow skipped by a path filter as never having started, so a docs-only
+    # PR would leave the REQUIRED check pending forever — never green, never
+    # red, and unmergeable.
+
+# Default-deny at the workflow level; the job re-grants only what it needs.
+# `contents: read` is NOT optional while this repo is private: with no
+# permissions at all the token cannot see the repository and `actions/checkout`
+# fails with "Repository not found", which reads like a missing repo rather than
+# a missing scope.
+permissions: {}
+
+concurrency:
+  # The event name is part of the group so two arms sharing a ref never cancel
+  # each other — a cancelled run is neither green nor red, which is the one
+  # outcome nothing notices.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # This name is the REQUIRED STATUS CHECK context in the `main-protection`
+    # ruleset. Renaming the job renames the context, and a required check whose
+    # context no longer exists blocks every merge with no visible cause.
+    name: lint + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # FIRST, before anything installs or runs. `uv sync --frozen` installs the
+      # locked versions WITHOUT re-checking them against `pyproject.toml`, so a
+      # dependency floor raised without regenerating the lockfile is invisible to
+      # it. `uv lock --check` is uv's own contract check and cannot be fooled.
+      #
+      # A pytest guard for this was written in `crucible` and DISCARDED, because
+      # `uv run --frozen pytest` implicitly re-locks before running — the test
+      # would rewrite the very file it was grading and report green.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
+      # --frozen, never a re-resolve. The lockfile is the supply chain: a CI run
+      # that resolves its own dependencies has not tested what ships.
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run --frozen ruff check
+
+      - name: Format check
+        run: uv run --frozen ruff format --check
+
+      # Blocking, never `continue-on-error` / `|| true`. The fleet conformance
+      # sweep fails a repo that runs pip-audit non-blocking exactly as hard as
+      # one that never runs it.
+      #
+      # `uv export` reads the locked, --frozen graph rather than re-resolving
+      # one. pip-audit is installed with bare `pip`, not `uv run --with`: it is a
+      # CI-only tool, so it belongs in neither `pyproject.toml` nor `uv.lock`,
+      # and `uv run --with` would re-resolve an environment.
+      - name: Install pip-audit
+        run: python3 -m pip install --quiet --upgrade pip pip-audit
+
+      - name: Security audit (pip-audit)
+        run: |
+          set -euo pipefail
+          uv export --frozen --no-hashes --no-editable --format requirements-txt > /tmp/requirements-audit.txt
+          IGNORE_ARGS=()
+          if [ -f .github/pip-audit-ignore.txt ]; then
+            while IFS= read -r vuln_id; do
+              IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
+            done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
+          fi
+          pip-audit -r /tmp/requirements-audit.txt "${IGNORE_ARGS[@]}"
+
+      # The blocking gate. `--cov=crucible_trader` measures the WHOLE package
+      # (`repository-baseline-policy` §4.2 C1), not just the modules this
+      # invocation happens to import — a coverage tool reporting only loaded
+      # files understates nothing untested by omitting it.
+      # `--cov-fail-under` is not passed explicitly: pytest-cov reads
+      # `[tool.coverage.report] fail_under` from `pyproject.toml` once `--cov`
+      # is passed, so the ratchet lives in exactly one place.
+      - name: Tests
+        run: uv run --frozen pytest -c pyproject.toml -q --cov=crucible_trader --cov-config=pyproject.toml --cov-report=term-missing

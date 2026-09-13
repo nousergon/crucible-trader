@@ -1,0 +1,37 @@
+# Agent instruction files are SYMLINKS into the private nous-ergon-ops repo
+# (`nous-ergon-ops/agent-instructions/crucible-trader/AGENTS.md`). This repo is
+# PRIVATE, so they could be tracked here — they are not, because one
+# installation mechanism for the whole fleet is one mechanism to maintain
+# (`link_agent_instructions.sh`), and the repo that flips the convention is the
+# repo whose instructions go stale first.
+AGENTS.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets — never committed. Config files with real values use the `.example`
+# pattern with the real file ignored. This repository holds the money path:
+# broker credentials, the account allowlist and the kill switch all live
+# behind this line.
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+ib_gateway/
+
+# Local run artifacts (the local store backend writes here by default)
+runs/
+.crucible-store/

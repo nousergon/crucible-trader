@@ -1,0 +1,12 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Fleet-tracked work
+    url: https://github.com/nousergon/alpha-engine-config/issues/new
+    about: >-
+      Everything in the alpha-engine ecosystem is tracked on alpha-engine-config,
+      including work whose code lands here. File there unless the defect is
+      confined to this repository's own code.
+  - name: Security vulnerability
+    url: https://github.com/nousergon/crucible-trader/blob/main/SECURITY.md
+    about: >-
+      This repository is on the money path. Report privately — never as an issue.

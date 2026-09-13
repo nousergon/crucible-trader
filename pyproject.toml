@@ -1,0 +1,103 @@
+[project]
+name = "crucible-trader"
+version = "0.1.0"
+description = "The trader: reads one contract, refuses an unattested champion, trades nothing without one."
+readme = "README.md"
+license = { text = "LicenseRef-Proprietary" }
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # The harness, consumed as a LIBRARY and never re-implemented. Everything
+    # this repository needs from it is a reader:
+    # `crucible.champion.read_champion` (which re-derives the producing
+    # manifest's status and raises on anything but `ok`),
+    # `crucible.serving.read_predictions_feed`, `crucible.keys`, and
+    # `crucible.explain.verify_money_path_chain`. A second implementation of any
+    # of those here would be the defect, not the deliverable
+    # (`alpha-engine-config-I10648`).
+    #
+    # Pinned by GIT SHA, not by version, and not from PyPI. Three measured
+    # reasons:
+    #   1. `crucible` is NOT published to PyPI, and the name `crucible` there
+    #      belongs to an unrelated project (mspinola/crucible 0.7.0, MIT,
+    #      checked 2026-09-13). A version pin would silently install a stranger's
+    #      package.
+    #   2. Plan §4.11 says the trader runs THE SAME WHEEL as the harness. The
+    #      wheel is built by `uv build` from a `main` sha and published to
+    #      `releases/{sha}/` in the store; a git-sha pin here resolves to the
+    #      identical tree, so what CI grades and what the box installs are the
+    #      same code.
+    #   3. A sha is the only pin that cannot move under the repository. A branch
+    #      or tag reference would make this lockfile a statement about when it
+    #      was resolved.
+    #
+    # At RUNTIME the box does not use this pin: it reads `trader/release_pin`
+    # from the store and installs the wheel at `releases/{sha}/`. It never
+    # follows `releases/current`. The two shas are required to agree, and that
+    # agreement is checked by the release-promotion path, not by this file.
+    "crucible @ git+https://github.com/nousergon/crucible@9ea4c0a32e83814a0c0b55c85094b5f060ccaf38",
+]
+
+# NO LLM dependency, and none may be added. The fleet's standing rule confines
+# LLM calls to research (`preference_llm_calls_confined_to_research_module`);
+# plan §3's harness/trader table says "Zero" in this column. The absence is the
+# control, and `alpha-engine-config/private-docs/LLM_CALLSITE_REGISTRY.yaml`
+# carries this repository's row declaring no call site.
+
+[project.urls]
+Homepage = "https://github.com/nousergon/crucible-trader"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.16.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# The `crucible` dependency is a direct git reference (see the pin's rationale
+# above), and hatchling refuses one by default. Enabled deliberately and scoped
+# to this repository: the alternative is a version pin against a PyPI name that
+# belongs to an unrelated project.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["crucible_trader"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+# `repository-baseline-policy` §4.2 C1: the denominator is the WHOLE source
+# tree, not the files a test happened to import. `source` makes coverage.py
+# report modules the suite never loaded; `omit` stays EMPTY so the scope cannot
+# be narrowed into a flattering number. Measured on symposion: 92.37% by the
+# import-only method against 34.76% truthfully — the seven untested modules
+# simply did not appear.
+source = ["crucible_trader"]
+omit = []
+
+[tool.coverage.report]
+# §4.2 C3: a RATCHET set at the measured value. Raise it when coverage improves;
+# lowering it is a policy amendment with the four delta fields, never a way to
+# make a change pass.
+fail_under = 100
+show_missing = true
+# NO line exclusions. Three rounds of independent adversarial review on
+# `nousergon/crucible` (2026-09-05, crucible-PR112) showed that every
+# regex-shaped exclusion — the coverage pragma, an anchored
+# `if TYPE_CHECKING:`, the same with a rebinding guard — can be made to exclude
+# EXECUTING code by an author. A regex over source text cannot know whether a
+# block runs. So the denominator is every statement in `crucible_trader/`.
+exclude_lines = []

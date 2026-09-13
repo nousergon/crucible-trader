@@ -1,0 +1,38 @@
+# Standard fleet Dependabot config (weekly, grouped minor+patch) —
+# `repository-baseline-policy` §4.3. Version-update PRs merge under
+# `auto-merge-policy`'s Dependabot lane, not by hand.
+version: 2
+updates:
+  # `uv`, NOT `pip`. This repository's dependencies are locked in `uv.lock` and
+  # `ci.yml` runs `uv lock --check` before anything installs. The `pip`
+  # ecosystem edits `pyproject.toml` and leaves the lockfile alone, so every
+  # version-update PR it opened would fail that step and NONE could ever merge,
+  # however green the tests were — measured on `nousergon/crucible`
+  # (crucible-PR175..179, 2026-09-09, five PRs all failing with
+  # "The lockfile at uv.lock needs to be updated, but --check was provided").
+  # Mirrored here at birth rather than rediscovered.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+      majors:
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+      majors:
+        update-types:
+          - major
