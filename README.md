@@ -42,9 +42,11 @@ second is structurally impossible:
 ## Zero LLM calls, ever
 
 The fleet's standing rule confines LLM calls to research. This repository makes
-none, has no LLM dependency, and its row in
-`alpha-engine-config/private-docs/LLM_CALLSITE_REGISTRY.yaml` declaring no call
-site is itself the control.
+none and has no LLM dependency — direct or transitive through `crucible`'s own
+optional extras. The control is the absence itself: there is no call site to
+register in `alpha-engine-config/private-docs/LLM_CALLSITE_REGISTRY.yaml`, which
+declares call sites and has no row shape for a repository that has none. Adding a
+model dependency here is a policy change, not a code change.
 
 ## Run it
 

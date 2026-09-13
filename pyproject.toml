@@ -39,9 +39,12 @@ dependencies = [
 
 # NO LLM dependency, and none may be added. The fleet's standing rule confines
 # LLM calls to research (`preference_llm_calls_confined_to_research_module`);
-# plan §3's harness/trader table says "Zero" in this column. The absence is the
-# control, and `alpha-engine-config/private-docs/LLM_CALLSITE_REGISTRY.yaml`
-# carries this repository's row declaring no call site.
+# plan §3's harness/trader table says "Zero" in this column.
+#
+# The absence IS the control. `LLM_CALLSITE_REGISTRY.yaml` declares call SITES
+# and has no row shape for a repository that has none, so there is nothing to
+# register — which is why the guarantee has to live here, on the dependency list
+# a reviewer reads, rather than in a registry that would be silent either way.
 
 [project.urls]
 Homepage = "https://github.com/nousergon/crucible-trader"
