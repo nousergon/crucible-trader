@@ -202,7 +202,7 @@ wheels = [
 [[package]]
 name = "crucible"
 version = "0.1.0"
-source = { git = "https://github.com/nousergon/crucible?rev=22f4d976be1d68ae05e9e927e165ac6e4b095a3e#22f4d976be1d68ae05e9e927e165ac6e4b095a3e" }
+source = { git = "https://github.com/nousergon/crucible?rev=d3f2020222a634ab4cb1f9989792d96474f76592#d3f2020222a634ab4cb1f9989792d96474f76592" }
 dependencies = [
     { name = "boto3" },
     { name = "cvxpy" },
@@ -232,7 +232,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "crucible", git = "https://github.com/nousergon/crucible?rev=22f4d976be1d68ae05e9e927e165ac6e4b095a3e" }]
+requires-dist = [{ name = "crucible", git = "https://github.com/nousergon/crucible?rev=d3f2020222a634ab4cb1f9989792d96474f76592" }]
 
 [package.metadata.requires-dev]
 dev = [
