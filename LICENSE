@@ -1,0 +1,16 @@
+Copyright (c) 2026 Nous Ergon. All rights reserved.
+
+This repository is PRIVATE and proprietary. No licence to use, copy, modify,
+merge, publish, distribute, sublicense or sell any part of it is granted.
+
+Why a licence file in a private repository at all — `repository-baseline-policy`
+tier C does not require one: absence of a licence and "all rights reserved" are
+the same legal position but not the same signal. An unlicensed tree reads as an
+oversight, and the day this code is read outside the org — an audit, a diligence
+request, the spin-out of the generic execution framework that
+`alpha-engine-config-I10647` names as a deferred option — the question gets asked
+at the worst possible moment.
+
+The public half of this system is `nousergon/crucible`, licensed
+AGPL-3.0-or-later. Nothing here is a copy of it: the coupling is the two contract
+documents, and `crucible` is consumed as a pinned dependency.
