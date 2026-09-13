@@ -55,7 +55,17 @@ jobs:
     # ruleset. Renaming the job renames the context, and a required check whose
     # context no longer exists blocks every merge with no visible cause.
     name: lint + tests
-    runs-on: ubuntu-latest
+    # GitHub-hosted by default; CodeBuild when the fleet has flipped
+    # `CI_RUNNER_MODE` because the included-minutes allowance is at risk
+    # (`scm-platform-policy` §4.1). This repository is PRIVATE, so its minutes
+    # are metered and the failover is not optional: `atlas` was absent from this
+    # toggle and from the runner's webhook allowlist, burned 10,818 Actions
+    # minutes in August 2026 and carried $33.15 of the $42.56 billed once the
+    # allowance ran out -- while the runner-mode guard flipped on schedule and
+    # reported success (`alpha-engine-config-I10475`). The companion half is the
+    # `REPOSITORY_NAME` allowlist on `nousergon-private-runner`, which names
+    # this repo as of the same change.
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'codebuild' && format('codebuild-nousergon-private-runner-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
