@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from crucible.keys import manifest_key
 from crucible.release import TRADER_PIN_KEY
 from crucible.serving import PredictionsFeed
 from crucible.store import LocalStore
@@ -45,13 +46,24 @@ class Router:
             self.on_send()
 
 
+def _pin_document(sha: str, *, day: str = "2026-09-05") -> dict:
+    """A schema-valid `TraderReleasePinDocument` (six fields, `crucible.release`):
+    the three-field shape this repository wrote before `alpha-engine-config-I10649`
+    is refused by `read_pointer` now that it validates strictly."""
+    return {
+        "sha": sha,
+        "target": "trader",
+        "pinned_at": "2026-09-05T22:00:00Z",
+        "smoke_run_id": "01JG0000000000000000000000",
+        "smoke_status": "ok",
+        "smoke_manifest_key": manifest_key("trader.smoke", day, discriminator=sha[:12]),
+    }
+
+
 @pytest.fixture
 def store(tmp_path):
     s = LocalStore(tmp_path)
-    s.put_bytes(
-        TRADER_PIN_KEY,
-        json.dumps({"sha": SHA, "target": "trader", "pinned_at": "2026-09-05T22:00:00Z"}).encode(),
-    )
+    s.put_bytes(TRADER_PIN_KEY, json.dumps(_pin_document(SHA)).encode())
     return s
 
 
@@ -150,12 +162,7 @@ def test_a_hold_from_an_earlier_session_has_lapsed(store) -> None:
 def test_a_wheel_disagreement_fails_the_run_before_anything(tmp_path, pin, match) -> None:
     store = LocalStore(tmp_path)
     if pin is not None:
-        store.put_bytes(
-            TRADER_PIN_KEY,
-            json.dumps(
-                {"sha": pin, "target": "trader", "pinned_at": "2026-09-05T22:00:00Z"}
-            ).encode(),
-        )
+        store.put_bytes(TRADER_PIN_KEY, json.dumps(_pin_document(pin)).encode())
     ib, router, constructed = FakeIB(), Router(), []
     with pytest.raises(RunningWheelMismatchError, match=match):
         _run(store, ib, router, constructed=constructed)
