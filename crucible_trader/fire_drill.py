@@ -18,6 +18,11 @@ switch and no drill flag the trader session can see:
 
 Whether a drill was announced is recorded ONLY in its own artifact, written after
 the fire: nothing in the trader's configuration marks the day (I10650 gotcha 2).
+An UNANNOUNCED drill fires only under a sealed schedule
+(`crucible_trader.drill_schedule`, `alpha-engine-config-I10761`): the drill opens
+the seal before it fires, refuses if the seal does not open or it is not the
+sealed instant, and its artifact reveals the instant and nonce so the harness can
+verify the claim.
 
 **The artifact** (`trader/fire_drills/{trading_day}/{run_id}.json`,
 `fire_drill.v1`) carries the instant fired, the instant the book reached
@@ -26,12 +31,11 @@ broker accepted after the fire instant that the switch did not place. `passed`
 is derived from those fields, never supplied. A drill that did not pass raises
 :class:`FireDrillFailedError`, so its manifest is `failed` -- a page.
 
-**Not done means not done.** :func:`evaluate_drills` reads the artifacts and
-returns ``done`` only for >= 2 passed drills inside the window with >= 1 of them
-unannounced. No artifacts, only failed drills, or only announced drills are all
-not-done, each with its reason. The phase-4 gate clause that reads the same
-artifacts belongs to `crucible.gate` (a contract change); this is the trader's
-own reading of its own evidence.
+**Not done means not done, and the harness says which.** `fire-drill status`
+calls `crucible.gate.kill_switch_fire_drill_reading` -- the phase-4 clause
+itself -- rather than a second count here: the trader's own count read
+`announced: false` at face value and would have said DONE where the gate says
+UNMET (`alpha-engine-config-I10761`).
 
 Drills run only inside regular NYSE hours (`krepis.trading_calendar.is_market_hours`)
 and only against a paper account; both refusals raise before any broker call.
@@ -39,7 +43,6 @@ and only against a paper account; both refusals raise before any broker call.
 
 from __future__ import annotations
 
-import dataclasses
 import datetime as dt
 import json
 from collections.abc import Callable, Iterable
@@ -49,9 +52,9 @@ from crucible.keys import TRADER_FIRE_DRILLS_PREFIX
 from crucible.keys import trader_fire_drill_key as fire_drill_key
 from crucible.runner import RunContext
 from crucible.serving import PredictionsFeed
-from crucible.store import Store
 from krepis.trading_calendar import is_market_hours
 
+from crucible_trader.drill_schedule import SealOpening, open_seal
 from crucible_trader.hold_book import enforce_hold_book
 from crucible_trader.kill_switch import BrokerControl, KillSwitchOutcome, fire, utcnow
 
@@ -65,10 +68,6 @@ METRIC_MODULE = "crucible_trader.fire_drill"
 
 DRILL_KINDS: tuple[str, ...] = ("kill_switch_flatten", "kill_switch_freeze", "hold_book")
 _KIND_MODE = {"kill_switch_flatten": "flatten", "kill_switch_freeze": "freeze"}
-
-#: Plan §9.5 entry condition 4.
-REQUIRED_PASSED = 2
-REQUIRED_UNANNOUNCED = 1
 
 #: The planted feed's champion id. Never written to the store; it names itself
 #: so a hold cause read back from the halt document is traceable to the drill.
@@ -107,12 +106,23 @@ def drill_cycle(
     broker: BrokerControl,
     kind: str,
     announced: bool,
+    seal: SealOpening | None = None,
     clock: Callable[[], dt.datetime] = utcnow,
     market_open: Callable[[dt.datetime], bool] = is_market_hours,
 ) -> dict[str, Any]:
-    """The job body: refuse, fire, record, and raise unless the drill passed."""
+    """The job body: refuse, open the seal, fire, record, and raise unless the drill passed."""
     if kind not in DRILL_KINDS:
         raise DrillRefusedError(f"drill kind {kind!r} not in {DRILL_KINDS}")
+    if announced and seal is not None:
+        raise DrillRefusedError(
+            "an announced drill was handed a seal; a seal exists only to make an unannounced "
+            "claim checkable"
+        )
+    if not announced and seal is None:
+        raise DrillRefusedError(
+            "an unannounced drill fires only under a sealed schedule (`fire-drill seal`); an "
+            "unsealed `announced: false` is a claim the gate will not count"
+        )
     now = clock()
     if not market_open(now):
         raise DrillRefusedError(
@@ -120,6 +130,7 @@ def drill_cycle(
             "switch against a live paper session; outside it, market orders queue and the "
             "drill measures the queue."
         )
+    reveal = None if seal is None else open_seal(ctx.store, seal, now=now)
     day = ctx.trading_day.isoformat()
     hold_decision: str | None = None
     if kind == "hold_book":
@@ -135,7 +146,7 @@ def drill_cycle(
         outcome = fire(ctx, broker, mode=_KIND_MODE[kind], cause=f"fire_drill:{kind}", clock=clock)
 
     document = drill_document(
-        ctx, outcome, kind=kind, announced=announced, hold_decision=hold_decision
+        ctx, outcome, kind=kind, announced=announced, hold_decision=hold_decision, schedule=reveal
     )
     key = fire_drill_key(day, ctx.run_id)
     ctx.record_output(
@@ -174,6 +185,7 @@ def drill_document(
     kind: str,
     announced: bool,
     hold_decision: str | None,
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = outcome.to_document()
     return {
@@ -193,77 +205,5 @@ def drill_document(
         "orders_accepted_after_fire": body["orders_accepted_after_fire"],
         "hold_decision": hold_decision,
         "passed": outcome.passed,
+        "schedule": schedule,
     }
-
-
-@dataclasses.dataclass(frozen=True)
-class DrillReading:
-    done: bool
-    n_passed: int
-    n_unannounced_passed: int
-    reason: str
-
-
-_REQUIRED_FIELDS = frozenset(
-    {
-        "schema_version",
-        "kind",
-        "announced",
-        "trading_day",
-        "fired_at",
-        "settled_at",
-        "settle_seconds",
-        "bound_seconds",
-        "orders_accepted_after_fire",
-        "passed",
-    }
-)
-
-
-def _drill_passed(document: dict[str, Any]) -> bool:
-    """Re-derived from the evidence fields, never trusted from `passed` alone."""
-    settle = document["settle_seconds"]
-    return (
-        document["passed"] is True
-        and document["settled_at"] is not None
-        and isinstance(settle, (int, float))
-        and settle <= document["bound_seconds"]
-        and document["orders_accepted_after_fire"] == []
-    )
-
-
-def evaluate_drills(
-    documents: Iterable[tuple[str, dict[str, Any]]], *, window_start: str, window_end: str
-) -> DrillReading:
-    """Whether the drill requirement is met inside ``[window_start, window_end]``."""
-    in_window = []
-    for key, document in documents:
-        missing = _REQUIRED_FIELDS - set(document)
-        if document.get("schema_version") != FIRE_DRILL_SCHEMA_VERSION or missing:
-            raise ValueError(
-                f"{key} is not a {FIRE_DRILL_SCHEMA_VERSION} artifact (missing {sorted(missing)})"
-            )
-        if window_start <= document["trading_day"] <= window_end:
-            in_window.append(document)
-    passed = [d for d in in_window if _drill_passed(d)]
-    unannounced = [d for d in passed if d["announced"] is False]
-    if not in_window:
-        reason = f"no fire drill artifact between {window_start} and {window_end}: undrilled"
-    else:
-        reason = (
-            f"{len(passed)}/{len(in_window)} drills passed ({REQUIRED_PASSED} required), "
-            f"{len(unannounced)} of them unannounced ({REQUIRED_UNANNOUNCED} required)"
-        )
-    done = len(passed) >= REQUIRED_PASSED and len(unannounced) >= REQUIRED_UNANNOUNCED
-    return DrillReading(done, len(passed), len(unannounced), reason)
-
-
-def read_drills(store: Store) -> list[tuple[str, dict[str, Any]]]:
-    """Every drill artifact on the store. An unreadable one raises, never skipped."""
-    out = []
-    for key in sorted(store.list_keys(FIRE_DRILL_PREFIX)):
-        try:
-            out.append((key, json.loads(store.get_bytes(key).decode("utf-8"))))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"{key} is not readable JSON: {exc}") from exc
-    return out

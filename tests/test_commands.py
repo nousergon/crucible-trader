@@ -9,11 +9,13 @@ from crucible.keys import parse_manifest_key
 from crucible.manifest import read_manifest
 from crucible.models import JOB_VALUES
 from crucible.runner import run_job
-from crucible.store import LocalStore
+from crucible.store import LocalStore, S3Store
 from ib_fakes import DAY, FakeIB, FakeSdk, environ_for
+from s3_fake import FakeS3, FakeSsm
 
 from crucible_trader import commands
 from crucible_trader.commands import main
+from crucible_trader.drill_schedule import NONCE_ENV_VAR
 from crucible_trader.fire_drill import FIRE_DRILL_JOB, fire_drill_key
 from crucible_trader.kill_switch import KILL_SWITCH_JOB, kill_switch_event_key, read_state
 
@@ -34,15 +36,33 @@ def _real_run_job_on_day(job, fn, **kwargs):
     )
 
 
-def _main(tmp_path, argv, ib=None, loader=None, **kw):
+def _main(tmp_path, argv, ib=None, loader=None, environ_extra=None, **kw):
     ib = ib or FakeIB(positions={"AAA": 4})
     return main(
         argv,
-        environ=environ_for(tmp_path),
+        environ=environ_for(tmp_path, **(environ_extra or {})),
         sdk_loader=loader or FakeSdk(ib),
         clock=ib.clock,
         **kw,
     ), ib
+
+
+def _seal_via_command(tmp_path, ib, ssm, fire_at: str) -> tuple[list[str], str]:
+    """`fire-drill seal` through `main`; returns the printed run command's argv and
+    the nonce the operator would fetch from SSM."""
+    lines: list[str] = []
+    main(
+        ["fire-drill", "seal", "--from", "2026-09-08", "--to", "2026-09-11", "--fire-at", fire_at],
+        environ=environ_for(tmp_path),
+        sdk_loader=_never_loaded,
+        clock=ib.clock,
+        printer=lines.append,
+        ssm_factory=lambda: ssm,
+    )
+    (parameter,) = list(ssm.parameters.values())
+    run = lines[0].split("fire-drill run ", 1)[1].split()
+    run[run.index("KIND")] = "kill_switch_freeze"
+    return ["fire-drill", "run", *run], parameter["Value"]
 
 
 def _only_manifest(store, job: str) -> dict:
@@ -104,18 +124,82 @@ class TestKillSwitchCommand:
 
 
 class TestFireDrillCommand:
-    def test_an_unannounced_drill_records_itself_as_unannounced(
+    def test_an_unannounced_drill_fires_under_a_seal_and_reveals_it(
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
-        rc, ib = _main(
-            tmp_path, ["fire-drill", "run", "--kind", "kill_switch_freeze", "--unannounced"]
-        )
+        ib = FakeIB(positions={"AAA": 4})
+        ssm = FakeSsm()
+        run_argv, nonce = _seal_via_command(tmp_path, ib, ssm, "2026-09-08T14:00:30Z")
+        ib.clock.advance(30)
+        rc, _ = _main(tmp_path, run_argv, ib=ib, environ_extra={NONCE_ENV_VAR: nonce})
         store = LocalStore(tmp_path)
         manifest = _only_manifest(store, FIRE_DRILL_JOB)
         artifact = json.loads(store.get_bytes(fire_drill_key(DAY.isoformat(), manifest["run_id"])))
         assert rc == 0 and artifact["announced"] is False and artifact["passed"] is True
+        assert artifact["schedule"]["nonce"] == nonce
         assert ib.disconnected == 1
+
+    @pytest.mark.parametrize(
+        ("argv", "environ_extra"),
+        [
+            pytest.param(["--unannounced"], {}, id="unannounced-without-seal-flags"),
+            pytest.param(
+                [
+                    "--unannounced",
+                    "--schedule-id",
+                    "a",
+                    "--window-from",
+                    "2026-09-08",
+                    "--window-to",
+                    "2026-09-11",
+                    "--fire-at",
+                    "2026-09-08T14:00:00Z",
+                ],
+                {},
+                id="unannounced-without-the-nonce",
+            ),
+            pytest.param(["--announced", "--schedule-id", "a"], {}, id="announced-with-a-seal"),
+        ],
+    )
+    def test_a_seal_mismatch_on_the_command_line_is_refused(
+        self, tmp_path, argv, environ_extra
+    ) -> None:
+        with pytest.raises(SystemExit):
+            _main(
+                tmp_path,
+                ["fire-drill", "run", "--kind", "kill_switch_freeze", *argv],
+                loader=_never_loaded,
+                environ_extra=environ_extra,
+            )
+
+    def test_seal_never_connects_and_never_prints_the_nonce(self, tmp_path) -> None:
+        ssm = FakeSsm()
+        lines: list[str] = []
+        rc, _ = _main(
+            tmp_path,
+            [
+                "fire-drill",
+                "seal",
+                "--from",
+                "2026-09-08",
+                "--to",
+                "2026-09-11",
+                "--fire-at",
+                "2026-09-08T15:00:00Z",
+            ],
+            loader=_never_loaded,
+            printer=lines.append,
+            ssm_factory=lambda: ssm,
+        )
+        (parameter,) = ssm.parameters.values()
+        assert rc == 0 and lines[0].startswith("SEALED ") and parameter["Value"] not in lines[0]
+
+    def test_the_default_ssm_client_is_boto3s(self, monkeypatch) -> None:
+        import boto3
+
+        monkeypatch.setattr(boto3, "client", lambda service: f"client:{service}")
+        assert commands.default_ssm_client() == "client:ssm"
 
     def test_the_drill_writes_a_schema_valid_manifest_through_the_real_runner(
         self, tmp_path, monkeypatch
@@ -147,38 +231,51 @@ class TestFireDrillCommand:
             loader=_never_loaded,
             printer=lines.append,
         )
-        assert rc == 1 and lines[0].startswith("NOT DONE: no fire drill artifact")
+        assert rc == 1 and lines[0].startswith("NOT DONE:") and "undrilled" in lines[0]
 
-    def test_status_is_done_after_two_passing_drills_one_unannounced(
+    def test_status_is_the_gates_reading_done_only_on_a_sealed_unannounced_drill(
         self, tmp_path, monkeypatch
     ) -> None:
-        store = LocalStore(tmp_path)
-        for run_id, announced in (("r1", True), ("r2", False)):
-            store.put_bytes(
-                fire_drill_key("2026-09-08", run_id),
-                json.dumps(
-                    {
-                        "schema_version": "fire_drill.v1",
-                        "kind": "kill_switch_flatten",
-                        "announced": announced,
-                        "trading_day": "2026-09-08",
-                        "fired_at": "a",
-                        "settled_at": "b",
-                        "settle_seconds": 2.0,
-                        "bound_seconds": 300.0,
-                        "orders_accepted_after_fire": [],
-                        "passed": True,
-                    }
-                ).encode(),
-            )
-        lines = []
+        """End to end through the real runner and the harness's own clause, over an
+        S3Store (the seal's write time is the store's `LastModified`)."""
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        ib = FakeIB(positions={"AAA": 4})
+        s3 = S3Store("a-test-store", "crucible", client=FakeS3(now=ib.clock))
+        monkeypatch.setattr(commands, "open_configured_store", lambda settings: s3)
+        status = ["fire-drill", "status", "--from", "2026-09-01", "--to", "2026-09-30"]
+
+        lines: list[str] = []
+        _main(tmp_path, ["fire-drill", "run", "--kind", "kill_switch_freeze", "--announced"], ib=ib)
+        rc, _ = _main(tmp_path, status, loader=_never_loaded, printer=lines.append)
+        assert rc == 1 and "0 unannounced" in lines[0], lines
+
+        ib.clock.advance(5)
+        run_argv, nonce = _seal_via_command(tmp_path, ib, FakeSsm(), "2026-09-08T14:01:00Z")
+        ib.clock.advance(55)
+        run_argv[run_argv.index("--kind") + 1] = "kill_switch_flatten"
+        _main(tmp_path, run_argv, ib=ib, environ_extra={NONCE_ENV_VAR: nonce})
+
+        rc, _ = _main(tmp_path, status, loader=_never_loaded, printer=lines.append)
+        assert rc == 0 and lines[-1].startswith("DONE:") and "1 unannounced" in lines[-1], lines
+
+    def test_status_says_unmeasurable_when_the_store_cannot_be_listed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        class Unlistable(LocalStore):
+            def list_keys(self, prefix=""):
+                raise PermissionError("AccessDenied")
+
+        monkeypatch.setattr(
+            commands, "open_configured_store", lambda settings: Unlistable(tmp_path)
+        )
+        lines: list[str] = []
         rc, _ = _main(
             tmp_path,
             ["fire-drill", "status", "--from", "2026-09-01", "--to", "2026-09-30"],
             loader=_never_loaded,
             printer=lines.append,
         )
-        assert rc == 0 and lines[0].startswith("DONE")
+        assert rc == 1 and lines[0].startswith("UNMEASURABLE:")
 
 
 def test_the_store_comes_from_the_process_environment_by_default(tmp_path, monkeypatch) -> None:
@@ -190,3 +287,32 @@ def test_the_store_comes_from_the_process_environment_by_default(tmp_path, monke
         printer=printed.append,
     )
     assert rc == 1 and printed
+
+
+def test_a_drill_reads_its_nonce_from_the_process_environment_by_default(
+    tmp_path, monkeypatch
+) -> None:
+    for var, value in environ_for(tmp_path).items():
+        monkeypatch.setenv(var, value)
+    monkeypatch.delenv(NONCE_ENV_VAR, raising=False)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "fire-drill",
+                "run",
+                "--kind",
+                "kill_switch_freeze",
+                *[
+                    "--unannounced",
+                    "--schedule-id",
+                    "a",
+                    "--window-from",
+                    "2026-09-08",
+                    "--window-to",
+                    "2026-09-11",
+                    "--fire-at",
+                    "2026-09-08T14:00:00Z",
+                ],
+            ],
+            sdk_loader=_never_loaded,
+        )
