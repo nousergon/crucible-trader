@@ -90,9 +90,7 @@ class TestKillSwitchCommand:
         `crucible.manifest.read_manifest`, never a fake."""
         assert KILL_SWITCH_JOB in JOB_VALUES
         monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
-        rc, _ = _main(
-            tmp_path, ["kill-switch", "fire", "--mode", "freeze", "--cause", "incident"]
-        )
+        rc, _ = _main(tmp_path, ["kill-switch", "fire", "--mode", "freeze", "--cause", "incident"])
         store = LocalStore(tmp_path)
         assert rc == 0
         manifest = _only_manifest(store, KILL_SWITCH_JOB)

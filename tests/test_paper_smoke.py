@@ -84,9 +84,7 @@ class TestPinDisagreementPageCondition:
                     "pinned_at": "2026-09-05T22:00:00Z",
                     "smoke_run_id": "01JG0000000000000000000000",
                     "smoke_status": "ok",
-                    "smoke_manifest_key": manifest_key(
-                        "trader.smoke", day, discriminator=sha[:12]
-                    ),
+                    "smoke_manifest_key": manifest_key("trader.smoke", day, discriminator=sha[:12]),
                 }
             ).encode(),
         )
