@@ -113,7 +113,7 @@ jobs:
       - name: Security audit (pip-audit)
         run: |
           set -euo pipefail
-          uv export --frozen --no-hashes --no-editable --format requirements-txt > /tmp/requirements-audit.txt
+          uv export --frozen --all-extras --no-hashes --no-editable --format requirements-txt > /tmp/requirements-audit.txt
           IGNORE_ARGS=()
           if [ -f .github/pip-audit-ignore.txt ]; then
             while IFS= read -r vuln_id; do

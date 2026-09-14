@@ -8,6 +8,18 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "aeventkit"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5c/8c/c08db1a1910f8d04ec6a524de522edd0bac181bdf94dbb01183f7685cd77/aeventkit-2.1.0.tar.gz", hash = "sha256:4e7d81bb0a67227121da50a23e19e5bbf13eded541a9f4857eeb6b7b857b738a", size = 24703, upload-time = "2025-06-22T15:54:03.961Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/8c/2a4b912b1afa201b25bdd0f5bccf96d5a8b5dccb6131316a8dd2d9cabcc1/aeventkit-2.1.0-py3-none-any.whl", hash = "sha256:962d43f79e731ac43527f2d0defeed118e6dbaa85f1487f5667540ebb8f00729", size = 26678, upload-time = "2025-06-22T15:54:02.141Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -225,6 +237,11 @@ dependencies = [
     { name = "crucible" },
 ]
 
+[package.optional-dependencies]
+ib = [
+    { name = "ib-async" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -233,7 +250,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "crucible", git = "https://github.com/nousergon/crucible?rev=3ce5b7137fc182871fa58c932c22c76e5f742c6a" }]
+requires-dist = [
+    { name = "crucible", git = "https://github.com/nousergon/crucible?rev=3ce5b7137fc182871fa58c932c22c76e5f742c6a" },
+    { name = "ib-async", marker = "extra == 'ib'", specifier = "==2.1.0" },
+]
+provides-extras = ["ib"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -369,6 +390,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cd/c4/0e5636363151a2a1795e0a77617168b9ca438e1748ec05fc9b5687f93d64/httpx2_jsfetch-1.0.tar.gz", hash = "sha256:70a0e3eabfef7cce5ad9c629f7d01ca05e418f586646f4ddf14782e4c1454c60", size = 6872, upload-time = "2026-08-07T00:13:07.492Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/43/832f631d32e4f1211caa2ba368317739fe71f0b8530e4c9d15dc454bac2a/httpx2_jsfetch-1.0-py3-none-any.whl", hash = "sha256:cb916b707601e69a07721aabc8f3f6659be3a6893bc1ff5c6f9e02241df2da32", size = 6382, upload-time = "2026-08-07T00:13:06.567Z" },
+]
+
+[[package]]
+name = "ib-async"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aeventkit" },
+    { name = "nest-asyncio" },
+    { name = "tzdata" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/30/4d/dfc1da8224c3ffcdcd668da7283c4e5f14239a07f83ea66af99700296fc3/ib_async-2.1.0.tar.gz", hash = "sha256:6a03a87d6c06acacb0217a5bea60a8a168ecd5b5a7e86e1c73678d5b48cbc796", size = 87678, upload-time = "2025-12-08T01:42:32.004Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/80/e7/8f33801788c66f15e9250957ff7f53a8000843f79af1a3ed7a96def0e96b/ib_async-2.1.0-py3-none-any.whl", hash = "sha256:f6d8b991bdbd6dd38e700c61b3dced06ebe0f14be4e5263e2ef10ba10b88d434", size = 88876, upload-time = "2025-12-08T01:42:30.883Z" },
 ]
 
 [[package]]
@@ -539,6 +574,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/35/68/5351e34623d253423240ea7de3f8fc74fa8ab14b1ab3c0ec4ac8997413c9/narwhals-2.26.0.tar.gz", hash = "sha256:6b9cadca82f375c7e4cf584fdc86ca25da54827307a9c58f94547ee6104b82dd", size = 686970, upload-time = "2026-09-08T13:32:08.964Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/40/b5/1b84b2c784db76d69442334bc8b8748c840f13ca53be086f4f250ad4a0bc/narwhals-2.26.0-py3-none-any.whl", hash = "sha256:29326d74f107c347fd1009bd58e38d9f7c7c5b51e6de97bc93dbc325d9038b54", size = 474034, upload-time = "2026-09-08T13:32:07.159Z" },
+]
+
+[[package]]
+name = "nest-asyncio"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/83/f8/51569ac65d696c8ecbee95938f89d4abf00f47d58d48f6fbabfe8f0baefe/nest_asyncio-1.6.0.tar.gz", hash = "sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe", size = 7418, upload-time = "2024-01-21T14:25:19.227Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/c4/c2971a3ba4c6103a3d10c4b0f24f461ddc027f0f09763220cf35ca1401b3/nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c", size = 5195, upload-time = "2024-01-21T14:25:17.223Z" },
 ]
 
 [[package]]
@@ -1030,11 +1074,11 @@ wheels = [
 
 [[package]]
 name = "tzdata"
-version = "2026.4"
+version = "2025.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e4/31/3d74fa778a63b98b7374323befcc0be5ab3bd94afd4096a0124e7379152c/tzdata-2026.4.tar.gz", hash = "sha256:f1b8bd365d8d210c55353f4d7f8d6d8561c0ba50d704b700d195a9424bba0d79", size = 199350, upload-time = "2026-09-12T12:56:03.251Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/a7/c202b344c5ca7daf398f3b8a477eeb205cf3b6f32e7ec3a6bac0629ca975/tzdata-2025.3.tar.gz", hash = "sha256:de39c2ca5dc7b0344f2eba86f49d614019d29f060fc4ebc8a417896a620b56a7", size = 196772, upload-time = "2025-12-13T17:45:35.667Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f9/bc/8737e8d54cf51106118039b83f485a4783112fab49ea9d044b234978a46e/tzdata-2026.4-py2.py3-none-any.whl", hash = "sha256:c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81", size = 347494, upload-time = "2026-09-12T12:56:01.67Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/b0/003792df09decd6849a5e39c28b513c06e84436a54440380862b5aeff25d/tzdata-2025.3-py2.py3-none-any.whl", hash = "sha256:06a47e5700f3081aab02b2e513160914ff0694bce9947d6b76ebd6bf57cfc5d1", size = 348521, upload-time = "2025-12-13T17:45:33.889Z" },
 ]
 
 [[package]]
