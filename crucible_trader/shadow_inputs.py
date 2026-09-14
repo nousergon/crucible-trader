@@ -1,0 +1,124 @@
+"""Each registered S arm's shadow-book session, resolved from the store.
+
+The remaining deliverable of `alpha-engine-config-I10653`: `run_shadow_books`
+takes each arm's `ArmSessionInputs` already assembled, and this module
+assembles them the way the S grade does — through
+`crucible.slots.inputs.resolve_strategy_sessions`, over the arm's own recorded
+`session_inputs.v1` document for the decision day, joined onto the session it
+was held through. So a shadow book is constructed on the grade's inputs by the
+grade's engine, and the paper P&L it reports is the same object the grade
+scores (`alpha-engine-config-I10654`).
+
+**Fills at close.** The decision day's book is held through its successor
+session; advancing it needs the panel compiled for that successor. Run it
+after the successor's close, with ``as_of`` = that successor.
+
+**No active arm is silently dropped** (`alpha-engine-config-I10636`). An arm
+whose inputs cannot be resolved comes back in ``unresolved`` with the reason,
+and `run_shadow_books` records it as a failed book naming that reason.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Mapping
+
+from crucible.portfolio import load_portfolio_params_from_store
+from crucible.slots.arms import read_register
+from crucible.slots.inputs import SlotUnservableError, resolve_strategy_sessions
+from crucible.slots.strategy import RegisteredStrategyArm, load_strategy_slot
+from crucible.store import Store
+
+from crucible_trader.shadow_books import ArmSessionInputs
+
+__all__ = ["ResolvedShadowInputs", "resolve_shadow_inputs"]
+
+SLOT = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedShadowInputs:
+    """Every active arm, either resolved or unresolved with its reason — never absent."""
+
+    decision_day: str
+    as_of: str
+    active_arms: tuple[str, ...]
+    inputs: Mapping[str, ArmSessionInputs]
+    unresolved: Mapping[str, str]
+
+
+def _registered_by_id(store: Store, today: str) -> tuple[dict[str, RegisteredStrategyArm], str]:
+    try:
+        loaded = load_strategy_slot(store=store, register=read_register(store, SLOT), today=today)
+    except SlotUnservableError as exc:
+        return {}, f"the S slot is unservable: every filed recipe is refused ({exc})"
+    refused = ", ".join(f"{r.arm}: {r.reason}" for r in loaded.refused) or "none"
+    return {arm.arm_id: arm for arm in loaded.registered}, f"refused recipes: {refused}"
+
+
+def resolve_shadow_inputs(
+    store: Store,
+    *,
+    decision_day: str,
+    as_of: str,
+    feature_version: str | None = None,
+) -> ResolvedShadowInputs:
+    """Resolve ``decision_day``'s session for every ACTIVE arm in the S register."""
+    active = tuple(read_register(store, SLOT).active_arms())
+    registered, load_note = _registered_by_id(store, decision_day)
+    inputs: dict[str, ArmSessionInputs] = {}
+    unresolved: dict[str, str] = {}
+    params = None
+    params_error: str | None = None
+    if active:
+        try:
+            params = load_portfolio_params_from_store(SLOT, store=store)
+        except Exception as exc:
+            # Failure mode swallowed: the slot's parameter set is unusable, which
+            # fails EVERY arm's book. Recording surface: each active arm's
+            # `unresolved` reason -> a failed book in shadow_books.v1, and
+            # ShadowBookFailure raised by run_shadow_books after writing.
+            params_error = f"{type(exc).__name__}: {exc}"
+    for arm_id in active:
+        arm = registered.get(arm_id)
+        if arm is None:
+            unresolved[arm_id] = (
+                f"{arm_id} is active in the S register but no filed recipe registers it on "
+                f"{decision_day} ({load_note})"
+            )
+            continue
+        if params is None:
+            unresolved[arm_id] = f"the S portfolio parameter set is unusable: {params_error}"
+            continue
+        try:
+            resolved = resolve_strategy_sessions(
+                store,
+                arm_id=arm_id,
+                benchmark=arm.recipe.benchmark,
+                decision_days=[decision_day],
+                as_of=as_of,
+                feature_version=feature_version,
+            )
+        except Exception as exc:
+            # Failure mode swallowed: one arm's inputs are unresolvable (no
+            # recorded session, no settled successor, a misfiled document).
+            # Recording surface: the arm's `unresolved` reason -> its failed book
+            # in shadow_books.v1, and ShadowBookFailure after the write — so one
+            # arm cannot hide the others' books and the run still exits non-zero.
+            unresolved[arm_id] = f"{type(exc).__name__}: {exc}"
+            continue
+        (session,) = resolved.sessions
+        inputs[arm_id] = ArmSessionInputs(
+            recipe=arm.recipe,
+            params=params,
+            universe=resolved.universe,
+            session=session,
+            portfolio_notional=params.book_notional_usd,
+        )
+    return ResolvedShadowInputs(
+        decision_day=decision_day,
+        as_of=as_of,
+        active_arms=active,
+        inputs=inputs,
+        unresolved=unresolved,
+    )

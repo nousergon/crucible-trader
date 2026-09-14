@@ -259,15 +259,21 @@ def run_shadow_books(
     inputs: Mapping[str, ArmSessionInputs],
     now: dt.datetime,
     slot: str = "s",
+    unresolved: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Advance a book for every ACTIVE arm in ``slot``'s register, write, then refuse failures.
 
     Every active arm gets an entry: advanced, or failed with its reason. Inputs
     for an arm the register does not list as active are refused — a book for
     an unregistered arm is not a challenger's evidence.
+
+    ``unresolved`` carries, per arm, why its inputs could not be assembled
+    (`crucible_trader.shadow_inputs.resolve_shadow_inputs`); that reason becomes
+    the failed book's `failure_reason` instead of a generic absence.
     """
+    unresolved = dict(unresolved or {})
     active = list(read_register(store, slot).active_arms())
-    stray = sorted(set(inputs) - set(active))
+    stray = sorted((set(inputs) | set(unresolved)) - set(active))
     if stray:
         raise ValueError(
             f"inputs supplied for {stray}, which the {slot!r} register does not list as "
@@ -279,7 +285,11 @@ def run_shadow_books(
         arm_inputs = inputs.get(arm_id)
         if arm_inputs is None:
             books.append(
-                _failed(arm_id, f"no session inputs were assembled for {arm_id} on {trading_day}")
+                _failed(
+                    arm_id,
+                    unresolved.get(arm_id)
+                    or f"no session inputs were assembled for {arm_id} on {trading_day}",
+                )
             )
             continue
         try:
