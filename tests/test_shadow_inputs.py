@@ -12,10 +12,12 @@ import datetime as dt
 import json
 
 import pytest
-from conftest import AS_OF, NEXT, recipe_yaml, remove
+from conftest import AS_OF, D_PREV, NEXT, TICKERS, recipe_yaml, remove
 from crucible.execution import shadow_books_key, validate_shadow_books
 from crucible.keys import strategy_arm_key, strategy_slot_key
-from crucible.slots.strategy import construct_book
+from crucible.portfolio import load_portfolio_params_from_store
+from crucible.slots.inputs import resolve_strategy_sessions
+from crucible.slots.strategy import construct_book, load_strategy_slot
 
 from crucible_trader.construction import initial_weights
 from crucible_trader.shadow_books import ShadowBookFailure, run_shadow_books
@@ -26,7 +28,9 @@ DAY = AS_OF.isoformat()
 
 
 def _resolve(world):
-    return resolve_shadow_inputs(world.store, decision_day=DAY, as_of=NEXT.isoformat())
+    return resolve_shadow_inputs(
+        world.store, decision_day=DAY, as_of=NEXT.isoformat(), previous_trading_day=None
+    )
 
 
 class TestEveryActiveArmIsResolvedFromTheStore:
@@ -123,5 +127,102 @@ class TestEveryActiveArmIsResolvedFromTheStore:
                 previous_trading_day=None,
                 inputs={},
                 unresolved={"s:stranger:000000000000": "nope"},
+                now=NOW,
+            )
+
+
+class TestAHeldNameTheMChampionStopsPricingIsExited:
+    """`alpha-engine-config-I10754` for shadow books: the book advanced through
+    D_PREV holds a name the M champion stops pricing on DAY. Its DAY session is
+    resolved with that held name, the book sells it, charged, and matches the
+    settled grade walk over [D_PREV, DAY] from cash."""
+
+    def _advance_d_prev(self, world):
+        world.register([world.arm_id])
+        world.record_session(world.arm_id, D_PREV)
+        first = resolve_shadow_inputs(
+            world.store,
+            decision_day=D_PREV.isoformat(),
+            as_of=DAY,
+            previous_trading_day=None,
+        )
+        document = run_shadow_books(
+            world.store,
+            trading_day=D_PREV.isoformat(),
+            previous_trading_day=None,
+            inputs=first.inputs,
+            unresolved=first.unresolved,
+            now=NOW,
+        )
+        (book,) = document["books"]
+        held = {t: w for t, w in book["weights"].items() if w != 0.0 and t in TICKERS}
+        assert held, "the fixture's first book holds no name; nothing can leave the universe"
+        dropped = max(held, key=held.get)
+        world.drop_prediction(AS_OF, dropped)
+        world.record_session(world.arm_id, AS_OF)
+        return book, dropped
+
+    def test_the_dropped_name_is_exited_charged_and_equals_the_grade_walk(self, world) -> None:
+        first, dropped = self._advance_d_prev(world)
+        resolved = resolve_shadow_inputs(
+            world.store,
+            decision_day=DAY,
+            as_of=NEXT.isoformat(),
+            previous_trading_day=D_PREV.isoformat(),
+        )
+        assert dropped in resolved.inputs[world.arm_id].universe.tickers
+        document = run_shadow_books(
+            world.store,
+            trading_day=DAY,
+            previous_trading_day=D_PREV.isoformat(),
+            inputs=resolved.inputs,
+            unresolved=resolved.unresolved,
+            now=NOW,
+        )
+        (book,) = document["books"]
+        assert book["status"] == "advanced" and book["days_advanced"] == [D_PREV.isoformat(), DAY]
+        assert book["weights"][dropped] < first["weights"][dropped], "the dropped name was not sold"
+        assert book["weights"][dropped] == 0.0
+        assert book["cost_bps"] > 0.0
+
+        recipe = next(
+            arm.recipe
+            for arm in load_strategy_slot(store=world.store).registered
+            if arm.arm_id == world.arm_id
+        )
+        params = load_portfolio_params_from_store("s", store=world.store)
+        walk = resolve_strategy_sessions(
+            world.store,
+            arm_id=world.arm_id,
+            benchmark=recipe.benchmark,
+            decision_days=[D_PREV.isoformat(), DAY],
+            as_of=NEXT.isoformat(),
+        )
+        graded = construct_book(
+            recipe=recipe,
+            params=params,
+            universe=walk.universe,
+            sessions=walk.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=initial_weights(walk.universe),
+        )
+        assert tuple(book["weights"]) == walk.universe.tickers
+        assert tuple(book["weights"].values()) == graded.weights[1]
+        assert book["cost_bps"] == graded.book.cost_bps[1]
+        assert book["gross_return_ratio"] == graded.book.portfolio_returns[1]
+
+    def test_resolving_without_the_previous_book_is_a_recorded_failed_book(self, world) -> None:
+        _first, dropped = self._advance_d_prev(world)
+        resolved = resolve_shadow_inputs(
+            world.store, decision_day=DAY, as_of=NEXT.isoformat(), previous_trading_day=None
+        )
+        assert dropped not in resolved.inputs[world.arm_id].universe.tickers
+        with pytest.raises(ShadowBookFailure, match=f"holds \\['{dropped}'\\]"):
+            run_shadow_books(
+                world.store,
+                trading_day=DAY,
+                previous_trading_day=D_PREV.isoformat(),
+                inputs=resolved.inputs,
+                unresolved=resolved.unresolved,
                 now=NOW,
             )

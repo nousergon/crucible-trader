@@ -197,11 +197,32 @@ class TestTheBookAdvances:
         with pytest.raises(ValueError, match="its own last ADVANCED state"):
             advance_book(arm_id="s:x:2", inputs=_inputs(day=DAY2), previous=first)
 
-    def test_a_universe_that_changed_shape_is_refused(self) -> None:
+    def test_a_non_zero_held_name_outside_the_universe_is_refused(self) -> None:
         first = advance_book(arm_id="s:x:1", inputs=_inputs(), previous=None)
-        first = {**first, "weights": {"AAA": 1.0}}
-        with pytest.raises(ValueError, match="changed shape"):
+        first = {**first, "weights": {**first["weights"], "ZZZ": 0.1}}
+        with pytest.raises(ValueError, match=r"holds \['ZZZ'\].*does not contain"):
             advance_book(arm_id="s:x:1", inputs=_inputs(day=DAY2), previous=first)
+
+    def test_zero_weight_names_outside_and_new_names_inside_the_universe_advance(self) -> None:
+        """Only the non-zero support must be in the universe (I10754): a name the
+        book no longer holds may leave, and a name it never held enters at 0."""
+        first = advance_book(arm_id="s:x:1", inputs=_inputs(), previous=None)
+        carried = {t: w for t, w in first["weights"].items() if t != "BBB"}
+        carried["GONE"] = 0.0
+        second = advance_book(
+            arm_id="s:x:1", inputs=_inputs(day=DAY2), previous={**first, "weights": carried}
+        )
+        assert set(second["weights"]) == set(_universe().tickers)
+        w_prev = np.array([carried.get(t, 0.0) for t in _universe().tickers])
+        direct = construct_book(
+            recipe=_recipe(IMPACT),
+            params=_params(),
+            universe=_universe(),
+            sessions=[_session(DAY2)],
+            portfolio_notional=NOTIONAL,
+            w_initial=w_prev,
+        )
+        assert tuple(second["weights"].values()) == direct.weights[0]
 
     def test_a_book_with_no_per_session_cost_is_refused(self, monkeypatch) -> None:
         real = shadow_module.construct_book

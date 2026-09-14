@@ -30,6 +30,15 @@ recorded under a champion that has since been demoted is refused, not traded.
 (`alpha-engine-config-I10503`). That raise propagates: no ADV at trade time is a
 refusal to size, never a cheaper charge.
 
+**A held name the M champion stopped pricing is EXITED, not refused**
+(`alpha-engine-config-I10754`, crucible-PR298). The book held into the session
+is handed to the resolver as ``held_tickers`` (its non-zero, non-sentinel
+names); each enters the universe ineligible with alpha 0, so the engine's
+ineligibility pin sells it and the recipe's cost model charges the sale — the
+same book the settled grade walk constructs for that day. A held name the price
+panel has no return for raises `MissingArtifactError` in the resolver (a hold:
+an exit with no price is not a fillable trade).
+
 **What this returns** is the target book and the `portfolio_construction.v1`
 evidence the engine produced beside it, plus that evidence as a `MetricRecord`
 (`crucible.portfolio.portfolio_metric_record`) — the record the grading
@@ -57,6 +66,7 @@ from crucible.slots.arms import read_register
 from crucible.slots.cycle import MissingArtifactError
 from crucible.slots.inputs import SlotUnservableError, resolve_strategy_sessions
 from crucible.slots.strategy import (
+    CASH_TICKER,
     BookUniverse,
     RegisteredStrategyArm,
     ResolvedSession,
@@ -71,6 +81,7 @@ __all__ = [
     "STRATEGY_SLOT",
     "TargetBook",
     "construct_target_book",
+    "held_tickers",
     "initial_weights",
     "resolve_strategy_arm",
 ]
@@ -160,6 +171,15 @@ def _assert_session_names_the_attested_champions(
         )
 
 
+def held_tickers(previous: Mapping[str, float] | None, *, benchmark: str) -> list[str]:
+    """The book's non-zero support, sentinels (benchmark, cash) excluded — exactly
+    what `resolve_strategy_sessions(held_tickers=...)` is specified to take: a
+    zero-weight name would add a column the grade's universe does not have."""
+    if previous is None:
+        return []
+    return sorted(t for t, w in previous.items() if w != 0.0 and t not in {benchmark, CASH_TICKER})
+
+
 def _previous_weights(
     universe: BookUniverse, previous: Mapping[str, float] | None, *, trading_day: str
 ) -> np.ndarray:
@@ -169,9 +189,10 @@ def _previous_weights(
     if unseen:
         raise ContractRefusal(
             f"the book held into {trading_day} carries {unseen}, which the session's universe "
-            "does not contain. The engine cannot see a name it is not given, so it could "
-            "neither size nor price the trade that exits it; constructing anyway would "
-            "report a book that is not the one held."
+            "does not contain although they were passed to the resolver as held names. The "
+            "engine cannot see a name it is not given, so it could neither size nor price "
+            "the trade that exits it; constructing anyway would report a book that is not "
+            "the one held."
         )
     return np.array([float(previous.get(t, 0.0)) for t in universe.tickers], dtype=np.float64)
 
@@ -211,6 +232,7 @@ def construct_target_book(
             as_of=trading_day,
             feature_version=feature_version,
             unsettled_last=True,
+            held_tickers=held_tickers(previous_weights, benchmark=arm.recipe.benchmark),
         )
     except MissingArtifactError as exc:
         raise ContractUnavailable(

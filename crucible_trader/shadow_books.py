@@ -120,13 +120,16 @@ def advance_book(
                 "a book advances only from its own last ADVANCED state"
             )
         held = previous["weights"]
-        if set(held) != set(universe.tickers):
+        unseen = sorted(t for t, w in held.items() if w != 0.0 and t not in universe.tickers)
+        if unseen:
             raise ValueError(
-                f"{arm_id}: previous weights cover {sorted(held)} but the universe is "
-                f"{sorted(universe.tickers)}; a book whose names changed shape mid-walk makes "
-                "the turnover between the two weight vectors meaningless"
+                f"{arm_id}: the book holds {unseen}, which the session's universe "
+                f"{sorted(universe.tickers)} does not contain. Held names are passed to the "
+                "resolver (`resolve_shadow_inputs`) so a name the M champion stopped pricing "
+                "enters as a forced exit; a universe without it could neither size nor "
+                "charge that exit (alpha-engine-config-I10754)"
             )
-        w_prev = np.array([float(held[t]) for t in universe.tickers], dtype=np.float64)
+        w_prev = np.array([float(held.get(t, 0.0)) for t in universe.tickers], dtype=np.float64)
         inception = str(previous["inception_trading_day"])
         days = list(previous["days_advanced"])
         cumulative = float(previous["cumulative_net_return_ratio"])

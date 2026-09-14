@@ -13,6 +13,13 @@ scores (`alpha-engine-config-I10654`).
 session; advancing it needs the panel compiled for that successor. Run it
 after the successor's close, with ``as_of`` = that successor.
 
+**Held names are exited, not refused** (`alpha-engine-config-I10754`). Each
+arm's book advanced through ``previous_trading_day`` is read back
+(`read_previous_books`, the read `run_shadow_books` advances from) and its
+non-zero, non-sentinel names are passed to the resolver as ``held_tickers``, so
+a name that arm's session did not price enters its universe as a forced exit
+charged by the recipe's cost model — the book the settled grade walk builds.
+
 **No active arm is silently dropped** (`alpha-engine-config-I10636`). An arm
 whose inputs cannot be resolved comes back in ``unresolved`` with the reason,
 and `run_shadow_books` records it as a failed book naming that reason.
@@ -29,7 +36,8 @@ from crucible.slots.inputs import SlotUnservableError, resolve_strategy_sessions
 from crucible.slots.strategy import RegisteredStrategyArm, load_strategy_slot
 from crucible.store import Store
 
-from crucible_trader.shadow_books import ArmSessionInputs
+from crucible_trader.construction import held_tickers
+from crucible_trader.shadow_books import ArmSessionInputs, read_previous_books
 
 __all__ = ["ResolvedShadowInputs", "resolve_shadow_inputs"]
 
@@ -61,10 +69,17 @@ def resolve_shadow_inputs(
     *,
     decision_day: str,
     as_of: str,
+    previous_trading_day: str | None,
     feature_version: str | None = None,
 ) -> ResolvedShadowInputs:
-    """Resolve ``decision_day``'s session for every ACTIVE arm in the S register."""
+    """Resolve ``decision_day``'s session for every ACTIVE arm in the S register.
+
+    ``previous_trading_day`` is the session whose `shadow_books.v1` document the
+    books advance from — the same value handed to `run_shadow_books` — or None
+    at inception. It is required so a caller cannot silently omit the held names.
+    """
     active = tuple(read_register(store, SLOT).active_arms())
+    previous = read_previous_books(store, previous_trading_day) if active else {}
     registered, load_note = _registered_by_id(store, decision_day)
     inputs: dict[str, ArmSessionInputs] = {}
     unresolved: dict[str, str] = {}
@@ -98,6 +113,10 @@ def resolve_shadow_inputs(
                 decision_days=[decision_day],
                 as_of=as_of,
                 feature_version=feature_version,
+                held_tickers=held_tickers(
+                    previous[arm_id]["weights"] if arm_id in previous else None,
+                    benchmark=arm.recipe.benchmark,
+                ),
             )
         except Exception as exc:
             # Failure mode swallowed: one arm's inputs are unresolvable (no

@@ -7,11 +7,12 @@ import json
 
 import crucible.release
 import pytest
-from crucible.manifest import ManifestValidationError
+from crucible.manifest import read_manifest
 from crucible.models import JOB_VALUES, MetricRecordRow
-from crucible.release import TRADER_PIN_KEY
+from crucible.release import TRADER_PIN_KEY, passing_trader_smoke
+from crucible.runner import run_job
 from crucible.store import LocalStore
-from ib_fakes import DAY, FakeIB, FakeSdk, ctx_for, environ_for, fake_run_job
+from ib_fakes import DAY, FakeIB, FakeSdk, ctx_for, environ_for
 
 from crucible_trader import paper_smoke
 from crucible_trader.broker_session import BrokerSessionUnavailableError, OrderRefusedError
@@ -30,6 +31,17 @@ from crucible_trader.paper_smoke import (
 )
 
 SHA = "c" * 40
+
+
+def _real_run_job_on_day(job, fn, **kwargs):
+    """The harness's real runner, with the trading day pinned so a test never
+    grades against the wall clock (`main` takes no day), and the run mode
+    declared where the caller left it to the environment."""
+    return run_job(
+        job, fn, **{**kwargs, "trading_day": DAY, "run_mode": kwargs.get("run_mode") or "live"}
+    )
+
+
 VERSION = f"0.1.0+g{'c' * 12}"
 
 
@@ -129,28 +141,29 @@ class TestSmokeCycle:
 
 
 class TestRunSmoke:
-    def test_the_manifest_contract_does_not_yet_admit_this_job(self, store) -> None:
-        assert TRADER_SMOKE_JOB not in JOB_VALUES, (
-            "crucible now admits trader.smoke: bump the pin, delete this test, and assert "
-            "run_smoke writes a valid runs/trader.smoke/{day}/{sha12}/run.json"
-        )
+    def test_writes_a_schema_valid_manifest_the_trader_pin_selects(self, store) -> None:
+        assert TRADER_SMOKE_JOB in JOB_VALUES
         ib = FakeIB(positions={"AAA": 1})
-        with pytest.raises(ManifestValidationError, match="job"):
-            run_smoke(
-                store,
-                SHA,
-                connector=lambda: ib,
-                installed_version=VERSION,
-                trading_day=DAY,
-                run_mode="live",
-            )
+        run_smoke(
+            store,
+            SHA,
+            connector=lambda: ib,
+            installed_version=VERSION,
+            trading_day=DAY,
+            run_mode="live",
+        )
         assert ib.order_calls == [] and ib.disconnected == 1
+        manifest = read_manifest(
+            store, TRADER_SMOKE_JOB, DAY.isoformat(), discriminator=SHA[:12]
+        )  # validated on read
+        assert (manifest["status"], manifest["release_sha"]) == ("ok", SHA)
         assert store.exists(paper_smoke_key(DAY.isoformat(), SHA))
+        passing_trader_smoke(store, SHA)  # raises TraderPinRefusedError when it does not select
 
     def test_an_expired_session_propagates_named_and_nothing_was_connected(
         self, store, monkeypatch
     ) -> None:
-        monkeypatch.setattr(paper_smoke, "run_job", fake_run_job)
+        monkeypatch.setattr(paper_smoke, "run_job", _real_run_job_on_day)
 
         def refused():
             raise BrokerSessionUnavailableError("broker_session_unavailable: logged out")
@@ -164,7 +177,7 @@ class TestRunSmoke:
 
 
 def test_main_wires_settings_gateway_and_a_readonly_connect(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(paper_smoke, "run_job", fake_run_job)
+    monkeypatch.setattr(paper_smoke, "run_job", _real_run_job_on_day)
     ib = FakeIB(positions={"AAA": 2})
     rc = main(
         ["--release", SHA],
@@ -179,7 +192,7 @@ def test_main_wires_settings_gateway_and_a_readonly_connect(tmp_path, monkeypatc
 
 
 def test_main_reads_the_process_environment_by_default(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(paper_smoke, "run_job", fake_run_job)
+    monkeypatch.setattr(paper_smoke, "run_job", _real_run_job_on_day)
     for var, value in environ_for(tmp_path).items():
         monkeypatch.setenv(var, value)
     ib = FakeIB()
