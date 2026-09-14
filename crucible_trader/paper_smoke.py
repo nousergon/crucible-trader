@@ -39,6 +39,7 @@ from typing import Any
 
 from crucible.release import (
     TRADER_PIN_KEY,
+    TRADER_SMOKE_JOB,
     assert_sha,
     read_pointer,
     wheel_filename_for,
@@ -50,10 +51,6 @@ from crucible_trader.broker_session import GatewayAddress, ReadOnlyBroker, conne
 from crucible_trader.broker_statement import IbPaperStatementSource
 from crucible_trader.settings import Settings
 
-#: The job `crucible.release.passing_trader_smoke` reads. Declared here only until
-#: the pinned crucible exports `crucible.release.TRADER_SMOKE_JOB` (crucible-PR294);
-#: a test flips red the moment it does, and this becomes an import.
-TRADER_SMOKE_JOB = "trader.smoke"
 SMOKE_SCHEMA_VERSION = "trader_paper_smoke.v1"
 PAPER_SMOKE_PREFIX = "trader/paper_smoke/"
 METRIC_MODULE = "crucible_trader.paper_smoke"

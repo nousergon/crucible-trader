@@ -38,12 +38,9 @@ def store(tmp_path):
     return LocalStore(tmp_path)
 
 
-def test_the_pinned_harness_does_not_yet_export_the_job_name() -> None:
-    assert not hasattr(crucible.release, "TRADER_SMOKE_JOB"), (
-        "the pinned crucible now exports TRADER_SMOKE_JOB (crucible-PR294): import it in "
-        "paper_smoke instead of declaring it, and assert the two are the same object"
-    )
-    assert TRADER_SMOKE_JOB == "trader.smoke"
+def test_the_job_name_is_the_harness_constant() -> None:
+    # crucible-PR294 exports it; `passing_trader_smoke` selects on that object.
+    assert TRADER_SMOKE_JOB is crucible.release.TRADER_SMOKE_JOB == "trader.smoke"
 
 
 class TestRunningWheel:
