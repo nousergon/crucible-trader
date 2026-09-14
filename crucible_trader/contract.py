@@ -113,6 +113,17 @@ def resolve(store: Store, trading_day: str, *, slot: str = "m") -> ResolvedContr
     return ResolvedContract(trading_day=trading_day, champion=champion, feed=feed)
 
 
+def read_slot_champion(store: Store, slot: str) -> ChampionPointer:
+    """``slot``'s champion, with the harness's refusals translated into the trader's two.
+
+    Public so the construction path (`crucible_trader.construction`) reads the S,
+    M and U pointers through exactly the translation the contract uses:
+    :class:`ContractUnavailable` for no pointer, :class:`ContractRefusal` for a
+    pointer that exists and must not be served.
+    """
+    return _read_champion(store, slot)
+
+
 def _read_champion(store: Store, slot: str) -> ChampionPointer:
     try:
         return read_champion(store, slot)
