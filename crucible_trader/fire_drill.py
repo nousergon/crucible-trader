@@ -45,6 +45,8 @@ import json
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from crucible.keys import TRADER_FIRE_DRILLS_PREFIX
+from crucible.keys import trader_fire_drill_key as fire_drill_key
 from crucible.runner import RunContext
 from crucible.serving import PredictionsFeed
 from crucible.store import Store
@@ -55,7 +57,10 @@ from crucible_trader.kill_switch import BrokerControl, KillSwitchOutcome, fire, 
 
 FIRE_DRILL_JOB = "trader.fire_drill"
 FIRE_DRILL_SCHEMA_VERSION = "fire_drill.v1"
-FIRE_DRILL_PREFIX = "trader/fire_drills/"
+#: `crucible.keys` owns this prefix and the key function below
+#: (`alpha-engine-config-I10649`/`-I10650`); kept as a local alias so nothing
+#: here or in the test suite has to change its import.
+FIRE_DRILL_PREFIX = TRADER_FIRE_DRILLS_PREFIX
 METRIC_MODULE = "crucible_trader.fire_drill"
 
 DRILL_KINDS: tuple[str, ...] = ("kill_switch_flatten", "kill_switch_freeze", "hold_book")
@@ -68,11 +73,6 @@ REQUIRED_UNANNOUNCED = 1
 #: The planted feed's champion id. Never written to the store; it names itself
 #: so a hold cause read back from the halt document is traceable to the drill.
 PLANTED_CHAMPION = "fire_drill:planted_degenerate_batch"
-
-
-def fire_drill_key(trading_day: str, run_id: str) -> str:
-    """Declared here only until `crucible.keys` owns it (as `reconciliation_key`)."""
-    return f"{FIRE_DRILL_PREFIX}{trading_day}/{run_id}.json"
 
 
 class DrillRefusedError(RuntimeError):

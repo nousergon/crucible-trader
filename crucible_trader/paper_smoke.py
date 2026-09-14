@@ -36,6 +36,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from crucible.keys import TRADER_PAPER_SMOKE_PREFIX, trader_paper_smoke_key
 from crucible.release import (
     TRADER_PIN_KEY,
     TRADER_SMOKE_JOB,
@@ -51,13 +52,12 @@ from crucible_trader.broker_statement import IbPaperStatementSource
 from crucible_trader.settings import Settings
 
 SMOKE_SCHEMA_VERSION = "trader_paper_smoke.v1"
-PAPER_SMOKE_PREFIX = "trader/paper_smoke/"
+#: `crucible.keys` owns this prefix and the key function below
+#: (`alpha-engine-config-I10649`/`-I10650`); kept as a local alias so nothing
+#: here or in the test suite has to change its import.
+PAPER_SMOKE_PREFIX = TRADER_PAPER_SMOKE_PREFIX
 METRIC_MODULE = "crucible_trader.paper_smoke"
-
-
-def paper_smoke_key(trading_day: str, sha: str) -> str:
-    """Declared here only until `crucible.keys` owns it (as `reconciliation_key`)."""
-    return f"{PAPER_SMOKE_PREFIX}{trading_day}/{assert_sha(sha)}.json"
+paper_smoke_key = trader_paper_smoke_key
 
 
 class RunningWheelMismatchError(RuntimeError):

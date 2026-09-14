@@ -184,17 +184,6 @@ def ctx_for(store, job: str, *, day: dt.date = DAY, started: dt.datetime = T0) -
     )
 
 
-def fake_run_job(job, fn, *, store, discriminator=None, **_ignored):
-    """Stands in for `crucible.runner.run_job` ONLY where the job name is not yet
-    admitted by the harness contract (`trader.kill_switch`, `trader.fire_drill`);
-    the real runner is exercised separately by each module's contract-dependency test."""
-    ctx = ctx_for(store, job)
-    if callable(discriminator):
-        discriminator(ctx)
-    fn(ctx)
-    return ctx
-
-
 def environ_for(store_path, **extra) -> dict[str, str]:
     values = {
         "CRUCIBLE_TRADER_STORE_URI": f"file://{store_path}",

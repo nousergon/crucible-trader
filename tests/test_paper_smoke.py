@@ -7,6 +7,7 @@ import json
 
 import crucible.release
 import pytest
+from crucible.keys import manifest_key
 from crucible.manifest import read_manifest
 from crucible.models import JOB_VALUES, MetricRecordRow
 from crucible.release import TRADER_PIN_KEY, passing_trader_smoke
@@ -68,11 +69,23 @@ class TestRunningWheel:
 
 
 class TestPinDisagreementPageCondition:
-    def _pin(self, store, sha):
+    def _pin(self, store, sha, *, day=None):
+        """A schema-valid `TraderReleasePinDocument` (six fields, `crucible.release`):
+        the three-field shape this repository wrote before
+        `alpha-engine-config-I10649` is refused by `read_pointer` now that it
+        validates strictly."""
+        day = DAY.isoformat() if day is None else day
         store.put_bytes(
             TRADER_PIN_KEY,
             json.dumps(
-                {"sha": sha, "target": "trader", "pinned_at": "2026-09-05T22:00:00Z"}
+                {
+                    "sha": sha,
+                    "target": "trader",
+                    "pinned_at": "2026-09-05T22:00:00Z",
+                    "smoke_run_id": "01JG0000000000000000000000",
+                    "smoke_status": "ok",
+                    "smoke_manifest_key": manifest_key("trader.smoke", day, discriminator=sha[:12]),
+                }
             ).encode(),
         )
 

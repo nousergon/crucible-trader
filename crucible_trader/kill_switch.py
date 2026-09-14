@@ -29,10 +29,12 @@ or let a foreign order through fails its run.
 :class:`~crucible_trader.broker_statement.IbPaperStatementSource`, which refuses
 a non-`DU` account.
 
-**Recorded contract dependency:** `trader.kill_switch` is not yet in
-`crucible.models.JOB_VALUES`. The halt document is written directly (never only
-at manifest time) precisely so the protection does not wait on that
-registration; the run's manifest is refused until it lands, and a test pins it.
+**`trader.kill_switch` is admitted** (`crucible.models.JOB_VALUES`, since
+`nousergon/crucible@88f6e24`). The halt document is still written directly
+(never only at manifest time), so the protection does not depend on the
+manifest write succeeding: `fire` records :data:`KILL_SWITCH_KEY` before any
+broker call, and the enclosing `crucible.runner.run_job` run then writes a
+schema-valid `trader.kill_switch` manifest through the real runner.
 """
 
 from __future__ import annotations
@@ -43,14 +45,19 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, Protocol
 
+from crucible.keys import TRADER_KILL_SWITCH_EVENTS_PREFIX, TRADER_KILL_SWITCH_KEY
+from crucible.keys import trader_kill_switch_event_key as kill_switch_event_key
 from crucible.runner import RunContext
 from crucible.store import Store
 
 from crucible_trader.broker_statement import BrokerStatement, IbPaperStatementSource
 
 KILL_SWITCH_JOB = "trader.kill_switch"
-KILL_SWITCH_KEY = "trader/kill_switch.json"
-KILL_SWITCH_EVENTS_PREFIX = "trader/kill_switch/events/"
+#: `crucible.keys` owns the key shapes below (`alpha-engine-config-I10649`/
+#: `-I10650`); kept as local aliases so nothing here or in the test suite has
+#: to change its import.
+KILL_SWITCH_KEY = TRADER_KILL_SWITCH_KEY
+KILL_SWITCH_EVENTS_PREFIX = TRADER_KILL_SWITCH_EVENTS_PREFIX
 KILL_SWITCH_SCHEMA_VERSION = "kill_switch.v1"
 KILL_SWITCH_OUTCOME_SCHEMA_VERSION = "kill_switch_outcome.v1"
 METRIC_MODULE = "crucible_trader.kill_switch"
@@ -71,11 +78,6 @@ POLL_INTERVAL_S = 2.0
 
 #: IB order statuses that mean the broker accepted the order.
 ACCEPTED_STATUSES: frozenset[str] = frozenset({"PreSubmitted", "Submitted", "Filled"})
-
-
-def kill_switch_event_key(trading_day: str, run_id: str) -> str:
-    """Declared here only until `crucible.keys` owns it (as `reconciliation_key`)."""
-    return f"{KILL_SWITCH_EVENTS_PREFIX}{trading_day}/{run_id}.json"
 
 
 class TradingHaltedError(RuntimeError):
