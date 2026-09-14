@@ -34,7 +34,7 @@ dependencies = [
     # from the store and installs the wheel at `releases/{sha}/`. It never
     # follows `releases/current`. The two shas are required to agree, and that
     # agreement is checked by the release-promotion path, not by this file.
-    "crucible @ git+https://github.com/nousergon/crucible@c73cdcf84cf43cf915df361c59796e3e13f1571f",
+    "crucible @ git+https://github.com/nousergon/crucible@3ce5b7137fc182871fa58c932c22c76e5f742c6a",
 ]
 
 # NO LLM dependency, and none may be added. The fleet's standing rule confines
