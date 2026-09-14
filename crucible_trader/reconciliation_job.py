@@ -19,19 +19,12 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    the manifest `status: failed`, which is the page condition (§4.6), and the
    reason names every finding's instrument, delta and side.
 
-**Two contract dependencies on `nousergon/crucible`, recorded rather than
-worked around** (the tests pin both, so each flips red the moment the harness
-lands its half and this repository must follow):
-
-* `trader.reconcile` is not in `crucible.models.JOB_VALUES`, so the harness's
-  manifest validator refuses this job's manifest at the currently pinned sha.
-* :func:`reconciliation_key` is not matched by
-  `crucible.manifest.MONEY_PATH_PREDICATES`, so the result does not yet join the
-  money-path hash chain (`alpha-engine-config-I10414`). Because the chain link is
-  attached by the harness's single writer from the manifest's OUTPUTS, joining
-  needs no change here: once the predicate exists, the next run chains.
-
-Both keys are declared here only until `crucible.keys` owns them.
+**Registered in the harness contract** (crucible-PR297): `trader.reconcile` is
+in `crucible.models.JOB_VALUES`, both keys are owned by `crucible.keys`
+(`trader_reconciliation_key`, `trader_broker_statement_key`), and the
+reconciliation key is on `crucible.manifest.MONEY_PATH_PREDICATES`, so the
+harness's single manifest writer attaches a `money_path_link` from this run's
+OUTPUTS (`alpha-engine-config-I10414`). Nothing here declares a key shape.
 """
 
 from __future__ import annotations
@@ -41,6 +34,7 @@ import json
 from collections.abc import Callable, Sequence
 
 from crucible.calendar import is_trading_day
+from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
 
@@ -67,17 +61,11 @@ from crucible_trader.reconciliation_control import (
 )
 
 RECONCILE_JOB = "trader.reconcile"
-BROKER_STATEMENT_PREFIX = "trader/broker_statements/"
-RECONCILIATION_PREFIX = "trader/reconciliation/"
 METRIC_MODULE = "crucible_trader.reconciliation"
 
-
-def broker_statement_key(trading_day: str) -> str:
-    return f"{BROKER_STATEMENT_PREFIX}{trading_day}.json"
-
-
-def reconciliation_key(trading_day: str) -> str:
-    return f"{RECONCILIATION_PREFIX}{trading_day}.json"
+#: The listing prefix of every stored statement, derived from the harness's key
+#: function (any valid day) so the key shape has one owner.
+BROKER_STATEMENT_PREFIX = trader_broker_statement_key("2000-01-03").rsplit("/", 1)[0] + "/"
 
 
 class ReconciliationDiscrepancyError(RuntimeError):
@@ -108,7 +96,7 @@ def latest_anchor(store: Store, trading_day: str) -> tuple[str, bytes, BrokerSta
     earlier = [d for d in days if d < trading_day]
     if not earlier:
         return None
-    key = broker_statement_key(earlier[-1])
+    key = trader_broker_statement_key(earlier[-1])
     payload = store.get_bytes(key)
     return key, payload, statement_from_document(json.loads(payload.decode("utf-8")))
 
@@ -146,7 +134,7 @@ def reconcile_cycle(
     verdict = run_control_arm(inputs, reconciler=reconciler)
 
     ctx.record_output(
-        broker_statement_key(day),
+        trader_broker_statement_key(day),
         json.dumps(broker.to_document(), indent=2, sort_keys=True).encode("utf-8"),
         BROKER_STATEMENT_SCHEMA_VERSION,
     )
@@ -156,7 +144,7 @@ def reconcile_cycle(
         "void": not verdict.passed,
     }
     ctx.record_output(
-        reconciliation_key(day),
+        trader_reconciliation_key(day),
         json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
         RECONCILIATION_SCHEMA_VERSION,
     )
@@ -164,7 +152,9 @@ def reconcile_cycle(
         rows_in=len(broker.positions) + len(inputs.fills), rows_out=len(result.discrepancies)
     )
     now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for metric in metric_records(result, verdict, now=now, source_path=reconciliation_key(day)):
+    for metric in metric_records(
+        result, verdict, now=now, source_path=trader_reconciliation_key(day)
+    ):
         ctx.record_metric(metric)
 
     if not verdict.passed:

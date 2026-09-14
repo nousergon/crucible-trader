@@ -19,7 +19,18 @@ import crucible.slots.inputs as harness_inputs
 import crucible.slots.strategy as harness_strategy
 import numpy as np
 import pytest
-from conftest import AS_OF, IMPACT_COST, M_CHAMPION, NEXT, U_CHAMPION, put, remove, seat_champion
+from conftest import (
+    AS_OF,
+    D_PREV,
+    IMPACT_COST,
+    M_CHAMPION,
+    NEXT,
+    TICKERS,
+    U_CHAMPION,
+    put,
+    remove,
+    seat_champion,
+)
 from crucible.keys import champion_key, session_inputs_key, strategy_slot_key
 from crucible.portfolio import (
     PORTFOLIO_METRIC_NAME,
@@ -30,7 +41,12 @@ from crucible.slots.inputs import resolve_strategy_sessions
 from crucible.slots.strategy import construct_book
 
 import crucible_trader.construction as construction
-from crucible_trader.construction import construct_target_book, initial_weights
+from crucible_trader.construction import (
+    _previous_weights,
+    construct_target_book,
+    held_tickers,
+    initial_weights,
+)
 from crucible_trader.contract import ContractRefusal, ContractUnavailable
 
 NOW = dt.datetime(2026, 9, 11, 20, 30, tzinfo=dt.UTC)
@@ -187,12 +203,19 @@ class TestNoAttestedChampionNoBook:
         with pytest.raises(ContractRefusal, match="parameter set is unusable"):
             construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
 
-    def test_a_held_name_outside_the_universe_is_refused(self, world) -> None:
+    def test_a_held_name_with_no_price_is_a_hold_not_a_book(self, world) -> None:
         world.record_session(world.arm_id)
-        with pytest.raises(ContractRefusal, match="does not contain"):
+        with pytest.raises(ContractUnavailable, match=r"\['ZZZ'\].*no proxy is substituted"):
             construct_target_book(
                 world.store, trading_day=DAY, previous_weights={"ZZZ": 0.1}, now=NOW
             )
+
+    def test_a_universe_the_resolver_returned_without_a_held_name_is_refused(self, world) -> None:
+        """Defence in depth: the resolver is specified to carry every held name."""
+        world.record_session(world.arm_id)
+        book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+        with pytest.raises(ContractRefusal, match="passed to the resolver as held names"):
+            _previous_weights(book.universe, {"ZZZ": 0.1}, trading_day=DAY)
 
     def test_a_session_document_filed_under_another_day_is_refused(self, world) -> None:
         from crucible.slots.inputs import ArmPredictionsContractError
@@ -203,3 +226,64 @@ class TestNoAttestedChampionNoBook:
         put(world.store, session_inputs_key(world.arm_id, DAY), document)
         with pytest.raises(ArmPredictionsContractError):
             construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+
+class TestAHeldNameTheMChampionStopsPricingIsExited:
+    """`alpha-engine-config-I10754`: the trader decides D_PREV from cash, carries
+    that book into DAY, and on DAY the M champion no longer prices the name the
+    book held most of. The trader must sell it, charged, and construct exactly
+    the book the settled grade walk over [D_PREV, DAY] constructs for DAY."""
+
+    def _carry(self, world):
+        world.record_session(world.arm_id, D_PREV)
+        first = construct_target_book(
+            world.store, trading_day=D_PREV.isoformat(), previous_weights=None, now=NOW
+        )
+        held = {t: w for t, w in first.weights.items() if w != 0.0 and t in TICKERS}
+        assert held, "the fixture's first book holds no name; nothing can leave the universe"
+        dropped = max(held, key=held.get)
+        world.drop_prediction(AS_OF, dropped)
+        world.record_session(world.arm_id, AS_OF)
+        return first, dropped
+
+    def test_held_tickers_is_the_non_zero_non_sentinel_support(self) -> None:
+        assert held_tickers(None, benchmark="SPY") == []
+        weights = {"T01": 0.2, "T02": 0.0, "SPY": 0.1, "__CASH__": 0.7}
+        assert held_tickers(weights, benchmark="SPY") == ["T01"]
+
+    def test_the_dropped_name_is_exited_charged_and_equals_the_grade_walk(self, world) -> None:
+        first, dropped = self._carry(world)
+        book = construct_target_book(
+            world.store, trading_day=DAY, previous_weights=first.weights, now=NOW
+        )
+        assert dropped in book.universe.tickers
+        assert book.weights[dropped] < first.weights[dropped], "the dropped name was not sold"
+        assert book.weights[dropped] == 0.0
+        assert book.cost_bps > 0.0 and book.turnover_one_way_ratio > 0.0
+
+        recipe = next(
+            arm.recipe
+            for arm in harness_strategy.load_strategy_slot(store=world.store).registered
+            if arm.arm_id == world.arm_id
+        )
+        params = load_portfolio_params_from_store("s", store=world.store)
+        walk = resolve_strategy_sessions(
+            world.store,
+            arm_id=world.arm_id,
+            benchmark=recipe.benchmark,
+            decision_days=[D_PREV.isoformat(), DAY],
+            as_of=NEXT.isoformat(),
+        )
+        graded = construct_book(
+            recipe=recipe,
+            params=params,
+            universe=walk.universe,
+            sessions=walk.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=initial_weights(walk.universe),
+        )
+        assert book.universe == walk.universe
+        assert graded.weights[0] == tuple(first.weights.get(t, 0.0) for t in walk.universe.tickers)
+        assert tuple(book.weights.values()) == graded.weights[1]
+        assert book.cost_bps == graded.book.cost_bps[1]
+        assert book.turnover_one_way_ratio == graded.book.turnover[1]

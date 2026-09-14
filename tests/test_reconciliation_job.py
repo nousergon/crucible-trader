@@ -1,5 +1,5 @@
-"""The job: I/O, outputs, MetricRecords, raises, and the two recorded harness
-contract dependencies. IB is faked (`FixedSource`)."""
+"""The job: I/O, outputs, MetricRecords, raises, and the manifest the harness
+writes for it through its own validator. IB is faked (`FixedSource`)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ import json
 import pathlib
 
 import pytest
-from crucible.manifest import ManifestValidationError, on_money_path
+from crucible.keys import trader_broker_statement_key as broker_statement_key
+from crucible.keys import trader_reconciliation_key as reconciliation_key
+from crucible.manifest import on_money_path, read_manifest
 from crucible.models import JOB_VALUES, MetricRecordRow
 from crucible.runner import RunContext
 from crucible.store import LocalStore
@@ -19,11 +21,9 @@ from crucible_trader.reconciliation_control import ReconciliationVoidError
 from crucible_trader.reconciliation_job import (
     RECONCILE_JOB,
     ReconciliationDiscrepancyError,
-    broker_statement_key,
     latest_anchor,
     previous_trading_day,
     reconcile_cycle,
-    reconciliation_key,
     run_reconciliation,
 )
 
@@ -197,31 +197,44 @@ def test_previous_trading_day_walks_the_calendar():
     assert previous_trading_day(dt.date(2026, 9, 8)).isoformat() == "2026-09-04"  # Labor Day
 
 
-class TestRecordedHarnessContractDependencies:
-    """Both assertions are EXPECTED to break when `nousergon/crucible` lands its
-    half; the failure is the instruction to bump the pin and replace each with a
-    positive end-to-end test. They are not suppressions: each pins a gap the PR
-    names, so it cannot close silently."""
+class TestTheHarnessWritesThisJobsManifest:
+    """crucible-PR297 registered `trader.reconcile` and put its result on the
+    money-path predicates; these assert the written manifest, not the constants."""
 
-    def test_the_manifest_contract_does_not_yet_admit_this_job(self, store):
-        assert RECONCILE_JOB not in JOB_VALUES, (
-            "crucible now admits trader.reconcile: bump the pin, delete this test, and "
-            "assert run_reconciliation writes a valid runs/trader.reconcile/{day}/run.json"
-        )
+    def _run(self, store, broker_positions):
         put_anchor(store)
-        with pytest.raises(ManifestValidationError, match="job"):
-            run_reconciliation(
-                store,
-                FixedSource({"AAA": 12}, 800.0),
-                trading_day=DAY,
-                fills=(Fill("AAA", 2, -200.0),),
-                cash_flows=(),
-                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
-                run_mode="replay",
-            )
+        return run_reconciliation(
+            store,
+            FixedSource(broker_positions, 800.0),
+            trading_day=DAY,
+            fills=(Fill("AAA", 2, -200.0),),
+            cash_flows=(),
+            corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+            run_mode="replay",
+        )
 
-    def test_the_result_is_not_yet_on_the_money_path_chain(self):
-        assert not on_money_path(reconciliation_key("2026-09-11")), (
-            "crucible's MONEY_PATH_PREDICATES now match the reconciliation key: the chain "
-            "link is attached by the harness writer, so assert it on the written manifest"
+    def test_the_job_is_admitted_and_its_result_is_on_the_money_path(self):
+        assert RECONCILE_JOB in JOB_VALUES
+        assert on_money_path(reconciliation_key(DAY.isoformat()))
+
+    def test_a_clean_cycle_writes_a_schema_valid_manifest_carrying_the_chain_link(self, store):
+        self._run(store, {"AAA": 12})
+        manifest = read_manifest(store, RECONCILE_JOB, DAY.isoformat())  # validates on read
+        assert manifest["status"] == "ok" and manifest["job"] == RECONCILE_JOB
+        link = manifest["money_path_link"]
+        assert link["index"] == 0 and link["prev_sha256"] is None
+        assert reconciliation_key(DAY.isoformat()) in link["money_path_writes"]
+        assert {o["key"] for o in manifest["outputs"]} == {
+            broker_statement_key(DAY.isoformat()),
+            reconciliation_key(DAY.isoformat()),
+        }
+
+    def test_a_discrepancy_is_a_failed_manifest_that_still_chains(self, store):
+        with pytest.raises(ReconciliationDiscrepancyError):
+            self._run(store, {"AAA": 13})
+        manifest = read_manifest(store, RECONCILE_JOB, DAY.isoformat())
+        assert manifest["status"] == "failed"
+        assert "AAA" in manifest["reason"]
+        assert (
+            reconciliation_key(DAY.isoformat()) in manifest["money_path_link"]["money_path_writes"]
         )

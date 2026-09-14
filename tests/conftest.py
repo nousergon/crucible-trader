@@ -38,6 +38,7 @@ from crucible.store import LocalStore
 from nousergon_lib.arena.arms import ArmRegister
 
 AS_OF = dt.date(2026, 9, 11)
+D_PREV = dt.date(2026, 9, 10)
 NEXT = dt.date(2026, 9, 14)
 M_CHAMPION = "m:fixture_model:aaaaaaaaaaaa"
 U_CHAMPION = "u:fixture_cut:bbbbbbbbbbbb"
@@ -186,6 +187,13 @@ class World:
         register, _ = register_arms(ArmRegister(), [by_id[a] for a in arm_ids])
         write_register(self.store, "s", register)
 
+    def drop_prediction(self, day: dt.date, ticker: str) -> None:
+        """The M champion stops pricing ``ticker`` on ``day`` (I10754's fixture)."""
+        key = arm_predictions_key(M_CHAMPION, day.isoformat())
+        document = json.loads(self.store.get_bytes(key))
+        del document["predicted_alpha"][ticker]
+        put(self.store, key, document)
+
     def write_adv(self, day: dt.date = AS_OF) -> None:
         frame = pd.DataFrame(
             {
@@ -203,6 +211,8 @@ class World:
 def world(tmp_path) -> World:
     store = LocalStore(tmp_path / "store")
     days = sessions_ending(AS_OF, 80)
+    assert days[-2] == D_PREV
+    store.put_bytes(data_panel_key(D_PREV.isoformat()), _panel(days[:-1]).to_parquet(index=False))
     store.put_bytes(data_panel_key(AS_OF.isoformat()), _panel(days).to_parquet(index=False))
     store.put_bytes(data_panel_key(NEXT.isoformat()), _panel([*days, NEXT]).to_parquet(index=False))
     rng = random.Random(7)

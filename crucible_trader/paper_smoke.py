@@ -22,10 +22,9 @@ under test -- the exact manifest `crucible.release.passing_trader_smoke` selects
 `scripts/trader_paper_smoke.sh` is the box-side entry: it installs the pinned
 wheel into a fresh environment and calls :func:`main` inside it.
 
-**Recorded contract dependency** (pinned by a test, like `trader.reconcile`):
-`trader.smoke` is not yet in `crucible.models.JOB_VALUES`, so the manifest
-validator refuses this run's manifest at the currently pinned sha, and every
-trader pin is refused until the harness registers the job.
+**Registered in the harness contract** (crucible-PR297): `trader.smoke` is in
+`crucible.models.JOB_VALUES`, so the runner's single writer files a
+schema-valid manifest that `crucible.release.passing_trader_smoke` can select.
 """
 
 from __future__ import annotations
