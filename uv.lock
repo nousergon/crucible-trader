@@ -202,12 +202,13 @@ wheels = [
 [[package]]
 name = "crucible"
 version = "0.1.0"
-source = { git = "https://github.com/nousergon/crucible?rev=d3f2020222a634ab4cb1f9989792d96474f76592#d3f2020222a634ab4cb1f9989792d96474f76592" }
+source = { git = "https://github.com/nousergon/crucible?rev=3ce5b7137fc182871fa58c932c22c76e5f742c6a#3ce5b7137fc182871fa58c932c22c76e5f742c6a" }
 dependencies = [
     { name = "boto3" },
     { name = "cvxpy" },
     { name = "jsonschema" },
     { name = "krepis", extra = ["openai"] },
+    { name = "lightgbm" },
     { name = "nousergon-lib", extra = ["github-app"] },
     { name = "numpy" },
     { name = "pandas" },
@@ -232,7 +233,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "crucible", git = "https://github.com/nousergon/crucible?rev=d3f2020222a634ab4cb1f9989792d96474f76592" }]
+requires-dist = [{ name = "crucible", git = "https://github.com/nousergon/crucible?rev=3ce5b7137fc182871fa58c932c22c76e5f742c6a" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -495,6 +496,24 @@ openai = [
 ]
 
 [[package]]
+name = "lightgbm"
+version = "4.7.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "narwhals" },
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/63/8e/4db5e29290d7e619c307fdb8dab0a0514090af2ce3ec483050e024ec6126/lightgbm-4.7.0.tar.gz", hash = "sha256:f8e20f682c9aabd000bcf4a7ed8aa6f473c1adfecccae34ec24e823d156f4af0", size = 1792896, upload-time = "2026-07-18T21:00:56.139Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/05/7213965863cba1ed0150ad045bceed6276a1afaaaedbaeff4699ec4f0ccb/lightgbm-4.7.0-py3-none-macosx_10_15_x86_64.whl", hash = "sha256:dfc1cfe8e760387be1e7ba7a214688be21fdff96e4ed9749188f83e1877c2477", size = 1877851, upload-time = "2026-07-18T21:00:35.225Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/86/f4fe714f2e0bf3941705a20d7f6849dc476276d71236e82ea6b0d6539b86/lightgbm-4.7.0-py3-none-macosx_12_0_arm64.whl", hash = "sha256:129535462686f274df179133643118c5c5c5667167fe6c3a28d955f0b3c8e868", size = 1498914, upload-time = "2026-07-18T21:00:36.549Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/a3/b29580948b92e8c2f84dea70118ac702ff067dc52ec4ffb5d73c953536a5/lightgbm-4.7.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d4529acec5c6fefe4768302a529707d0ead90f6a6f42df694b856212e09695b8", size = 3349492, upload-time = "2026-07-18T21:00:37.943Z" },
+    { url = "https://files.pythonhosted.org/packages/15/eb/837ea3b40cc36e22eeebb9785c01e42b2c255d033eea1d2d9ee8e2540e55/lightgbm-4.7.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d23e922acd891e77212e4d0fbcee9ba973c96dee479491341d05ba595357ebb7", size = 3476028, upload-time = "2026-07-18T21:00:39.331Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/0b/c5c17d862b12ce292f24cd85d40f2f8f8981668fbdbd43fdc2625eccbc79/lightgbm-4.7.0-py3-none-win_amd64.whl", hash = "sha256:f42d1e5b32b6f170e606d7c689c6165671da98d7bf37f1addec2623efc8740c9", size = 1360833, upload-time = "2026-07-18T21:00:40.865Z" },
+]
+
+[[package]]
 name = "markupsafe"
 version = "3.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -514,8 +533,17 @@ wheels = [
 ]
 
 [[package]]
+name = "narwhals"
+version = "2.26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/35/68/5351e34623d253423240ea7de3f8fc74fa8ab14b1ab3c0ec4ac8997413c9/narwhals-2.26.0.tar.gz", hash = "sha256:6b9cadca82f375c7e4cf584fdc86ca25da54827307a9c58f94547ee6104b82dd", size = 686970, upload-time = "2026-09-08T13:32:08.964Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/b5/1b84b2c784db76d69442334bc8b8748c840f13ca53be086f4f250ad4a0bc/narwhals-2.26.0-py3-none-any.whl", hash = "sha256:29326d74f107c347fd1009bd58e38d9f7c7c5b51e6de97bc93dbc325d9038b54", size = 474034, upload-time = "2026-09-08T13:32:07.159Z" },
+]
+
+[[package]]
 name = "nousergon-lib"
-version = "0.124.120"
+version = "0.124.124"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -524,9 +552,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/da/ccc2a6799105b1edbd1c1b21dc07c6c12cf7683818301abb6b9811a1c6cb/nousergon_lib-0.124.120.tar.gz", hash = "sha256:686a99b76133d050b865b9971cf648cc93068eda29855421e89ad52f3929da12", size = 863011, upload-time = "2026-09-12T16:27:51.218Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/c9/edc352d7ce7388fef91bdcbf6d546505ebed1d99f1672bd31ab4a77d094d/nousergon_lib-0.124.124.tar.gz", hash = "sha256:f2cbdf1671e3937eddd38aa009206d6b466b48ac9976aee0187567119454220d", size = 873487, upload-time = "2026-09-13T20:21:35.473Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/d1/72ecdb3bfc184ff188924c7d36dc9287bbeca5805ad69c5438f9da7675d9/nousergon_lib-0.124.120-py3-none-any.whl", hash = "sha256:ef138086f51ad475415cbae12faabf8662660533ce94f8842879ac2b73bcda44", size = 593612, upload-time = "2026-09-12T16:27:49.526Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/c0/54fe736c46bea84a1937e490d68c36d3ccd9283b77031742f11096f6509a/nousergon_lib-0.124.124-py3-none-any.whl", hash = "sha256:9be5fa4a892b883921f1162ca22a90f0fea1fdd04fd0cf6db91a94fddcbb939d", size = 598541, upload-time = "2026-09-13T20:21:33.513Z" },
 ]
 
 [package.optional-dependencies]
