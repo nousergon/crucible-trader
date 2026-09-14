@@ -46,6 +46,16 @@ dependencies = [
 # register — which is why the guarantee has to live here, on the dependency list
 # a reviewer reads, rather than in a registry that would be silent either way.
 
+[project.optional-dependencies]
+# The broker SDK, for the box only. `ib_async` is the maintained successor of
+# `ib_insync` (which the v1 executor used; unmaintained since its author's death
+# in 2024). An EXTRA, not a dependency: the library and its tests take an
+# already-connected client and import the SDK lazily
+# (`crucible_trader.broker_session.load_sdk`), so CI installs no broker SDK.
+# Locked in `uv.lock` like everything else; `scripts/trader_paper_smoke.sh`
+# installs it from the lock, never by a floating name.
+ib = ["ib-async==2.1.0"]
+
 [project.urls]
 Homepage = "https://github.com/nousergon/crucible-trader"
 
