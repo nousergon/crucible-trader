@@ -28,7 +28,7 @@ connects READ-ONLY (`crucible_trader.broker_session.ReadOnlyBroker`) -- it never
 places an order -- and its `source`/`fills` come from that session via
 `crucible_trader.reconcile_entrypoint`; `cash_flows` and `corporate_actions`
 have no live source yet and default to the reconciler's own documented
-fail-loud state (see that module's docstring; follow-up `alpha-engine-config-I11072`).
+fail-loud state (see that module's docstring; follow-up `alpha-engine-config-I11076`).
 """
 
 from __future__ import annotations

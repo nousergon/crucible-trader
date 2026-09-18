@@ -35,7 +35,7 @@ real; the third is a stated, fail-loud gap, not a fabrication:**
   shows up as an unexplained `cash_delta` finding for the same reason: an
   undeclared movement is a discrepancy by design, not a hole.
 
-  Tracked follow-up for a real source: `alpha-engine-config-I11072`.
+  Tracked follow-up for a real source: `alpha-engine-config-I11076`.
 """
 
 from __future__ import annotations
