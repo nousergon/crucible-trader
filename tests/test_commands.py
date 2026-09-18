@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 
 import pytest
-from crucible.keys import parse_manifest_key
+from crucible.keys import parse_manifest_key, trader_reconciliation_key
 from crucible.manifest import read_manifest
 from crucible.models import JOB_VALUES
 from crucible.runner import run_job
 from crucible.store import LocalStore, S3Store
-from ib_fakes import DAY, FakeIB, FakeSdk, environ_for
+from ib_fakes import DAY, T0, FakeIB, FakeSdk, broker_fill, environ_for
 from s3_fake import FakeS3, FakeSsm
 
 from crucible_trader import commands
@@ -18,6 +18,7 @@ from crucible_trader.commands import main
 from crucible_trader.drill_schedule import NONCE_ENV_VAR
 from crucible_trader.fire_drill import FIRE_DRILL_JOB, fire_drill_key
 from crucible_trader.kill_switch import KILL_SWITCH_JOB, kill_switch_event_key, read_state
+from crucible_trader.reconciliation_job import RECONCILE_JOB, ReconciliationDiscrepancyError
 
 
 def _never_loaded():
@@ -287,6 +288,58 @@ def test_the_store_comes_from_the_process_environment_by_default(tmp_path, monke
         printer=printed.append,
     )
     assert rc == 1 and printed
+
+
+class TestReconcileCommand:
+    """`alpha-engine-config-I11071`: the subcommand nothing dispatched before
+    this. Full stack -- the real `run_job`, the real `reconcile`, the real
+    control arm -- with only the broker connection faked."""
+
+    def test_a_genesis_run_connects_read_only_costs_fills_and_files_a_manifest(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        assert RECONCILE_JOB in JOB_VALUES
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        ib = FakeIB(
+            positions={"AAA": 4},
+            cash=1_000.0,
+            broker_fills=(
+                broker_fill("AAA", side="BOT", shares=4, avg_price=10.0, commission=1.0, time=T0),
+            ),
+        )
+        rc, _ = _main(tmp_path, ["reconcile", "run", "--genesis"], ib=ib)
+        store = LocalStore(tmp_path)
+        assert rc == 0
+        assert ib.connected_with["readonly"] is True and ib.disconnected == 1
+        manifest = _only_manifest(store, RECONCILE_JOB)
+        assert manifest["status"] == "ok"
+        document = json.loads(store.get_bytes(trader_reconciliation_key(DAY.isoformat())))
+        assert document["genesis"] is True and document["void"] is False
+
+    def test_without_genesis_and_no_prior_statement_the_run_fails_loud(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """No anchor and no `--genesis` is a finding, never a silent pass --
+        the reconciler's own no-replay-fallback contract. The manifest is
+        still written `failed` before the exception propagates."""
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        ib = FakeIB(positions={"AAA": 4}, cash=1_000.0)
+        with pytest.raises(ReconciliationDiscrepancyError, match="no_anchor"):
+            _main(tmp_path, ["reconcile", "run"], ib=ib)
+        store = LocalStore(tmp_path)
+        manifest = _only_manifest(store, RECONCILE_JOB)
+        assert manifest["status"] == "failed"
+
+    def test_one_manifest_per_trading_day_no_discriminator(self, tmp_path, monkeypatch) -> None:
+        """Unlike the kill switch and the fire drill (fired more than once a
+        day), `trader.reconcile` writes exactly one manifest per trading day
+        -- matching `reconciliation_job.run_reconciliation`'s own contract."""
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        ib = FakeIB(positions={"AAA": 4}, cash=1_000.0)
+        _main(tmp_path, ["reconcile", "run", "--genesis"], ib=ib)
+        store = LocalStore(tmp_path)
+        keys = [k for k in store.list_keys(f"runs/{RECONCILE_JOB}/") if k.endswith("/run.json")]
+        assert len(keys) == 1 and f"runs/{RECONCILE_JOB}/{DAY.isoformat()}/run.json" == keys[0]
 
 
 def test_a_drill_reads_its_nonce_from_the_process_environment_by_default(

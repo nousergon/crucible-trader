@@ -1,7 +1,8 @@
-"""The operator commands: the kill switch (one command) and the fire drill.
+"""The operator commands: the kill switch, the fire drill, and reconciliation.
 
-`alpha-engine-config-I10650`. Each command is one `crucible.runner.run_job` run,
-so every fire, release and drill files a manifest whatever happens:
+`alpha-engine-config-I10650`, `-I11071`. Each command is one
+`crucible.runner.run_job` run, so every fire, release, drill and reconcile
+files a manifest whatever happens:
 
     kill-switch fire --mode flatten|freeze --cause TEXT     job trader.kill_switch
     kill-switch release --cause TEXT                        job trader.kill_switch
@@ -10,6 +11,7 @@ so every fire, release and drill files a manifest whatever happens:
     fire-drill run --kind KIND --unannounced --schedule-id ID --window-from DAY
                    --window-to DAY --fire-at INSTANT        nonce in $CRUCIBLE_TRADER_DRILL_NONCE
     fire-drill status --from YYYY-MM-DD --to YYYY-MM-DD     read-only; exit 1 unless done
+    reconcile run [--genesis]                                job trader.reconcile
 
 `seal` runs under the OPERATOR identity (it writes an SSM SecureString the
 trader's identity is denied) and never connects to the broker
@@ -21,7 +23,12 @@ import main; sys.exit(main(sys.argv[1:]))' <command> ...`` (one line).
 (no `__main__` block: this package's coverage floor has no exclusions).
 
 `fire` and `run` connect to IB Gateway PAPER with an order-capable session (the
-switch cancels and closes); `release` and `status` never connect.
+switch cancels and closes); `release` and `status` never connect. `reconcile run`
+connects READ-ONLY (`crucible_trader.broker_session.ReadOnlyBroker`) -- it never
+places an order -- and its `source`/`fills` come from that session via
+`crucible_trader.reconcile_entrypoint`; `cash_flows` and `corporate_actions`
+have no live source yet and default to the reconciler's own documented
+fail-loud state (see that module's docstring; follow-up `alpha-engine-config-I11076`).
 """
 
 from __future__ import annotations
@@ -51,6 +58,12 @@ from crucible_trader.kill_switch import (
     utcnow,
 )
 from crucible_trader.paper_smoke import open_configured_store
+from crucible_trader.reconcile_entrypoint import (
+    fills_from_ib,
+    live_corporate_actions,
+    live_statement_source,
+)
+from crucible_trader.reconciliation_job import RECONCILE_JOB, reconcile_cycle
 from crucible_trader.settings import Settings
 
 
@@ -81,7 +94,11 @@ def _parser() -> argparse.ArgumentParser:
     status_p.add_argument("--from", dest="window_start", required=True)
     status_p.add_argument("--to", dest="window_end", required=True)
 
-    for sub in (fire_p, release_p, run_p):
+    reconcile = top.add_parser("reconcile").add_subparsers(dest="action", required=True)
+    reconcile_run_p = reconcile.add_parser("run")
+    reconcile_run_p.add_argument("--genesis", action="store_true")
+
+    for sub in (fire_p, release_p, run_p, reconcile_run_p):
         sub.add_argument("--run-mode", choices=("live", "replay"), default="live")
     return parser
 
@@ -165,6 +182,8 @@ def main(
         job, stamp, connects = KILL_SWITCH_JOB, "release", False
     elif args.command == "kill-switch":
         job, stamp, connects = KILL_SWITCH_JOB, f"fire-{args.mode}", True
+    elif args.command == "reconcile":
+        job, stamp, connects = RECONCILE_JOB, "run", True
     else:
         job, stamp, connects = FIRE_DRILL_JOB, args.kind, True
 
@@ -172,6 +191,18 @@ def main(
     clients: list[Any] = []
 
     def body(ctx: RunContext) -> Any:
+        if job == RECONCILE_JOB:
+            sdk = sdk_loader()
+            client = connect(address, readonly=True, sdk_loader=lambda: sdk)
+            clients.append(client)
+            return reconcile_cycle(
+                ctx,
+                source=live_statement_source(client),
+                fills=fills_from_ib(client, ctx.trading_day.isoformat()),
+                cash_flows=(),
+                corporate_actions=live_corporate_actions(),
+                genesis=args.genesis,
+            )
         if address is None:
             return release(ctx, cause=args.cause, clock=clock)
         sdk = sdk_loader()
@@ -191,14 +222,22 @@ def main(
             clock=clock,
         )
 
+    # `trader.reconcile` writes exactly one manifest per trading day, per its
+    # own contract in `reconciliation_job.py` (no discriminator there), and
+    # its transient-retry default matches the harness's own (a rerun on a
+    # classified transient is safe: the job's outputs are content-addressed
+    # and re-anchor identically). The kill switch and fire drill are each a
+    # deliberate human action fired once, never retried underneath the caller.
     try:
         run_job(
             job,
             body,
             store=store,
-            discriminator=lambda ctx: f"{stamp}-{ctx.started:%H%M%S}",
+            discriminator=(
+                None if job == RECONCILE_JOB else (lambda ctx: f"{stamp}-{ctx.started:%H%M%S}")
+            ),
             run_mode=args.run_mode,
-            transient_retry=False,
+            transient_retry=job == RECONCILE_JOB,
         )
     finally:
         for client in clients:

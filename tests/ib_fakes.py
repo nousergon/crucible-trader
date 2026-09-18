@@ -34,6 +34,26 @@ def _entry(time: dt.datetime, status: str) -> SimpleNamespace:
     return SimpleNamespace(time=time, status=status)
 
 
+def broker_fill(
+    symbol: str,
+    *,
+    side: str,
+    shares: float,
+    avg_price: float,
+    commission: float | None = 0.0,
+    time: dt.datetime = T0,
+) -> SimpleNamespace:
+    """An `ib_async.Fill`-shaped record: `reconcile_entrypoint.fills_from_ib`
+    reads exactly this subset (`contract.symbol`, `execution.{time,side,shares,
+    avgPrice}`, `commissionReport.commission`)."""
+    report = None if commission is None else SimpleNamespace(commission=commission)
+    return SimpleNamespace(
+        contract=SimpleNamespace(symbol=symbol),
+        execution=SimpleNamespace(time=time, side=side, shares=shares, avgPrice=avg_price),
+        commissionReport=report,
+    )
+
+
 class FakeIB:
     def __init__(
         self,
@@ -43,13 +63,19 @@ class FakeIB:
         positions: dict[str, int] | None = None,
         cash: float = 1_000.0,
         fills: bool = True,
+        broker_fills: tuple = (),
         connect_error: BaseException | None = None,
     ) -> None:
         self.clock = clock or FakeClock()
         self.accounts = list(accounts)
         self.book = dict(positions or {})
         self.cash = cash
-        self.fills = fills
+        #: `reconcile_entrypoint.fills_from_ib` reads this through the real
+        #: `.fills()` method below -- kept distinct from `_simulate_fills`
+        #: (the order-fill-simulation toggle) so a method and a bool don't
+        #: collide on the same name.
+        self.broker_fills = list(broker_fills)
+        self._simulate_fills = fills
         self.connect_error = connect_error
         self.connected_with: dict | None = None
         self.disconnected = 0
@@ -112,9 +138,12 @@ class FakeIB:
         self.order_calls.append((contract, order))
         return self._add(contract, order, "Submitted", self.clock())
 
+    def fills(self):
+        return list(self.broker_fills)
+
     def sleep(self, seconds):
         self.clock.advance(seconds)
-        if self.fills:
+        if self._simulate_fills:
             for trade in self._trades:
                 if (
                     trade.orderStatus.status == "Submitted"
