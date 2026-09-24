@@ -342,11 +342,12 @@ class TestThePhase4GateGradesTheseBooks:
     @staticmethod
     def _served(store: LocalStore, days: list[str]) -> None:
         document = TraderEvidenceDocument(
-            schema_version="trader_evidence.v1",
+            schema_version="trader_evidence.v2",
             slot="m",
             champion="m:fixture_model:aaaaaaaaaaaa",
             trading_days=len(days),
             days_served=days,
+            session_modes=dict.fromkeys(days, "shadow"),
             calendar_date=days[-1],
         )
         store.put_bytes(TRADER_EVIDENCE_KEY, json.dumps(document.model_dump()).encode("utf-8"))

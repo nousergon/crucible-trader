@@ -34,6 +34,8 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+from collections.abc import Callable
+from typing import Literal
 
 from crucible.champion import ChampionPointer, ChampionUnusableError, read_champion
 from crucible.explain import verify_money_path_chain
@@ -42,10 +44,16 @@ from crucible.models import TraderEvidenceDocument
 from crucible.serving import PredictionsFeed, PredictionsFeedContractError, read_predictions_feed
 from crucible.store import Store
 
-#: The schema the evidence document declares. Resolved from the model rather
-#: than retyped, so the producer cannot name a version the consumer's schema
-#: does not describe.
-EVIDENCE_SCHEMA_VERSION = "trader_evidence.v1"
+#: The schema the evidence document declares. The model's `Literal` is the
+#: authority -- `tests/test_contract.py` asserts the two agree, so the producer
+#: cannot name a version the consumer's schema does not describe.
+EVIDENCE_SCHEMA_VERSION = "trader_evidence.v2"
+
+#: How a session served its day (`crucible.models.SessionModeLiteral`).
+#: `shadow`: champion resolved, book built, day recorded, NO order sent -- the
+#: only mode this package can run until an order router exists. `live`: the
+#: same, with the book's orders routed to the paper broker.
+SessionMode = Literal["shadow", "live"]
 
 
 class ContractUnavailable(RuntimeError):
@@ -186,16 +194,25 @@ def record_session(
     store: Store,
     contract: ResolvedContract,
     *,
+    mode: SessionMode,
     calendar_date: str | None = None,
+    put: Callable[[str, bytes], object] | None = None,
 ) -> TraderEvidenceDocument:
-    """Add ``contract``'s trading day to the consumer-evidence document.
+    """Add ``contract``'s trading day, and how it was served, to the consumer evidence.
 
     This is the artifact the phase-4 gate clause `trader_one_week_on_v2_champion`
     reads (`crucible.keys.TRADER_EVIDENCE_KEY`). The harness may not reach into
     the trader, so this record is the trader's own account of what it served --
     which is why the document's own schema makes the count uninflatable:
     `trading_days` must equal `len(days_served)`, the days must be real, unique
-    and strictly increasing.
+    and strictly increasing, and every day carries its session mode.
+
+    **``mode`` is required and recorded per day** (`alpha-engine-config-I11545`,
+    Brian's ruling 2 of 2026-09-24: a shadow session counts as a served day).
+    Both modes count toward `trading_days`; the mode is written beside each day
+    so the gate can report how many counted days sent no order. There is no
+    default: a caller that has not decided whether it routed orders has not
+    decided what it served.
 
     **A promotion ENDS a run of days.** When the champion has changed since the
     last record, the count restarts at this session rather than carrying the old
@@ -204,18 +221,30 @@ def record_session(
     as a week.
 
     Idempotent within a day: recording the same trading day twice leaves the
-    document unchanged, so a retried session does not inflate the count.
+    count unchanged, so a retried session does not inflate it. A day recorded
+    `shadow` and later served `live` becomes `live` (orders did leave the trader
+    that day); a day already `live` is never downgraded to `shadow`.
+
+    ``put`` is the write (default `store.put_bytes`); the session job passes
+    its run context's `record_output` so the document enters the manifest's
+    `outputs[]`.
     """
+    if mode not in ("shadow", "live"):
+        raise ValueError(f"session mode {mode!r} is not 'shadow' or 'live'")
     day = contract.trading_day
     previous = _read_evidence(store)
 
     if previous is not None and previous.champion == contract.arm_id:
         days = list(previous.days_served)
+        modes = dict(previous.session_modes)
         if day not in days:
             days.append(day)
             days.sort()
     else:
         days = [day]
+        modes = {}
+    if modes.get(day) != "live":
+        modes[day] = mode
 
     document = TraderEvidenceDocument(
         schema_version=EVIDENCE_SCHEMA_VERSION,
@@ -223,12 +252,11 @@ def record_session(
         champion=contract.arm_id,
         trading_days=len(days),
         days_served=days,
+        session_modes=modes,
         calendar_date=calendar_date or dt.date.today().isoformat(),
     )
-    store.put_bytes(
-        TRADER_EVIDENCE_KEY,
-        json.dumps(document.model_dump(), indent=2, sort_keys=True).encode("utf-8"),
-    )
+    payload = json.dumps(document.model_dump(), indent=2, sort_keys=True).encode("utf-8")
+    (put or store.put_bytes)(TRADER_EVIDENCE_KEY, payload)
     return document
 
 

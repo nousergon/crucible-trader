@@ -86,6 +86,25 @@ In this repository's own dependency graph, `crucible` is pinned by git sha in
 `pyproject.toml` and locked in `uv.lock` — the same sha the wheel is built from,
 so what CI grades and what the box installs are the same code.
 
+## What runs on the executor box
+
+The trader runs on the executor box beside IB Gateway paper (Brian's ruling of
+2026-09-24 on `alpha-engine-config-I11545`). The box's units live in
+`crucible-executor/infrastructure/systemd/` and each one runs the PINNED
+release (`trader/release_pin`) in a fresh virtualenv:
+
+| When (weekdays, UTC) | Entry point | Writes |
+|---|---|---|
+| 14:15 | `scripts/trader_pinned.sh daily_session` | `runs/trader.session/{day}/run.json`, `trader/evidence.json`, `trader/execution_shortfall/{day}.json` |
+| 21:35 | `scripts/trader_reconcile.sh` | `runs/trader.reconcile/{day}/run.json`, `trader/reconciliation/{day}.json`, `trader/broker_statements/{day}.json` |
+| 21:50 | `scripts/trader_pinned.sh shadow_books_daily` | `trader/shadow_books/{decision_day}.json` |
+
+**A shadow session counts as a served day** (ruling 2). With routing off, the
+session resolves the champion, builds the book, records the day in
+`trader/evidence.json` with `session_modes[day] = "shadow"` and files a
+`no_orders` shortfall; no order leaves the trader. The phase-4 gate counts
+shadow and live days alike and names the split.
+
 ## Order routing is off by default
 
 `crucible_trader.order_router` turns the target book into IB **paper** orders.

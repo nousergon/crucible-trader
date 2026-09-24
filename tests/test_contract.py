@@ -243,7 +243,9 @@ class TestABrokenMoneyPathRefusesTheSession:
 class TestTheConsumerEvidenceIsTheTradersOwnAccount:
     def test_a_first_session_files_one_day(self, store: LocalStore) -> None:
         _serveable(store)
-        document = record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
+        document = record_session(
+            store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11"
+        )
 
         assert document.trading_days == 1
         assert document.days_served == [DAY]
@@ -251,7 +253,7 @@ class TestTheConsumerEvidenceIsTheTradersOwnAccount:
 
     def test_it_lands_at_the_key_the_gate_reads(self, store: LocalStore) -> None:
         _serveable(store)
-        record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
+        record_session(store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11")
 
         stored = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY).decode("utf-8"))
 
@@ -260,9 +262,11 @@ class TestTheConsumerEvidenceIsTheTradersOwnAccount:
 
     def test_a_second_session_on_the_same_champion_accumulates(self, store: LocalStore) -> None:
         _serveable(store)
-        record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
+        record_session(store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11")
         _serveable(store, trading_day=NEXT_DAY)
-        document = record_session(store, resolve(store, NEXT_DAY), calendar_date="2026-09-14")
+        document = record_session(
+            store, resolve(store, NEXT_DAY), mode="shadow", calendar_date="2026-09-14"
+        )
 
         assert document.trading_days == 2
         assert document.days_served == [DAY, NEXT_DAY]
@@ -273,8 +277,10 @@ class TestTheConsumerEvidenceIsTheTradersOwnAccount:
         """A retried session is one day. Without this a crash-and-retry loop
         would manufacture a week."""
         _serveable(store)
-        record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
-        document = record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
+        record_session(store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11")
+        document = record_session(
+            store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11"
+        )
 
         assert document.trading_days == 1
 
@@ -283,9 +289,11 @@ class TestTheConsumerEvidenceIsTheTradersOwnAccount:
         total across promotions would let five one-day champions read as a
         week."""
         _serveable(store)
-        record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
+        record_session(store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11")
         _serveable(store, champion=OTHER_ARM, trading_day=NEXT_DAY)
-        document = record_session(store, resolve(store, NEXT_DAY), calendar_date="2026-09-14")
+        document = record_session(
+            store, resolve(store, NEXT_DAY), mode="shadow", calendar_date="2026-09-14"
+        )
 
         assert document.champion == OTHER_ARM
         assert document.trading_days == 1
@@ -299,17 +307,77 @@ class TestTheConsumerEvidenceIsTheTradersOwnAccount:
         _put(store, TRADER_EVIDENCE_KEY, {"schema_version": "trader_evidence.v1"})
 
         with pytest.raises(ValidationError):
-            record_session(store, resolve(store, DAY), calendar_date="2026-09-11")
+            record_session(store, resolve(store, DAY), mode="shadow", calendar_date="2026-09-11")
 
     def test_five_sessions_are_the_week_the_gate_asks_for(self, store: LocalStore) -> None:
         """Five TRADING days, not seven calendar days (§4.12)."""
         week = ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14"]
         for day in week:
             _serveable(store, trading_day=day)
-            document = record_session(store, resolve(store, day), calendar_date=day)
+            document = record_session(store, resolve(store, day), mode="shadow", calendar_date=day)
 
         assert document.trading_days == 5
         assert document.days_served == week
+
+
+class TestEveryServedDayCarriesItsSessionMode:
+    """`alpha-engine-config-I11545`, Brian's ruling 2 of 2026-09-24: a shadow
+    session counts as a served day. The mode is recorded per day, so the count
+    treats the two alike and the reading does not."""
+
+    def test_the_producer_names_the_version_the_consumer_model_declares(self) -> None:
+        declared = TraderEvidenceDocument.model_fields["schema_version"].annotation.__args__
+        assert declared == (contract_module.EVIDENCE_SCHEMA_VERSION,)
+
+    def test_a_shadow_session_is_recorded_as_shadow(self, store: LocalStore) -> None:
+        _serveable(store)
+        document = record_session(store, resolve(store, DAY), mode="shadow")
+
+        assert document.session_modes == {DAY: "shadow"}
+        assert document.shadow_days() == [DAY]
+
+    def test_a_day_served_shadow_then_live_is_live(self, store: LocalStore) -> None:
+        """Orders did leave the trader that day; the record says so."""
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="shadow")
+        document = record_session(store, resolve(store, DAY), mode="live")
+
+        assert document.session_modes == {DAY: "live"}
+        assert document.trading_days == 1
+
+    def test_a_live_day_is_never_downgraded_to_shadow(self, store: LocalStore) -> None:
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="live")
+        document = record_session(store, resolve(store, DAY), mode="shadow")
+
+        assert document.session_modes == {DAY: "live"}
+
+    def test_a_promotion_restarts_the_modes_with_the_days(self, store: LocalStore) -> None:
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="live")
+        _serveable(store, champion=OTHER_ARM, trading_day=NEXT_DAY)
+        document = record_session(store, resolve(store, NEXT_DAY), mode="shadow")
+
+        assert document.session_modes == {NEXT_DAY: "shadow"}
+
+    def test_an_unknown_mode_is_refused_before_anything_is_written(self, store: LocalStore) -> None:
+        _serveable(store)
+        with pytest.raises(ValueError, match="session mode"):
+            record_session(store, resolve(store, DAY), mode="dry_run")  # type: ignore[arg-type]
+        assert not store.exists(TRADER_EVIDENCE_KEY)
+
+    def test_the_write_goes_through_the_callers_put(self, store: LocalStore) -> None:
+        """The session job passes its run context's `record_output`, so the
+        evidence enters the manifest's outputs."""
+        _serveable(store)
+        writes: list[tuple[str, bytes]] = []
+        record_session(
+            store, resolve(store, DAY), mode="shadow", put=lambda k, b: writes.append((k, b))
+        )
+
+        assert [key for key, _ in writes] == [TRADER_EVIDENCE_KEY]
+        assert not store.exists(TRADER_EVIDENCE_KEY)
+        assert json.loads(writes[0][1])["session_modes"] == {DAY: "shadow"}
 
 
 class TestThePhase4GateGradesThisEvidence:
@@ -323,7 +391,7 @@ class TestThePhase4GateGradesThisEvidence:
     def _serve(self, store: LocalStore, days: tuple[str, ...], *, champion: str = ARM) -> None:
         for day in days:
             _serveable(store, champion=champion, trading_day=day)
-            record_session(store, resolve(store, day), calendar_date=day)
+            record_session(store, resolve(store, day), mode="shadow", calendar_date=day)
 
     def test_a_trader_that_filed_nothing_is_a_graded_unmet(self, store, phase4_clause) -> None:
         """Absence is the truthful reading of a trader that has not served, and
@@ -339,7 +407,8 @@ class TestThePhase4GateGradesThisEvidence:
         clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
 
         assert not clause.met and not clause.unmeasurable
-        assert "4 trading day(s) on the v2 champion, 5 required" in clause.detail
+        assert "4 trading day(s) served on v2 champion" in clause.detail
+        assert "(4 shadow, 0 live), 5 required" in clause.detail
 
     def test_five_sessions_on_one_champion_are_the_week(self, store, phase4_clause) -> None:
         self._serve(store, self.WEEK)
@@ -348,6 +417,29 @@ class TestThePhase4GateGradesThisEvidence:
 
         assert clause.met
         assert clause.evidence == (TRADER_EVIDENCE_KEY,)
+
+    def test_a_week_of_shadow_sessions_is_met_and_the_reading_says_shadow(
+        self, store, phase4_clause
+    ) -> None:
+        """I11545 ruling 2: a shadow session counts as a served day, and the
+        reading names how many counted days sent no order."""
+        self._serve(store, self.WEEK)
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert clause.met
+        assert "5 shadow, 0 live" in clause.detail
+
+    def test_a_mixed_week_reads_its_split(self, store, phase4_clause) -> None:
+        self._serve(store, self.WEEK[:3])
+        for day in self.WEEK[3:]:
+            _serveable(store, trading_day=day)
+            record_session(store, resolve(store, day), mode="live", calendar_date=day)
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert clause.met
+        assert "3 shadow, 2 live" in clause.detail
 
     def test_a_promotion_mid_week_is_not_a_week(self, store, phase4_clause) -> None:
         """Five sessions across two champions: the gate reads the count the
@@ -393,15 +485,16 @@ class TestTheFeedIsReadThroughItsPublishedSchema:
         import crucible
 
         path = (
-            pathlib.Path(crucible.__file__).resolve().parent / "schemas" / "trader_evidence.v1.json"
+            pathlib.Path(crucible.__file__).resolve().parent / "schemas" / "trader_evidence.v2.json"
         )
         schema = json.loads(path.read_text(encoding="utf-8"))
         document = TraderEvidenceDocument(
-            schema_version="trader_evidence.v1",
+            schema_version=contract_module.EVIDENCE_SCHEMA_VERSION,
             slot="m",
             champion=ARM,
             trading_days=1,
             days_served=[DAY],
+            session_modes={DAY: "shadow"},
             calendar_date="2026-09-11",
         )
 
