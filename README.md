@@ -86,6 +86,23 @@ In this repository's own dependency graph, `crucible` is pinned by git sha in
 `pyproject.toml` and locked in `uv.lock` — the same sha the wheel is built from,
 so what CI grades and what the box installs are the same code.
 
+## Order routing is off by default
+
+`crucible_trader.order_router` turns the target book into IB **paper** orders.
+It sends nothing unless `CRUCIBLE_TRADER_ORDER_ROUTING=ib_paper` is set in the
+trader's environment on the box. Unset, or `off`, gives a shadow router that
+yields no batch. Any other value raises. Nothing in this repository sets the
+variable. Setting it is an operator decision, not a merge.
+
+When it is set, the router also requires `CRUCIBLE_TRADER_IB_ACCOUNT` (a `DU…`
+paper account and the only account the gateway session manages), the gateway
+on the paper port `4002`, and two caps with no defaults:
+`CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD` and
+`CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD`. It checks the kill switch before
+every order. It never trades a position its own book does not name. Its
+`orderRef` is keyed by trading day and symbol, so a retried session adopts the
+orders it already sent and does not send them again.
+
 ## Where the rest lives
 
 | You need | Go to |
