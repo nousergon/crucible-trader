@@ -1,4 +1,4 @@
-"""Advance every active S arm's shadow book after the close -- the box entry point.
+"""Advance every active S arm's shadow book, one session behind -- the box entry point.
 
 `alpha-engine-config-I11545` (the v2 trader runs on the executor box) over
 `alpha-engine-config-I10653`'s producer: `shadow_inputs.resolve_shadow_inputs`
@@ -8,11 +8,20 @@ decides WHICH days, from the NYSE calendar, and runs the two.
 
 **Fills at close, one session behind.** A decision day's book is held through
 its successor session, so it can be advanced only after that successor has
-closed. Run after the close of trading day ``T``:
+closed. ``T`` is the LAST CLOSED session at run time
+(`crucible.calendar.resolve_trading_day`, the binding every harness job uses):
 
     as_of          = T                          (the successor, now closed)
     decision_day   = the session before T       (the book being advanced)
     previous       = the session before that    (the document it advances from)
+
+**It runs in the MORNING, not after the close.** The inputs for ``T`` --
+`data/{T}/panel.parquet` above all -- are published by the v2 `data-daily`
+schedule at 18:30 New York time, and the executor box is stopped by the v1
+postclose pipeline at 17:10-17:50 New York time (CloudTrail, 2026-09-11 to
+-24). An after-close run on the box would read a panel that does not exist
+yet. Binding ``T`` to the last closed session makes the run correct at any
+hour, so the box timer fires it the next morning, after the session.
 
 and `trader/shadow_books/{decision_day}.json` is written. The phase-4 clause
 `shadow_books_cover_every_active_arm` reads that document for the window's
@@ -30,7 +39,8 @@ import datetime as dt
 from collections.abc import Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from krepis.trading_calendar import is_trading_day, previous_trading_day
+from crucible.calendar import is_trading_day, resolve_trading_day
+from krepis.trading_calendar import previous_trading_day
 
 from crucible_trader.kill_switch import utcnow
 from crucible_trader.paper_smoke import open_configured_store
@@ -68,9 +78,11 @@ def main(
     now = clock()
     today = now.astimezone(NYSE_ZONE).date()
     if not is_trading_day(today):
-        printer(f"SKIP: {today} is not an NYSE session; no session closed today")
+        # A holiday's run would repeat the previous morning's; the next
+        # session's run picks up the same last closed session instead.
+        printer(f"SKIP: {today} is not an NYSE session; the next session's run advances the books")
         return 0
-    as_of, decision_day, previous = sessions_for(today)
+    as_of, decision_day, previous = sessions_for(resolve_trading_day(now))
     store = open_configured_store(Settings.from_env(None if environ is None else dict(environ)))
     resolved = resolve_shadow_inputs(
         store, decision_day=decision_day, as_of=as_of, previous_trading_day=previous
