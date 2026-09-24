@@ -1,0 +1,69 @@
+name: Harness contract canary
+
+# The trader and the phase-4 gate read and write the same artifacts from two
+# different `crucible` versions. The trader installs the sha pinned in
+# `pyproject.toml`; the gate that grades it runs `crucible` main. `ci.yml`
+# proves the trader against its PIN, so a consumer change on crucible main --
+# a renamed key, job, schema field or clause -- is invisible here until someone
+# bumps the pin, and in the meantime the phase-4 reading goes UNMET for a
+# reason nobody connects to this repository (`alpha-engine-config-I9760`).
+# Measured 2026-09-24: the pin was 52 commits behind main and eight tests
+# failed against main on a signature change nothing had announced.
+#
+# This workflow is the trigger a pytest cannot have (`crucible/AGENTS.md`):
+# weekly, it re-locks `crucible` to main's HEAD and runs the whole suite --
+# including the `TestThePhase4Gate*` round trips, which write through this
+# repository's producers and read back through `crucible.gate.evaluate`. Red
+# means "bump the pin and fix what moved", never "the trader is broken on the
+# box": the box runs the pinned wheel.
+#
+# PRIVATE repository, metered minutes: one run a week, no coverage, no audit.
+
+on:
+  schedule:
+    - cron: '17 11 * * 1'  # Mondays 11:17 UTC, before the NYSE open
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: harness-contract-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: suite against crucible main
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'codebuild' && format('codebuild-nousergon-private-runner-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+
+      # `crucible` is public, so its HEAD resolves unauthenticated. Only the
+      # `crucible` entry is re-resolved; every other lock entry stays as locked
+      # unless crucible main itself raised a floor, which is exactly the drift
+      # this run exists to surface.
+      - name: Re-lock crucible to main HEAD
+        run: |
+          set -euo pipefail
+          head_sha="$(git ls-remote https://github.com/nousergon/crucible.git refs/heads/main | cut -f1)"
+          test -n "$head_sha"
+          pinned="$(grep -oE 'nousergon/crucible@[0-9a-f]{40}' pyproject.toml | cut -d@ -f2)"
+          echo "pinned ${pinned}, crucible main ${head_sha}" | tee -a "$GITHUB_STEP_SUMMARY"
+          sed -i "s/${pinned}/${head_sha}/" pyproject.toml
+          uv lock --upgrade-package crucible
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Tests against crucible main
+        run: uv run --frozen pytest -c pyproject.toml -q
+
+  notify-main-failure:
+    needs: [canary]
+    if: ${{ always() && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@43bc22be8910fe1df1f5b14cf2c09537a8477bdf
+    secrets: inherit

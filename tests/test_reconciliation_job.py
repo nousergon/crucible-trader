@@ -238,3 +238,61 @@ class TestTheHarnessWritesThisJobsManifest:
         assert (
             reconciliation_key(DAY.isoformat()) in manifest["money_path_link"]["money_path_writes"]
         )
+
+
+class TestThePhase4GateGradesThisReconciliation:
+    """`run_reconciliation` is the producer; `broker_reconciliation_control_arm_passed`
+    is the consumer. Five sessions written here through the real runner, read back
+    through `crucible.gate.evaluate` as shipped in the pinned wheel
+    (`alpha-engine-config-I9760`, `-I10413`)."""
+
+    CLAUSE = "broker_reconciliation_control_arm_passed"
+    # The five NYSE sessions ending 2026-09-11; 2026-09-07 is Labor Day.
+    WEEK = ("2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11")
+
+    def _week(self, store, *, run_mode="live", broken=None):
+        """``broken``: from that session on the broker holds one more share than
+        any fill explains -- a real, persistent break, found on the day it
+        appears; the next session anchors on the statement that recorded it."""
+        put_anchor(store, day="2026-09-03")
+        for day in self.WEEK:
+            held = {"AAA": 11} if broken is not None and day >= broken else {"AAA": 10}
+            try:
+                run_reconciliation(
+                    store,
+                    FixedSource(held, 1_000.0),
+                    trading_day=dt.date.fromisoformat(day),
+                    fills=(),
+                    cash_flows=(),
+                    corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                    run_mode=run_mode,
+                )
+            except ReconciliationDiscrepancyError:
+                assert day == broken
+
+    def test_a_trader_that_never_reconciled_is_a_graded_unmet(self, store, phase4_clause):
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+        assert not clause.met and not clause.unmeasurable
+        assert "no `trader.reconcile` manifest for any of the 5 sessions" in clause.detail
+
+    def test_five_clean_live_sessions_with_the_control_arm_passing_are_met(
+        self, store, phase4_clause
+    ):
+        self._week(store)
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+        assert clause.met, clause.detail
+        for day in self.WEEK:
+            assert f"runs/{RECONCILE_JOB}/{day}/run.json" in clause.evidence
+            assert reconciliation_key(day) in clause.evidence
+
+    def test_a_discrepancy_on_one_session_is_unmet_naming_it(self, store, phase4_clause):
+        self._week(store, broken="2026-09-09")
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+        assert not clause.met
+        assert f"runs/{RECONCILE_JOB}/2026-09-09/run.json: status `failed`" in clause.detail
+
+    def test_a_replayed_week_reconciles_no_live_book(self, store, phase4_clause):
+        self._week(store, run_mode="replay")
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+        assert not clause.met
+        assert "run_mode `replay`" in clause.detail

@@ -15,6 +15,8 @@ import json
 import numpy as np
 import pytest
 from crucible.execution import shadow_book_coverage, shadow_books_key, validate_shadow_books
+from crucible.keys import TRADER_EVIDENCE_KEY
+from crucible.models import TraderEvidenceDocument
 from crucible.portfolio import CostModel, CostModelInputError, PortfolioParams
 from crucible.slots.arms import write_register
 from crucible.slots.strategy import (
@@ -245,7 +247,11 @@ def _registered(tmp_path, names: list[str]) -> tuple[LocalStore, list[str]]:
     ids: list[str] = []
     for name in names:
         register, record = register.register(
-            slot="s", name=name, spec={"recipe": name}, created_date="2026-09-01"
+            slot="s",
+            name=name,
+            spec={"recipe": name},
+            created_date="2026-09-01",
+            filed_on="2026-09-01",
         )
         ids.append(record.arm_id)
     write_register(store, "s", register)
@@ -323,3 +329,56 @@ class TestRunShadowBooks:
         store = LocalStore(tmp_path)
         assert read_previous_books(store, None) == {}
         assert read_previous_books(store, DAY1) == {}
+
+
+class TestThePhase4GateGradesTheseBooks:
+    """`run_shadow_books` is the producer; `shadow_books_cover_every_active_arm`
+    is the consumer, joined to the trader's served days in `trader/evidence.json`.
+    Read back through `crucible.gate.evaluate` as shipped in the pinned wheel
+    (`alpha-engine-config-I9760`, `-I10653`)."""
+
+    CLAUSE = "shadow_books_cover_every_active_arm"
+
+    @staticmethod
+    def _served(store: LocalStore, days: list[str]) -> None:
+        document = TraderEvidenceDocument(
+            schema_version="trader_evidence.v1",
+            slot="m",
+            champion="m:fixture_model:aaaaaaaaaaaa",
+            trading_days=len(days),
+            days_served=days,
+            calendar_date=days[-1],
+        )
+        store.put_bytes(TRADER_EVIDENCE_KEY, json.dumps(document.model_dump()).encode("utf-8"))
+
+    def _two_sessions(self, tmp_path) -> LocalStore:
+        store, (arm_a, arm_b) = _registered(tmp_path, ["shadow_a", "shadow_b"])
+        run_shadow_books(
+            store,
+            trading_day=DAY1,
+            previous_trading_day=None,
+            inputs={arm_a: _inputs(IMPACT), arm_b: _inputs(FLAT)},
+            now=NOW,
+        )
+        run_shadow_books(
+            store,
+            trading_day=DAY2,
+            previous_trading_day=DAY1,
+            inputs={arm_a: _inputs(IMPACT, day=DAY2, i=1), arm_b: _inputs(FLAT, day=DAY2, i=1)},
+            now=NOW,
+        )
+        return store
+
+    def test_books_without_the_traders_served_days_are_unmet(self, tmp_path, phase4_clause):
+        """Books alone prove nothing: the gate checks them against the days the
+        trader says it served, and a trader that filed none is UNMET."""
+        clause = phase4_clause(self._two_sessions(tmp_path), self.CLAUSE, DAY2)
+        assert not clause.met and not clause.unmeasurable
+        assert f"{TRADER_EVIDENCE_KEY} is absent" in clause.detail
+
+    def test_every_arm_advanced_on_every_served_day_is_met(self, tmp_path, phase4_clause):
+        store = self._two_sessions(tmp_path)
+        self._served(store, [DAY1, DAY2])
+        clause = phase4_clause(store, self.CLAUSE, DAY2)
+        assert clause.met, clause.detail
+        assert shadow_books_key(DAY2) in clause.evidence

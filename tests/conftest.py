@@ -16,12 +16,14 @@ import datetime as dt
 import json
 import math
 import random
+from collections.abc import Callable
 
 import pandas as pd
 import pytest
 from crucible.calendar import is_trading_day
 from crucible.champion import CHAMPION_SCHEMA_VERSION
 from crucible.features import DEFAULT_FEATURE_VERSION
+from crucible.gate import Clause, evaluate
 from crucible.keys import (
     arm_predictions_key,
     champion_key,
@@ -184,7 +186,9 @@ class World:
         writes it."""
         loaded = load_strategy_slot(store=self.store)
         by_id = {arm.arm_id: arm for arm in loaded.registered}
-        register, _ = register_arms(ArmRegister(), [by_id[a] for a in arm_ids])
+        register, _ = register_arms(
+            ArmRegister(), [by_id[a] for a in arm_ids], filed_on=AS_OF.isoformat()
+        )
         write_register(self.store, "s", register)
 
     def drop_prediction(self, day: dt.date, ticker: str) -> None:
@@ -249,3 +253,33 @@ def world(tmp_path) -> World:
     seat_champion(store, "u", U_CHAMPION)
     seat_champion(store, "s", w.arm_id)
     return w
+
+
+@pytest.fixture
+def phase4_clause(monkeypatch: pytest.MonkeyPatch) -> Callable[[LocalStore, str, str], Clause]:
+    """Read one phase-4 clause the way the published gate reads it.
+
+    The producer/consumer contract end to end: a test writes an artifact through
+    this repository's own writer, and this reads it back through
+    `crucible.gate.evaluate(gate="phase4")` -- the public entry point
+    `crucible gate --gate phase4` calls -- as shipped in the pinned wheel. A
+    rename of a key, a job, a schema field or a clause on EITHER side fails
+    here, rather than as a phase-4 reading that stays UNMET for a reason no one
+    connects to this repository (`alpha-engine-config-I9760`).
+
+    The clause is picked out by name, so a clause the gate stops reading is a
+    `StopIteration` here, not a silent pass. The AWS credential chain is emptied
+    first: the gate's Cost Explorer clause must answer UNMEASURABLE offline
+    rather than reach whatever account the test runner can see.
+    """
+    for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/nonexistent/config")
+
+    def read(store: LocalStore, name: str, trading_day: str) -> Clause:
+        result = evaluate(store, gate="phase4", trading_day=dt.date.fromisoformat(trading_day))
+        return next(clause for clause in result.clauses if clause.name == name)
+
+    return read
