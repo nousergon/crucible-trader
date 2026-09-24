@@ -19,6 +19,8 @@ from crucible_trader.shadow_books_daily import main, sessions_for
 
 #: Monday 2026-09-14, 17:45 ET -- after NEXT's close.
 AFTER_CLOSE = dt.datetime(2026, 9, 14, 21, 45, tzinfo=dt.UTC)
+#: Tuesday 2026-09-15, 11:00 ET -- the box timer's slot; NEXT is the last close.
+NEXT_MORNING = dt.datetime(2026, 9, 15, 15, 0, tzinfo=dt.UTC)
 
 
 def _env(world) -> dict[str, str]:
@@ -57,6 +59,22 @@ class TestTheEntryPoint:
         assert code == 0
         assert [b["arm_id"] for b in document["books"]] == [world.arm_id]
         assert document["books"][0]["status"] == "advanced"
+        assert said[-1].startswith(f"shadow books {AS_OF.isoformat()} (as of {NEXT.isoformat()})")
+
+    def test_the_morning_run_advances_the_same_books_as_an_after_close_run(self, world) -> None:
+        """The box is stopped by the evening, so its timer fires the next morning.
+
+        ``as_of`` is the LAST CLOSED session, not today: Tuesday morning's run
+        advances Friday's book as of Monday, exactly what Monday's close would.
+        """
+        world.register([world.arm_id])
+        world.record_session(world.arm_id)
+        said: list[str] = []
+
+        code = main([], environ=_env(world), clock=lambda: NEXT_MORNING, printer=said.append)
+
+        assert code == 0
+        assert world.store.exists(shadow_books_key(AS_OF.isoformat()))
         assert said[-1].startswith(f"shadow books {AS_OF.isoformat()} (as of {NEXT.isoformat()})")
 
     def test_a_failed_book_is_written_and_then_fails_the_run(self, world) -> None:

@@ -93,11 +93,16 @@ The trader runs on the executor box beside IB Gateway paper (Brian's ruling of
 `crucible-executor/infrastructure/systemd/` and each one runs the PINNED
 release (`trader/release_pin`) in a fresh virtualenv:
 
-| When (weekdays, UTC) | Entry point | Writes |
+| When (NYSE sessions, New York time) | Entry point | Writes |
 |---|---|---|
-| 14:15 | `scripts/trader_pinned.sh daily_session` | `runs/trader.session/{day}/run.json`, `trader/evidence.json`, `trader/execution_shortfall/{day}.json` |
-| 21:35 | `scripts/trader_reconcile.sh` | `runs/trader.reconcile/{day}/run.json`, `trader/reconciliation/{day}.json`, `trader/broker_statements/{day}.json` |
-| 21:50 | `scripts/trader_pinned.sh shadow_books_daily` | `trader/shadow_books/{decision_day}.json` |
+| 10:45 | `scripts/trader_pinned.sh daily_session` | `runs/trader.session/{day}/run.json`, `trader/evidence.json`, `trader/execution_shortfall/{day}.json` |
+| 16:45 | `scripts/trader_reconcile.sh` | `runs/trader.reconcile/{day}/run.json`, `trader/reconciliation/{day}.json`, `trader/broker_statements/{day}.json` |
+| 11:00 | `scripts/trader_pinned.sh shadow_books_daily` | `trader/shadow_books/{decision_day}.json` |
+
+The box runs from about 08:15 to between 17:10 and 17:50 New York time. The v2
+`data-daily` run publishes the day's panel at 18:30. So the shadow books for the
+last closed session are advanced the next morning, and the broker is reconciled
+before the box stops.
 
 **A shadow session counts as a served day** (ruling 2). With routing off, the
 session resolves the champion, builds the book, records the day in
