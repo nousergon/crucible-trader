@@ -312,6 +312,55 @@ class TestTheConsumerEvidenceIsTheTradersOwnAccount:
         assert document.days_served == week
 
 
+class TestThePhase4GateGradesThisEvidence:
+    """`record_session` is the producer; `trader_one_week_on_v2_champion` is the
+    consumer. Written here, read back through `crucible.gate.evaluate` as
+    shipped in the pinned wheel (`alpha-engine-config-I9760`)."""
+
+    CLAUSE = "trader_one_week_on_v2_champion"
+    WEEK = ("2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14")
+
+    def _serve(self, store: LocalStore, days: tuple[str, ...], *, champion: str = ARM) -> None:
+        for day in days:
+            _serveable(store, champion=champion, trading_day=day)
+            record_session(store, resolve(store, day), calendar_date=day)
+
+    def test_a_trader_that_filed_nothing_is_a_graded_unmet(self, store, phase4_clause) -> None:
+        """Absence is the truthful reading of a trader that has not served, and
+        it is UNMET -- never UNMEASURABLE, which would hide it."""
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert not clause.met and not clause.unmeasurable
+        assert f"{TRADER_EVIDENCE_KEY} is absent" in clause.detail
+
+    def test_four_sessions_are_not_a_week(self, store, phase4_clause) -> None:
+        self._serve(store, self.WEEK[:4])
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert not clause.met and not clause.unmeasurable
+        assert "4 trading day(s) on the v2 champion, 5 required" in clause.detail
+
+    def test_five_sessions_on_one_champion_are_the_week(self, store, phase4_clause) -> None:
+        self._serve(store, self.WEEK)
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert clause.met
+        assert clause.evidence == (TRADER_EVIDENCE_KEY,)
+
+    def test_a_promotion_mid_week_is_not_a_week(self, store, phase4_clause) -> None:
+        """Five sessions across two champions: the gate reads the count the
+        writer restarted, so it cannot grade two part-weeks as one."""
+        self._serve(store, self.WEEK[:3])
+        self._serve(store, self.WEEK[3:], champion=OTHER_ARM)
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert not clause.met
+        assert "2 trading day(s)" in clause.detail
+
+
 class TestTheFeedIsReadThroughItsPublishedSchema:
     """The consumer-contract half: this repository validates against the schema
     the harness generated and shipped, not against a copy of its own."""

@@ -241,3 +241,51 @@ class TestTheHarnessReadsWhatTheTraderWrote:
 
         row = self._row(self._store_with(tmp_path, broken))
         assert row["status"] == "RED"
+
+
+class TestThePhase4GateGradesThisShortfall:
+    """The same week, read by `execution_shortfall_row_graded` through
+    `crucible.gate.evaluate` as shipped in the pinned wheel -- the gate's reading
+    of the row, not only the report's (`alpha-engine-config-I9760`, `-I10652`)."""
+
+    CLAUSE = "execution_shortfall_row_graded"
+    WEEK = TestTheHarnessReadsWhatTheTraderWrote.WEEK
+    _store_with = TestTheHarnessReadsWhatTheTraderWrote._store_with
+
+    def test_a_trader_that_filed_nothing_is_a_graded_unmet(self, tmp_path, phase4_clause):
+        clause = phase4_clause(LocalStore(tmp_path), self.CLAUSE, self.WEEK[-1])
+        assert not clause.met and not clause.unmeasurable
+        assert "the trader filed no execution-shortfall artifact" in clause.detail
+
+    def test_a_traded_week_is_met(self, tmp_path, phase4_clause):
+        def traded(day: str) -> dict:
+            fills = [_fill(f"{day}-{i}", fill=100.02) for i in range(5)]
+            return build_shortfall_document(
+                trading_day=day, champion=CHAMPION, fills=fills, now=NOW
+            )
+
+        clause = phase4_clause(self._store_with(tmp_path, traded), self.CLAUSE, self.WEEK[-1])
+        assert clause.met, clause.detail
+        assert execution_shortfall_key(self.WEEK[-1]) in clause.evidence
+
+    def test_a_week_with_no_orders_is_unmet_and_not_a_producer_failure(
+        self, tmp_path, phase4_clause
+    ):
+        def idle(day: str) -> dict:
+            return build_no_orders_document(
+                trading_day=day, champion=CHAMPION, reason="no rebalance", now=NOW
+            )
+
+        clause = phase4_clause(self._store_with(tmp_path, idle), self.CLAUSE, self.WEEK[-1])
+        assert not clause.met
+        assert "says `no_orders`" in clause.detail
+
+    def test_a_not_computed_session_is_unmet_naming_it(self, tmp_path, phase4_clause):
+        def broken(day: str) -> dict:
+            return build_not_computed_document(
+                trading_day=day, champion=CHAMPION, reason="fill report never arrived", now=NOW
+            )
+
+        clause = phase4_clause(self._store_with(tmp_path, broken), self.CLAUSE, self.WEEK[-1])
+        assert not clause.met
+        assert "shortfall NOT computed" in clause.detail
