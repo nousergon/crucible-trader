@@ -1,8 +1,8 @@
 """Where the trader is pointed, resolved once and fail-loud.
 
 Every value here names a piece of live infrastructure, so none of them is a
-literal in this tree (`repository-tiering-policy` test 2 — and this repository is
-private, which is a reason to keep the discipline, not an exemption from it).
+literal in this tree (`repository-tiering-policy` test 2; this repository is
+public).
 They arrive from the environment, and a missing or malformed one raises at
 resolution time rather than surfacing as a confusing failure three calls later.
 

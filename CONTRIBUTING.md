@@ -17,7 +17,8 @@
 4. **No LLM calls.** This repository has no LLM dependency and makes no model
    call. Adding one is a policy change, not a code change.
 5. **Nothing tier-1 in the tree.** No credentials, account identifiers, ARNs,
-   instance ids or tuned risk constants — even though the repository is private.
+   instance ids or tuned risk constants. The repository is public, and git
+   history is permanent: a value committed and reverted is still published.
    Real values come from SSM or the strategy tree at runtime.
 
 ## Before you open a PR
@@ -53,6 +54,13 @@ grades nothing.
   naming the PR and stating what was verified.
 - A PR must be deployable by the merge button alone. A "run this after merging"
   instruction in a PR body is not a deploy mechanism.
+
+## Sign-off (DCO)
+
+Every commit carries a `Signed-off-by:` line (`git commit -s`), certifying the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/): that
+you wrote the change, or otherwise have the right to submit it under this
+repository's licence, AGPL-3.0-or-later.
 
 ## Review
 

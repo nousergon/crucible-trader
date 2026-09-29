@@ -3,7 +3,7 @@ name = "crucible-trader"
 version = "0.1.0"
 description = "The trader: reads one contract, refuses an unattested champion, trades nothing without one."
 readme = "README.md"
-license = { text = "LicenseRef-Proprietary" }
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # The harness, consumed as a LIBRARY and never re-implemented. Everything
