@@ -17,7 +17,7 @@ name: Harness contract canary
 # means "bump the pin and fix what moved", never "the trader is broken on the
 # box": the box runs the pinned wheel.
 #
-# PRIVATE repository, metered minutes: one run a week, no coverage, no audit.
+# One run a week, no coverage, no audit.
 
 on:
   schedule:
@@ -33,7 +33,7 @@ concurrency:
 jobs:
   canary:
     name: suite against crucible main
-    runs-on: ${{ vars.CI_RUNNER_MODE == 'codebuild' && format('codebuild-nousergon-private-runner-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

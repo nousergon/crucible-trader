@@ -12,9 +12,8 @@ name: cost-gate
 # Adopted BLOCKING: the replay (origin/main~12..origin/main, the repo's
 # full commit history) found 0 findings and 0 could-not-grade results.
 #
-# This is a private repo — its Actions minutes are not free/unlimited, so
-# --repo-visibility private tells the gate to grade this repo's own CI
-# schedule as spend where applicable.
+# This repo is public (since 2026-09-29), so its GitHub-hosted Actions
+# minutes are free and --repo-visibility public grades accordingly.
 #
 # The gate is installed from nousergon-lib in ITS OWN step, pinned to the
 # v0.124.142 tag with --no-deps, deliberately isolated from this repo's own
@@ -99,4 +98,4 @@ jobs:
             --base "${{ steps.base.outputs.base }}" \
             --head HEAD \
             --root . \
-            --repo-visibility private
+            --repo-visibility public

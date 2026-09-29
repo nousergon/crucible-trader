@@ -5,20 +5,11 @@ name: CI
 # and not a count). Nothing here needs any of the three yet, so everything this
 # repository guards about itself is a test in `tests/`.
 #
-# This repository is PRIVATE, so these minutes are metered against the org
-# allowance. Budget: <= 5 min per PR. Keeping that true is what keeps the meter
-# immaterial — sixteen workflows per repo is how a fleet spends 66% of its
-# metered minutes on one private repo.
-#
-# NO CodeQL job, and that is a measured decision rather than an omission: code
-# scanning on a private repository requires GitHub Advanced Security, and
-# `security_and_analysis.code_security` reads `disabled` on the org's private
-# repos (measured 2026-09-13 against `nousergon/alpha-engine-config`). A CodeQL
-# workflow here would fail on every run with an entitlement error, which is
-# worse than absent — it trains the operator to merge past red. The static
-# surface this repository does gate on is `ruff` (E, F, I, UP, B) plus a
-# blocking `pip-audit` over the exported lockfile. Re-examine if GHAS is ever
-# enabled for private repos: `alpha-engine-config-I10647`.
+# This repository is public, so GitHub-hosted minutes are free and there is no
+# CodeBuild failover (routing a public repo to paid compute would replace
+# something free, `scm-platform-policy` §4.1). The static surface this
+# repository gates on is `ruff` (E, F, I, UP, B) plus a blocking `pip-audit`
+# over the exported lockfile.
 
 on:
   push:
@@ -36,10 +27,6 @@ on:
     # red, and unmergeable.
 
 # Default-deny at the workflow level; the job re-grants only what it needs.
-# `contents: read` is NOT optional while this repo is private: with no
-# permissions at all the token cannot see the repository and `actions/checkout`
-# fails with "Repository not found", which reads like a missing repo rather than
-# a missing scope.
 permissions: {}
 
 concurrency:
@@ -55,17 +42,7 @@ jobs:
     # ruleset. Renaming the job renames the context, and a required check whose
     # context no longer exists blocks every merge with no visible cause.
     name: lint + tests
-    # GitHub-hosted by default; CodeBuild when the fleet has flipped
-    # `CI_RUNNER_MODE` because the included-minutes allowance is at risk
-    # (`scm-platform-policy` §4.1). This repository is PRIVATE, so its minutes
-    # are metered and the failover is not optional: `atlas` was absent from this
-    # toggle and from the runner's webhook allowlist, burned 10,818 Actions
-    # minutes in August 2026 and carried $33.15 of the $42.56 billed once the
-    # allowance ran out -- while the runner-mode guard flipped on schedule and
-    # reported success (`alpha-engine-config-I10475`). The companion half is the
-    # `REPOSITORY_NAME` allowlist on `nousergon-private-runner`, which names
-    # this repo as of the same change.
-    runs-on: ${{ vars.CI_RUNNER_MODE == 'codebuild' && format('codebuild-nousergon-private-runner-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
