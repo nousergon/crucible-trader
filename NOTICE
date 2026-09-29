@@ -1,0 +1,12 @@
+crucible-trader
+Copyright (C) 2026 Nous Ergon
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE for the full text.
+
+crucible-trader consumes nousergon/crucible (AGPL-3.0-or-later) as a pinned
+dependency. Nothing in this repository is a copy of it: the coupling is the two
+contract documents crucible publishes (the champion pointer and the
+predictions feed).

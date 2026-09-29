@@ -1,9 +1,7 @@
 # Agent instruction files are SYMLINKS into the private nous-ergon-ops repo
 # (`nous-ergon-ops/agent-instructions/crucible-trader/AGENTS.md`). This repo is
-# PRIVATE, so they could be tracked here — they are not, because one
-# installation mechanism for the whole fleet is one mechanism to maintain
-# (`link_agent_instructions.sh`), and the repo that flips the convention is the
-# repo whose instructions go stale first.
+# public and agent-instruction files are private by default
+# (`repository-tiering-policy` §5.3), so they are never tracked here.
 AGENTS.md
 CLAUDE.md
 

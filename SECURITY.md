@@ -14,8 +14,8 @@ accepted with a named residual, or disputed with a reason — within fourteen.
 the kill switch, the account guard, reconciliation tolerances and the sizing
 path. A defect here does not produce a wrong verdict; it produces a wrong order.
 
-That is why the repository is private, and why the following are never committed
-to it under any circumstance:
+The code is public; the operation is not. The following are never committed to
+it under any circumstance:
 
 - credentials, API keys, tokens, broker passwords, session files
 - account numbers, account allowlists with real values, ARNs, instance ids

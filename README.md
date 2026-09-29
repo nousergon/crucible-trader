@@ -137,6 +137,10 @@ orders it already sent and does not send them again.
 | The epic | `alpha-engine-config-I9751` |
 | The harness | [`nousergon/crucible`](https://github.com/nousergon/crucible) |
 
+## Licence
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
 ## Security
 
 See [SECURITY.md](SECURITY.md). This repository is on the money path: treat every
