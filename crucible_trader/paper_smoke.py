@@ -41,7 +41,6 @@ from crucible.release import (
     TRADER_PIN_KEY,
     TRADER_SMOKE_JOB,
     assert_sha,
-    read_pointer,
     wheel_filename_for,
 )
 from crucible.runner import RunContext, run_job
@@ -49,6 +48,7 @@ from crucible.store import Store, open_store
 
 from crucible_trader.broker_session import GatewayAddress, ReadOnlyBroker, connect, load_sdk
 from crucible_trader.broker_statement import IbPaperStatementSource
+from crucible_trader.pin_request import read_trader_pin
 from crucible_trader.settings import Settings
 
 SMOKE_SCHEMA_VERSION = "trader_paper_smoke.v1"
@@ -99,7 +99,7 @@ def running_wheel_disagreement(store: Store, installed_version: str) -> str | No
     pinned). The session raises on a non-None result inside its own `run_job`,
     which makes its manifest `failed` -- the page.
     """
-    sha, _ = read_pointer(store, TRADER_PIN_KEY)
+    sha = read_trader_pin(store)
     if sha is None:
         return f"{TRADER_PIN_KEY} is unset while the trader runs crucible {installed_version!r}"
     want = expected_version(sha)

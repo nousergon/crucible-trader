@@ -59,6 +59,22 @@ UNREADABLE_EXIT = 3
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+def read_trader_pin(store: Any) -> str | None:
+    """The sha `trader/release_pin` names, or ``None`` when it has never been set.
+
+    Absence is decided by LISTING the exact key, the same way the request's is,
+    because `read_pointer` decides it with a HEAD, and a HEAD on an absent key
+    is a 403 for an identity whose `s3:ListBucket` is prefix-conditioned.
+    Measured on the executor box 2026-09-30: the pin had never been set, and
+    every smoke failed `HeadObject ... Forbidden` before it could say so. A
+    refused listing still raises; it is never read as "unset".
+    """
+    if TRADER_PIN_KEY not in set(store.list_keys(TRADER_PIN_KEY)):
+        return None
+    sha, _ = read_pointer(store, TRADER_PIN_KEY)
+    return sha
+
+
 class PinRequestUnreadableError(RuntimeError):
     """The request could not be read or does not conform. Never "none"."""
 
@@ -123,10 +139,16 @@ def decide(store: Any) -> Decision:
         return Decision("none", None, "no trader pin has been requested")
     sha, from_sha = request["sha"], request.get("from_sha")
     try:
-        pin_sha, _ = read_pointer(store, TRADER_PIN_KEY)
+        pin_sha = read_trader_pin(store)
     except Exception as exc:
+        hint = (
+            f" The trader identity needs s3:ListBucket (s3:prefix {TRADER_PIN_KEY!r}) and "
+            f"s3:GetObject on {TRADER_PIN_KEY!r} in the store."
+            if _error_code(exc) in ("AccessDenied", "403")
+            else ""
+        )
         raise PinRequestUnreadableError(
-            f"cannot read {TRADER_PIN_KEY}: {type(exc).__name__}: {exc}"
+            f"cannot read {TRADER_PIN_KEY}: {type(exc).__name__}: {exc}.{hint}"
         ) from exc
     asked = f"requested by {request.get('requested_by')} at {request.get('requested_at')}"
     if pin_sha == sha:
