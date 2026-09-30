@@ -130,6 +130,23 @@ class _DeniedS3(FakeS3):
         return SimpleNamespace(paginate=paginate)
 
 
+class _HeadDeniedS3(FakeS3):
+    """The trader identity as granted on the box: listing works, but a HEAD or
+    GET on an ABSENT key is a 403 -- S3's answer when the caller's
+    `s3:ListBucket` does not cover the key. Measured 2026-09-30 on
+    `trader/release_pin`, which has never been set."""
+
+    def head_object(self, **kw):
+        if kw["Key"] not in self.objects:
+            raise ClientError({"Error": {"Code": "403"}}, "HeadObject")
+        return super().head_object(**kw)
+
+    def get_object(self, **kw):
+        if kw["Key"] not in self.objects:
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+        return super().get_object(**kw)
+
+
 class TestTheStoreRefusing:
     def _store(self, client) -> S3Store:
         return S3Store("bucket", "crucible", client=client)
@@ -158,6 +175,39 @@ class TestTheStoreRefusing:
         _pin(store, SHA_A)
         _request(store)
         assert decide(store).state == "fresh"
+
+    def test_a_never_set_pin_behind_a_head_403_reads_as_unset(self) -> None:
+        store = self._store(_HeadDeniedS3(lambda: dt.datetime(2026, 9, 30, tzinfo=dt.UTC)))
+        _request(store, from_sha=None)
+        decision = decide(store)
+        assert (decision.state, decision.sha) == ("fresh", SHA_B)
+        assert pin_request.read_trader_pin(store) is None
+
+    def test_a_set_pin_behind_a_head_403_store_is_still_read(self) -> None:
+        store = self._store(_HeadDeniedS3(lambda: dt.datetime(2026, 9, 30, tzinfo=dt.UTC)))
+        _pin(store, SHA_A)
+        _request(store)
+        assert decide(store).state == "fresh"
+        assert pin_request.read_trader_pin(store) == SHA_A
+
+    def test_a_refused_pin_listing_names_the_grant(self) -> None:
+        class _PinListDenied(FakeS3):
+            def get_paginator(self, name):
+                inner = super().get_paginator(name)
+
+                def paginate(**kw):
+                    if kw.get("Prefix", "").endswith(TRADER_PIN_KEY):
+                        raise ClientError({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+                    return inner.paginate(**kw)
+
+                return SimpleNamespace(paginate=paginate)
+
+        store = self._store(_PinListDenied(lambda: dt.datetime(2026, 9, 30, tzinfo=dt.UTC)))
+        _request(store, from_sha=None)
+        with pytest.raises(pin_request.PinRequestUnreadableError) as caught:
+            decide(store)
+        message = str(caught.value)
+        assert f"cannot read {TRADER_PIN_KEY}" in message and "s3:ListBucket" in message
 
     def test_the_error_code_reader_tolerates_a_non_aws_exception(self) -> None:
         assert pin_request._error_code(ValueError("x")) is None
