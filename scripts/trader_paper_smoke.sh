@@ -61,4 +61,12 @@ uv venv --quiet --python 3.12 "$work/venv"
 uv pip install --quiet --python "$work/venv/bin/python" -r "$work/requirements.txt" "$work/$wheel"
 uv pip install --quiet --python "$work/venv/bin/python" --no-deps "$repo"
 
+# `crucible.runner.run_job` stamps `code_sha` from $CRUCIBLE_CODE_SHA, and
+# falls back to `git rev-parse HEAD` inside the installed wheel's directory,
+# which is no checkout. So without this the job refuses before it runs
+# (measured on the box 2026-10-01: `CodeShaError: $CRUCIBLE_CODE_SHA is
+# unset`). The code that runs IS the release wheel, so its sha is the
+# answer. crucible's own job boxes export the same value
+# (nous-ergon-ops crucible-v2.yaml, alpha-engine-config-I10454).
+export CRUCIBLE_CODE_SHA="$sha"
 "$work/venv/bin/python" -c 'import sys; from crucible_trader.paper_smoke import main; sys.exit(main(sys.argv[1:]))' --release "$sha"

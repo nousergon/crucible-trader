@@ -48,12 +48,14 @@ trap 'rm -rf "$work"' EXIT
 
 wheel="$(uv run --frozen --project "$repo" python - "$work" <<'PY'
 import hashlib, os, sys
-from crucible.release import TRADER_PIN_KEY, read_pointer, resolve_published_wheel
+from crucible.release import TRADER_PIN_KEY, resolve_published_wheel
 from crucible.store import open_store
+
+from crucible_trader.pin_request import read_trader_pin
 
 out = sys.argv[1]
 store = open_store(os.environ["CRUCIBLE_TRADER_STORE_URI"])
-sha, _ = read_pointer(store, TRADER_PIN_KEY)
+sha = read_trader_pin(store)
 if sha is None:
     raise SystemExit(f"{TRADER_PIN_KEY} is unset; no release is pinned to the trader")
 published = resolve_published_wheel(store, sha)
@@ -64,9 +66,11 @@ if digest != published.record.wheel_sha256:
 name = published.wheel_key.rsplit("/", 1)[1]
 with open(os.path.join(out, name), "wb") as handle:
     handle.write(payload)
-print(name)
+print(name, sha)
 PY
 )"
+pinned_sha="${wheel#* }"
+wheel="${wheel%% *}"
 
 uv export --frozen --project "$repo" --extra ib --no-emit-project --no-hashes --format requirements-txt \
   | grep -v '^crucible @' | grep -v '^ *#' > "$work/requirements.txt"
@@ -74,6 +78,14 @@ uv venv --quiet --python 3.12 "$work/venv"
 uv pip install --quiet --python "$work/venv/bin/python" -r "$work/requirements.txt" "$work/$wheel"
 uv pip install --quiet --python "$work/venv/bin/python" --no-deps "$repo"
 
+# `crucible.runner.run_job` stamps `code_sha` from $CRUCIBLE_CODE_SHA, and
+# falls back to `git rev-parse HEAD` inside the installed wheel's directory,
+# which is no checkout. So without this the job refuses before it runs
+# (measured on the box 2026-10-01: `CodeShaError: $CRUCIBLE_CODE_SHA is
+# unset`). The code that runs IS the release wheel, so its sha is the
+# answer. crucible's own job boxes export the same value
+# (nous-ergon-ops crucible-v2.yaml, alpha-engine-config-I10454).
+export CRUCIBLE_CODE_SHA="$pinned_sha"
 "$work/venv/bin/python" -c \
   'import sys; from crucible_trader.commands import main; sys.exit(main(sys.argv[1:]))' \
   reconcile run "${genesis_flag[@]}"
