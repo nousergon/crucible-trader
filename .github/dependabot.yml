@@ -15,6 +15,24 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # `crucible` is pinned by GIT SHA (see the pin's rationale in
+    # `pyproject.toml`), and Dependabot's `uv` updater cannot follow a git
+    # direct reference: it looks the NAME up on PyPI, finds the unrelated
+    # `crucible` project there (mspinola/crucible, latest 0.7.0) and tries to
+    # re-lock with `crucible==0.7.0`. Measured on the weekly `uv` runs
+    # 34785701550 (2026-09-13) and 36353960358 (2026-09-27): that attempt
+    # fails resolution and turns the whole job red, while the real
+    # updates in the same run (e.g. `ruff`) still open their PR.
+    #
+    # Ignoring it loses nothing: the sha only moves by a deliberate PR that
+    # edits the pin, because the trader runs the release named by
+    # `trader/release_pin` and the two shas are required to agree. And the
+    # failure mode it removes is not cosmetic: a resolution that SUCCEEDED
+    # would be a Dependabot PR proposing a stranger's package under this name
+    # — and one can: substituting `crucible==0.7.0` for the git pin and running
+    # `uv lock` resolves cleanly to the PyPI wheel (measured 2026-10-02).
+    ignore:
+      - dependency-name: crucible
     groups:
       minor-and-patch:
         update-types:
