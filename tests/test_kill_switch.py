@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 from crucible.models import MetricRecordRow
-from crucible.store import LocalStore
+from crucible.store import LocalStore, S3Store
 from ib_fakes import DAY, T0, FakeClock, FakeIB, FakeSdk, ctx_for
+from s3_fake import FakeS3
 
 from crucible_trader.kill_switch import (
     KILL_SWITCH_JOB,
@@ -95,6 +98,68 @@ class TestState:
     def test_a_released_switch_permits_trading(self, store) -> None:
         _put_state(store, engaged=False, mode=None)
         assert_trading_permitted(store, "2026-09-08")
+
+
+class _GetDeniedWhenAbsentS3(FakeS3):
+    """The trader identity on the box: a HEAD or GET on an ABSENT key is a 403,
+    S3's answer when the caller's `s3:ListBucket` does not cover the key. The
+    switch is absent until its first fire (alpha-engine-config-I11966)."""
+
+    def head_object(self, **kw):
+        if kw["Key"] not in self.objects:
+            raise ClientError({"Error": {"Code": "403"}}, "HeadObject")
+        return super().head_object(**kw)
+
+    def get_object(self, **kw):
+        if kw["Key"] not in self.objects:
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+        return super().get_object(**kw)
+
+
+class _ListDeniedS3(_GetDeniedWhenAbsentS3):
+    """The same identity WITHOUT the one-key list grant."""
+
+    def get_paginator(self, name):
+        def paginate(**kw):
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+
+        return SimpleNamespace(paginate=paginate)
+
+
+def _s3_store(client) -> S3Store:
+    return S3Store("bucket", "crucible", client=client)
+
+
+class TestAbsenceIsAListingNotAGetStatus:
+    """alpha-engine-config-I11966: the never-fired switch must read as "off"
+    under an identity whose GET on an absent key is a 403."""
+
+    def test_a_never_fired_switch_behind_a_get_403_reads_as_none(self) -> None:
+        store = _s3_store(_GetDeniedWhenAbsentS3(lambda: T0))
+        assert read_state(store) is None
+        assert_trading_permitted(store, "2026-09-08")
+
+    def test_a_fired_switch_behind_the_same_store_is_still_read(self) -> None:
+        store = _s3_store(_GetDeniedWhenAbsentS3(lambda: T0))
+        _put_state(store, mode="freeze")
+        assert read_state(store)["mode"] == "freeze"
+        with pytest.raises(TradingHaltedError):
+            assert_trading_permitted(store, "2026-09-08")
+
+    def test_a_switch_gone_between_the_listing_and_the_get_reads_as_none(self) -> None:
+        class _Vanishing:
+            def list_keys(self, prefix):
+                return iter([KILL_SWITCH_KEY])
+
+            def get_bytes(self, key):
+                raise KeyError(key)
+
+        assert read_state(_Vanishing()) is None
+
+    def test_a_refused_listing_raises_and_is_never_off(self) -> None:
+        store = _s3_store(_ListDeniedS3(lambda: T0))
+        with pytest.raises(ClientError, match="AccessDenied"):
+            assert_trading_permitted(store, "2026-09-08")
 
 
 class TestFire:
