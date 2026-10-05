@@ -23,6 +23,12 @@ charged by the recipe's cost model — the book the settled grade walk builds.
 **No active arm is silently dropped** (`alpha-engine-config-I10636`). An arm
 whose inputs cannot be resolved comes back in ``unresolved`` with the reason,
 and `run_shadow_books` records it as a failed book naming that reason.
+
+**Controls are not resolved** (`alpha-engine-config-I12021`). A control arm
+(`ArmRecord.control`) has no filed recipe and no construction inputs by
+design: it is scored by the grade's seeded selection. It is listed in
+``active_arms`` and ``controls`` and in neither ``inputs`` nor ``unresolved``;
+`run_shadow_books` records it with the ruled non-book status.
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ class ResolvedShadowInputs:
     decision_day: str
     as_of: str
     active_arms: tuple[str, ...]
+    controls: tuple[str, ...]
     inputs: Mapping[str, ArmSessionInputs]
     unresolved: Mapping[str, str]
 
@@ -78,14 +85,17 @@ def resolve_shadow_inputs(
     books advance from — the same value handed to `run_shadow_books` — or None
     at inception. It is required so a caller cannot silently omit the held names.
     """
-    active = tuple(read_register(store, SLOT).active_arms())
-    previous = read_previous_books(store, previous_trading_day) if active else {}
+    register = read_register(store, SLOT)
+    active = tuple(register.active_arms())
+    controls = tuple(arm_id for arm_id in active if register.state(arm_id).record.control)
+    challengers = tuple(arm_id for arm_id in active if arm_id not in controls)
+    previous = read_previous_books(store, previous_trading_day) if challengers else {}
     registered, load_note = _registered_by_id(store, decision_day)
     inputs: dict[str, ArmSessionInputs] = {}
     unresolved: dict[str, str] = {}
     params = None
     params_error: str | None = None
-    if active:
+    if challengers:
         try:
             params = load_portfolio_params_from_store(SLOT, store=store)
         except Exception as exc:
@@ -94,7 +104,7 @@ def resolve_shadow_inputs(
             # `unresolved` reason -> a failed book in shadow_books.v1, and
             # ShadowBookFailure raised by run_shadow_books after writing.
             params_error = f"{type(exc).__name__}: {exc}"
-    for arm_id in active:
+    for arm_id in challengers:
         arm = registered.get(arm_id)
         if arm is None:
             unresolved[arm_id] = (
@@ -138,6 +148,7 @@ def resolve_shadow_inputs(
         decision_day=decision_day,
         as_of=as_of,
         active_arms=active,
+        controls=controls,
         inputs=inputs,
         unresolved=unresolved,
     )

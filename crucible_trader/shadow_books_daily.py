@@ -40,6 +40,7 @@ from collections.abc import Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from crucible.calendar import is_trading_day, resolve_trading_day
+from crucible.execution import CONTROL_NON_BOOK_STATUS
 from krepis.trading_calendar import previous_trading_day
 
 from crucible_trader.kill_switch import utcnow
@@ -95,8 +96,10 @@ def main(
         unresolved=resolved.unresolved,
         now=now,
     )
+    controls = sum(1 for b in document["books"] if b["status"] == CONTROL_NON_BOOK_STATUS)
     printer(
-        f"shadow books {decision_day} (as of {as_of}): {len(document['books'])} active arm(s), "
-        "every book advanced"
+        f"shadow books {decision_day} (as of {as_of}): "
+        f"{len(document['books']) - controls} challenger book(s), every one advanced; "
+        f"{controls} control(s) recorded as {CONTROL_NON_BOOK_STATUS}"
     )
     return 0

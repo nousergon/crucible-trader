@@ -34,7 +34,8 @@ from crucible.keys import (
     strategy_arm_key,
     strategy_slot_key,
 )
-from crucible.slots.arms import register_arms, write_register
+from crucible.slots import get_slot
+from crucible.slots.arms import control_specs, register_arms, write_register
 from crucible.slots.strategy import load_strategy_slot, parse_strategy_document, resolve_session
 from crucible.store import LocalStore
 from nousergon_lib.arena.arms import ArmRegister
@@ -180,16 +181,20 @@ class World:
         self.store.put_bytes(strategy_arm_key("s", name), payload)
         return parse_strategy_document(payload, origin=name).arm_id
 
-    def register(self, arm_ids: list[str]) -> None:
+    def register(self, arm_ids: list[str], *, controls: bool = False) -> list[str]:
         """Register each filed recipe through the harness's own `register_arms`,
         so the register carries the recipe's own id exactly as `experiment.run`
-        writes it."""
+        writes it. ``controls`` also registers the S slot's two harness-generated
+        control arms, as `experiment.run` does (`control_specs`); their ids are
+        returned."""
         loaded = load_strategy_slot(store=self.store)
         by_id = {arm.arm_id: arm for arm in loaded.registered}
+        generated = control_specs(get_slot("s")) if controls else []
         register, _ = register_arms(
-            ArmRegister(), [by_id[a] for a in arm_ids], filed_on=AS_OF.isoformat()
+            ArmRegister(), [by_id[a] for a in arm_ids] + generated, filed_on=AS_OF.isoformat()
         )
         write_register(self.store, "s", register)
+        return [spec.arm_id for spec in generated]
 
     def drop_prediction(self, day: dt.date, ticker: str) -> None:
         """The M champion stops pricing ``ticker`` on ``day`` (I10754's fixture)."""
