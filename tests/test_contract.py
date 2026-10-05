@@ -499,3 +499,57 @@ class TestTheFeedIsReadThroughItsPublishedSchema:
         )
 
         Draft202012Validator(schema).validate(document.model_dump())
+
+
+class TestTheLiveUncertaintyFeedIsServed:
+    """`alpha-engine-config-I12020`. On 2026-10-05 the harness published
+    `predictions/2026-10-02.json` carrying the M champion's uncertainty fields
+    (crucible#372, `alpha-engine-config-I11791`), and the trader pinned at
+    `9aeb864` refused the whole session: its `predictions_feed.v1` model forbade
+    the three keys as extra inputs. The shape below is that live document's, key
+    for key, with the method and note copied verbatim and the cross-section cut
+    to two names. It must resolve through the trader's own reader, with the
+    uncertainty carried through rather than stripped, and validate against the
+    schema the pinned wheel ships. Against the old pin this class fails with the
+    same `Extra inputs are not permitted` refusal the live session filed.
+    """
+
+    METHOD = "purged_kfold_oos_residual"
+    NOTE = (
+        "lightgbm has no posterior: mean squared out-of-sample residual of a purged "
+        "6-fold over the fit's 505 training day(s) (454917 residual(s), 21-session "
+        "purge, 2-session embargo). Cross-sectionally flat; no aleatoric/epistemic "
+        "split is measured, so none is written"
+    )
+
+    def _live_shaped_feed(self) -> dict:
+        document = _feed()
+        document["predicted_alpha_std"] = {"AAPL": 0.0753, "MSFT": 0.0753}
+        document["predicted_alpha_std_method"] = self.METHOD
+        document["predicted_alpha_std_note"] = self.NOTE
+        return document
+
+    def test_the_session_resolves_and_keeps_the_uncertainty(self, store: LocalStore) -> None:
+        _serveable(store)
+        _put(store, predictions_key(DAY), self._live_shaped_feed())
+
+        resolved = resolve(store, DAY)
+
+        assert resolved.feed.predicted_alpha_std == {"AAPL": 0.0753, "MSFT": 0.0753}
+        assert resolved.feed.uncertainty["predicted_alpha_std_method"] == self.METHOD
+        assert resolved.feed.uncertainty["predicted_alpha_std_note"] == self.NOTE
+
+    def test_it_validates_against_the_shipped_schema(self) -> None:
+        Draft202012Validator(TestTheFeedIsReadThroughItsPublishedSchema._schema()).validate(
+            self._live_shaped_feed()
+        )
+
+    def test_an_undeclared_key_is_still_refused(self, store: LocalStore) -> None:
+        """Accepting the declared fields did not loosen `extra=forbid`."""
+        _serveable(store)
+        document = self._live_shaped_feed()
+        document["predicted_alpha_undeclared"] = {"AAPL": 1.0}
+        _put(store, predictions_key(DAY), document)
+
+        with pytest.raises(ContractRefusal, match="Extra inputs are not permitted"):
+            resolve(store, DAY)
