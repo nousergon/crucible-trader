@@ -283,3 +283,28 @@ def phase4_clause(monkeypatch: pytest.MonkeyPatch) -> Callable[[LocalStore, str,
         return next(clause for clause in result.clauses if clause.name == name)
 
     return read
+
+
+#: Seconds of uptime the suite's default host reports: far past any boot grace,
+#: so a failed connect in a test that does not opt into the boot race reads as
+#: the expired-session condition it always did, whatever the CI runner's real
+#: uptime happens to be.
+LONG_UPTIME_S = 86_400.0
+
+
+@pytest.fixture(autouse=True)
+def _gateway_port_listens(monkeypatch) -> None:
+    """Every fake gateway in this suite is already up.
+
+    `broker_session.connect` probes the real TCP port before the SDK connect and
+    reads the real `/proc/uptime` when a connect fails. Nothing listens on the
+    fake address in CI, so without this every test that opens a fake session
+    would wait out the full readiness deadline, and every failure would be
+    classified by the runner's own uptime. Tests of the wait and the
+    classification pass `probe=` / `uptime=` explicitly, and test the real
+    `port_listening` / `read_uptime_s` against a real socket and a real file.
+    """
+    import crucible_trader.broker_session as broker_session
+
+    monkeypatch.setattr(broker_session, "port_listening", lambda host, port: True)
+    monkeypatch.setattr(broker_session, "read_uptime_s", lambda: LONG_UPTIME_S)
