@@ -256,10 +256,25 @@ def read_state(store: Store) -> dict[str, Any] | None:
 
     Anything present that is not exactly a halt document raises
     :class:`KillSwitchStateError`: an unreadable switch is never read as "off".
+
+    **Absence is decided by LISTING the exact key, never by a GET status**
+    (alpha-engine-config-I11966). S3 answers a GET on an ABSENT key with 403,
+    not 404, when the caller's `s3:ListBucket` does not cover it -- and the
+    switch is absent until its first fire (measured 2026-10-04: HEAD 404 on
+    `trader/kill_switch.json`). Read by a GET alone, a never-fired switch on
+    the trader identity raises AccessDenied at the first
+    :func:`assert_trading_permitted`, which is nous-ergon-ops-I1475's shape on
+    the pin. The listing needs `s3:ListBucket` with `s3:prefix` = the key; a
+    REFUSED listing still raises, so a missing grant halts loudly and is never
+    read as "off".
     """
+    if KILL_SWITCH_KEY not in set(store.list_keys(KILL_SWITCH_KEY)):
+        return None
     try:
         payload = store.get_bytes(KILL_SWITCH_KEY)
     except KeyError:
+        # Listed, then gone before the GET. Nothing this identity holds can
+        # delete the switch, so this is the same "never written" as above.
         return None
     try:
         document = json.loads(payload.decode("utf-8"))
