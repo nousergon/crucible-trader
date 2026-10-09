@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sys
 
 import pytest
-from conftest import AS_OF, D_PREV, NEXT
+from conftest import AS_OF, D_PREV, M_CHAMPION, NEXT
 from crucible.execution import shadow_books_key
+from crucible.keys import TRADER_EVIDENCE_KEY
+from crucible.models import TraderEvidenceDocument
 
+import crucible_trader.broker_session as broker_session
+import crucible_trader.order_router as order_router
+import crucible_trader.paper_smoke as paper_smoke
 from crucible_trader.shadow_books import ShadowBookFailure
 from crucible_trader.shadow_books_daily import main, sessions_for
 
@@ -84,3 +90,87 @@ class TestTheEntryPoint:
             main([], environ=_env(world), clock=lambda: AFTER_CLOSE)
         document = json.loads(world.store.get_bytes(shadow_books_key(AS_OF.isoformat())))
         assert document["books"][0]["status"] == "failed"
+
+
+#: Tuesday 2026-09-15, ~22:00 ET -- when the published phase-4 gate for 09-15 is
+#: taken (`runs/gate/{day}/run.json` lands about then every trading day).
+GATE_EVENING = dt.date(2026, 9, 15)
+
+
+def _served(world, days: list[str]) -> None:
+    """`trader/evidence.json` as the box's `trader.session` runs leave it: each
+    morning's 10:45 ET session binds to the LAST CLOSED session, so by the
+    evening of 09-15 the sessions of 09-14 and 09-15 have served 09-11 and 09-14.
+    """
+    document = TraderEvidenceDocument(
+        schema_version="trader_evidence.v2",
+        slot="m",
+        champion=M_CHAMPION,
+        trading_days=len(days),
+        days_served=days,
+        session_modes=dict.fromkeys(days, "shadow"),
+        calendar_date=days[-1],
+    )
+    world.store.put_bytes(TRADER_EVIDENCE_KEY, json.dumps(document.model_dump()).encode("utf-8"))
+
+
+class TestThePhase4GateReadsWhatTheBoxScheduleFiles:
+    """C29 (2026-10-03 run), `alpha-engine-config-I10653` over the I11545 ruling.
+
+    The round trip on the box's own clock, not on a convenient one: the 11:00 ET
+    run of 09-15 advances 09-11's book as of 09-14, and the evening gate of
+    09-15 reads it -- through `crucible.gate.evaluate(gate="phase4")` as shipped
+    in the pinned wheel -- against the days the trader served. Before
+    crucible's settlement-lag read the gate asked for `shadow_books/2026-09-15
+    .json`, a document this schedule writes on 09-17, and the clause could never
+    read MET.
+    """
+
+    CLAUSE = "shadow_books_cover_every_active_arm"
+
+    def test_the_morning_run_is_read_met_by_that_evenings_gate(self, world, phase4_clause):
+        world.register([world.arm_id])
+        world.record_session(world.arm_id)
+        _served(world, [AS_OF.isoformat(), NEXT.isoformat()])
+
+        code = main([], environ=_env(world), clock=lambda: NEXT_MORNING, printer=lambda _: None)
+        clause = phase4_clause(world.store, self.CLAUSE, GATE_EVENING.isoformat())
+
+        assert code == 0
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert shadow_books_key(AS_OF.isoformat()) in clause.evidence
+        assert "on all 1 served day(s)" in clause.detail
+
+    def test_a_morning_the_run_did_not_happen_is_unmet_by_that_evening(self, world, phase4_clause):
+        world.register([world.arm_id])
+        _served(world, [AS_OF.isoformat(), NEXT.isoformat()])
+
+        clause = phase4_clause(world.store, self.CLAUSE, GATE_EVENING.isoformat())
+
+        assert not clause.met and not clause.unmeasurable
+        assert shadow_books_key(AS_OF.isoformat()) in clause.evidence
+
+
+class TestNoOrderPathIsReachable:
+    """The shadow-book run is shadow-only by construction, proven at run time:
+    every way this package opens a broker session or routes an order is made to
+    raise, the broker SDK is made unimportable, and the run still advances and
+    writes every book."""
+
+    def test_the_run_completes_with_every_broker_and_order_entry_point_refusing(
+        self, world, monkeypatch
+    ) -> None:
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("the shadow-book run reached a broker or order entry point")
+
+        monkeypatch.setitem(sys.modules, "ib_async", None)  # any import raises
+        for module in (broker_session, paper_smoke):
+            monkeypatch.setattr(module, "connect", refuse)
+            monkeypatch.setattr(module, "load_sdk", refuse)
+        monkeypatch.setattr(order_router, "build_router", refuse)
+        world.register([world.arm_id])
+        world.record_session(world.arm_id)
+
+        assert main([], environ=_env(world), clock=lambda: AFTER_CLOSE, printer=lambda _: None) == 0
+        document = json.loads(world.store.get_bytes(shadow_books_key(AS_OF.isoformat())))
+        assert [b["status"] for b in document["books"]] == ["advanced"]
