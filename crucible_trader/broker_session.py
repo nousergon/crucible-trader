@@ -21,7 +21,13 @@ neither re-derives them:
    it raises :class:`GatewayNotReadyError` (reason prefix
    :data:`GATEWAY_NOT_READY_PREFIX`, no re-authentication step, because none is
    indicated); only past it does the human re-login text apply. Reading a boot
-   race as an expired session sends a human to fix a login that was fine.
+   race as an expired session sends a human to fix a login that was fine. A
+   listening port is not proof of a completed login (a proxy in front of the
+   gateway accepts TCP first), so inside the grace a refused or timed-out API
+   connect, or an account-less session, is retried every
+   :data:`READY_POLL_S` until the same readiness deadline, measured from the
+   start of :func:`connect`. Past the grace, or with unknown uptime, there is
+   exactly one attempt.
 3. **Paper only.** A session whose single managed account is not `DU…` is
    refused. The paper -> live crossing is a reserved ruling (plan §9.5, phase 6).
 4. **Read-only by construction, not by convention.** :class:`ReadOnlyBroker`
@@ -233,7 +239,7 @@ def _unavailable(
     address: GatewayAddress, what: str, uptime_s: float | None
 ) -> BrokerSessionUnavailableError:
     """Classify a gateway that is not serving an authenticated session."""
-    if uptime_s is not None and uptime_s < address.boot_grace_s:
+    if _inside_grace(address, uptime_s):
         return GatewayNotReadyError(
             f"{GATEWAY_NOT_READY_PREFIX}: {what}. The box has been up {uptime_s:.0f}s, inside "
             f"the {address.boot_grace_s:.0f}s boot grace, so the gateway is still starting "
@@ -245,6 +251,45 @@ def _unavailable(
         f"{SESSION_UNAVAILABLE_PREFIX}: {what} (box uptime {up}, boot grace "
         f"{address.boot_grace_s:.0f}s). {REAUTH_STEP}"
     )
+
+
+def _inside_grace(address: GatewayAddress, uptime_s: float | None) -> bool:
+    """True when the box booted recently enough that a gateway not yet serving
+    an authenticated session is read as still starting. Unknown uptime is not."""
+    return uptime_s is not None and uptime_s < address.boot_grace_s
+
+
+def _attempt_session(
+    client: Any, address: GatewayAddress, *, readonly: bool, where: str
+) -> tuple[str | None, BaseException | None, list[str]]:
+    """One SDK connect. Returns ``(None, None, accounts)`` for a session that
+    manages an account, else ``(what, cause, [])`` naming why there is no
+    session. Only a refused or timed-out connect and an account-less session are
+    read as no session; any other exception propagates as a defect."""
+    try:
+        client.connect(
+            address.host,
+            address.port,
+            clientId=address.client_id,
+            timeout=CONNECT_TIMEOUT_S,
+            readonly=readonly,
+        )
+    except (ConnectionRefusedError, TimeoutError) as exc:
+        return (
+            f"{where} refused or timed out the API connect ({type(exc).__name__}: {exc})",
+            exc,
+            [],
+        )
+    accounts = list(client.managedAccounts())
+    if not accounts:
+        client.disconnect()
+        return (
+            f"{where} accepted the API connect but manages no account, which is a session "
+            "that is not logged in",
+            None,
+            [],
+        )
+    return None, None, accounts
 
 
 def load_sdk() -> Any:
@@ -268,7 +313,11 @@ def connect(
     listen. Then only a port that never listened, a refused or timed-out API
     connect, and an account-less session are read as no session -- classified
     by box uptime into :class:`GatewayNotReadyError` or the expired-session
-    :class:`BrokerSessionUnavailableError`. Any other exception is a defect and
+    :class:`BrokerSessionUnavailableError`. Inside the boot grace a failed API
+    connect or an account-less session is retried every :data:`READY_POLL_S`
+    until ``address.ready_deadline_s`` after this call started (never sleeping
+    past it), disconnecting the failed session first; past the grace, or with
+    unknown uptime, one attempt decides. Any other exception is a defect and
     propagates unchanged.
 
     ``probe`` and ``uptime`` default to :func:`port_listening` and
@@ -277,6 +326,7 @@ def connect(
     probe = port_listening if probe is None else probe
     uptime = read_uptime_s if uptime is None else uptime
     where = f"the gateway at {address.host}:{address.port}"
+    start = monotonic()
     if not wait_for_port(address, probe=probe, sleep=sleep, monotonic=monotonic):
         raise _unavailable(
             address,
@@ -284,30 +334,29 @@ def connect(
             uptime(),
         )
     sdk = sdk_loader()
-    client = sdk.IB()
-    try:
-        client.connect(
-            address.host,
-            address.port,
-            clientId=address.client_id,
-            timeout=CONNECT_TIMEOUT_S,
-            readonly=readonly,
-        )
-    except (ConnectionRefusedError, TimeoutError) as exc:
-        raise _unavailable(
-            address,
-            f"{where} refused or timed out the API connect ({type(exc).__name__}: {exc})",
-            uptime(),
-        ) from exc
-    accounts = list(client.managedAccounts())
-    if not accounts:
-        client.disconnect()
-        raise _unavailable(
-            address,
-            f"{where} accepted the API connect but manages no account, which is a session "
-            "that is not logged in",
-            uptime(),
-        )
+    attempts = 0
+    while True:
+        attempts += 1
+        client = sdk.IB()
+        what, cause, accounts = _attempt_session(client, address, readonly=readonly, where=where)
+        if what is None:
+            break
+        uptime_s = uptime()
+        remaining = address.ready_deadline_s - (monotonic() - start)
+        if not _inside_grace(address, uptime_s) or remaining <= 0:
+            if attempts > 1:
+                what = (
+                    f"{what}, after {attempts} attempts over {monotonic() - start:.0f}s "
+                    "of the readiness deadline"
+                )
+            raise _unavailable(address, what, uptime_s) from cause
+        # A listening port is not proof of a completed login: a proxy in front of
+        # the gateway accepts TCP before the gateway serves the API. Inside the
+        # boot grace, drop any half-open session and try again, bounded by the
+        # same readiness deadline the port wait used.
+        if cause is not None:
+            client.disconnect()
+        sleep(min(READY_POLL_S, remaining))
     live = [a for a in accounts if not a.startswith(PAPER_ACCOUNT_PREFIX)]
     if live:
         client.disconnect()
