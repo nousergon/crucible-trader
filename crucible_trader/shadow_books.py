@@ -26,6 +26,14 @@ from the harness's register (`crucible.slots.arms.read_register`); an active
 arm the caller supplied no inputs for is a failed book naming that, never a
 shorter list.
 
+**Controls are a RULED non-book** (`alpha-engine-config-I12021`, Brian
+2026-10-05). Plan §10.6 keeps "a simulated book per registered challenger". A
+control arm (`ArmRecord.control` in the register) is scored by the grade's
+seeded control selection and has no construction recipe — the planted control
+is look-ahead — so it is never constructed here. It is still LISTED: its entry
+carries `CONTROL_NON_BOOK_STATUS` and a `non_book_reason`, never dropped and
+never a failed book, and the phase-4 coverage reading holds it to exactly that.
+
 **Evidence, not a promotion input.** Nothing here moves a champion pointer.
 Whether realized edge ever does is a champion-challenger-policy change,
 out of scope by decision (I10653 deliverable 5).
@@ -46,6 +54,7 @@ from typing import Any
 
 import numpy as np
 from crucible.execution import (
+    CONTROL_NON_BOOK_STATUS,
     SHADOW_BOOK_METRIC_NAME,
     SHADOW_BOOKS_SCHEMA_VERSION,
     SHADOW_FILL_BASIS,
@@ -195,6 +204,20 @@ def _failed(arm_id: str, reason: str) -> dict[str, Any]:
     }
 
 
+def _control_entry(arm_id: str) -> dict[str, Any]:
+    """The ruled non-book entry for an active control arm (alpha-engine-config-I12021)."""
+    return {
+        **_failed(arm_id, ""),
+        "status": CONTROL_NON_BOOK_STATUS,
+        "failure_reason": None,
+        "non_book_reason": (
+            f"{arm_id} is a control arm (ArmRecord.control): scored every cycle by the grade's "
+            "seeded control selection and never constructed as a paper book; plan §10.6 keeps "
+            "a simulated book per registered challenger (alpha-engine-config-I12021)"
+        ),
+    }
+
+
 def _metric(book: Mapping[str, Any], trading_day: str, now: dt.datetime) -> dict[str, Any]:
     return {
         "name": SHADOW_BOOK_METRIC_NAME,
@@ -266,25 +289,38 @@ def run_shadow_books(
 ) -> dict[str, Any]:
     """Advance a book for every ACTIVE arm in ``slot``'s register, write, then refuse failures.
 
-    Every active arm gets an entry: advanced, or failed with its reason. Inputs
-    for an arm the register does not list as active are refused — a book for
-    an unregistered arm is not a challenger's evidence.
+    Every active arm gets an entry: a challenger's is advanced, or failed with
+    its reason; a control's is the ruled `CONTROL_NON_BOOK_STATUS` entry with
+    its reason. Inputs for an arm the register does not list as active are
+    refused — a book for an unregistered arm is not a challenger's evidence —
+    and so are inputs for a control, which is never constructed.
 
     ``unresolved`` carries, per arm, why its inputs could not be assembled
     (`crucible_trader.shadow_inputs.resolve_shadow_inputs`); that reason becomes
     the failed book's `failure_reason` instead of a generic absence.
     """
     unresolved = dict(unresolved or {})
-    active = list(read_register(store, slot).active_arms())
+    register = read_register(store, slot)
+    active = list(register.active_arms())
+    controls = {arm_id for arm_id in active if register.state(arm_id).record.control}
     stray = sorted((set(inputs) | set(unresolved)) - set(active))
     if stray:
         raise ValueError(
             f"inputs supplied for {stray}, which the {slot!r} register does not list as "
             "active; shadow books are kept for registered arms only"
         )
+    for_controls = sorted((set(inputs) | set(unresolved)) & controls)
+    if for_controls:
+        raise ValueError(
+            f"inputs supplied for {for_controls}, which the {slot!r} register marks as control "
+            f"arms; a control is recorded as {CONTROL_NON_BOOK_STATUS!r}, never constructed"
+        )
     previous = read_previous_books(store, previous_trading_day)
     books: list[dict[str, Any]] = []
     for arm_id in active:
+        if arm_id in controls:
+            books.append(_control_entry(arm_id))
+            continue
         arm_inputs = inputs.get(arm_id)
         if arm_inputs is None:
             books.append(

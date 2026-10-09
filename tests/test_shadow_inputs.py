@@ -13,7 +13,12 @@ import json
 
 import pytest
 from conftest import AS_OF, D_PREV, NEXT, TICKERS, recipe_yaml, remove
-from crucible.execution import shadow_books_key, validate_shadow_books
+from crucible.execution import (
+    CONTROL_NON_BOOK_STATUS,
+    shadow_book_coverage,
+    shadow_books_key,
+    validate_shadow_books,
+)
 from crucible.keys import strategy_arm_key, strategy_slot_key
 from crucible.portfolio import load_portfolio_params_from_store
 from crucible.slots.inputs import resolve_strategy_sessions
@@ -129,6 +134,85 @@ class TestEveryActiveArmIsResolvedFromTheStore:
                 unresolved={"s:stranger:000000000000": "nope"},
                 now=NOW,
             )
+
+
+class TestControlsAreARuledNonBook:
+    """`alpha-engine-config-I12021`, Brian's ruling 2026-10-05: an active control is
+    listed with `control_scored_by_grade` and a reason — never dropped, never a
+    failed book for lacking a recipe — and coverage needs CHALLENGER books only."""
+
+    def _run(self, world, resolved):
+        return run_shadow_books(
+            world.store,
+            trading_day=DAY,
+            previous_trading_day=None,
+            inputs=resolved.inputs,
+            unresolved=resolved.unresolved,
+            now=NOW,
+        )
+
+    def test_the_10_01_shape_lists_controls_and_advances_challengers(self, world) -> None:
+        """Two harness controls beside two filed challengers, as on 2026-10-01."""
+        challenger = world.file_recipe("challenger")
+        controls = world.register([world.arm_id, challenger], controls=True)
+        world.record_session(world.arm_id)
+        world.record_session(challenger)
+
+        resolved = _resolve(world)
+        assert len(controls) == 2 and set(resolved.controls) == set(controls)
+        assert set(resolved.active_arms) == {world.arm_id, challenger, *controls}
+        assert set(resolved.inputs) == {world.arm_id, challenger}
+        assert resolved.unresolved == {}
+
+        document = self._run(world, resolved)
+        status = {b["arm_id"]: b["status"] for b in document["books"]}
+        assert status == {
+            world.arm_id: "advanced",
+            challenger: "advanced",
+            **dict.fromkeys(controls, CONTROL_NON_BOOK_STATUS),
+        }
+        for book in document["books"]:
+            if book["arm_id"] in controls:
+                assert "control arm" in book["non_book_reason"]
+                assert book["failure_reason"] is None
+        assert {m["arm_id"] for m in document["metrics"]} == {world.arm_id, challenger}
+        reading = shadow_book_coverage(world.store, DAY, days_served=[DAY])
+        assert reading.met, reading.detail
+
+    def test_every_challenger_failing_still_fails_the_run(self, world) -> None:
+        challenger = world.file_recipe("challenger")
+        controls = world.register([world.arm_id, challenger], controls=True)
+
+        resolved = _resolve(world)
+        assert set(resolved.unresolved) == {world.arm_id, challenger}
+        with pytest.raises(ShadowBookFailure, match="2 of 4 shadow book"):
+            self._run(world, resolved)
+        written = validate_shadow_books(json.loads(world.store.get_bytes(shadow_books_key(DAY))))
+        assert {b["arm_id"]: b["status"] for b in written["books"]} == {
+            world.arm_id: "failed",
+            challenger: "failed",
+            **dict.fromkeys(controls, CONTROL_NON_BOOK_STATUS),
+        }
+        assert not shadow_book_coverage(world.store, DAY).met
+
+    def test_inputs_for_a_control_are_refused(self, world) -> None:
+        controls = world.register([world.arm_id], controls=True)
+        with pytest.raises(ValueError, match="marks as control"):
+            run_shadow_books(
+                world.store,
+                trading_day=DAY,
+                previous_trading_day=None,
+                inputs={},
+                unresolved={controls[0]: "no filed recipe registers it"},
+                now=NOW,
+            )
+
+    def test_a_controls_only_register_reads_no_parameters(self, world) -> None:
+        controls = world.register([], controls=True)
+        remove(world.store, strategy_slot_key("s"))
+        resolved = _resolve(world)
+        assert set(resolved.controls) == set(controls)
+        assert resolved.inputs == {} and resolved.unresolved == {}
 
 
 class TestAHeldNameTheMChampionStopsPricingIsExited:
