@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import inspect
+import json
 
 import crucible.slots.inputs as harness_inputs
 import crucible.slots.strategy as harness_strategy
@@ -31,7 +32,13 @@ from conftest import (
     remove,
     seat_champion,
 )
-from crucible.keys import champion_key, session_inputs_key, strategy_slot_key
+from crucible.keys import (
+    champion_key,
+    session_inputs_key,
+    shadow_key,
+    strategy_slot_key,
+    universe_members_key,
+)
 from crucible.portfolio import (
     PORTFOLIO_METRIC_NAME,
     CostModelInputError,
@@ -180,6 +187,49 @@ class TestNoAttestedChampionNoBook:
         world.record_session(world.arm_id)
         seat_champion(world.store, "u", "u:other_cut:dddddddddddd")
         with pytest.raises(ContractRefusal, match="the U champion's cut is"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def _record_session_from_the_u_feed(self, world, *, champion: str = U_CHAMPION) -> None:
+        """A session the weekly arc did not shadow: the harness took U's cut from
+        the feed `serve.daily --slot u` publishes (alpha-engine-config-I12021)."""
+        key = world.record_session(world.arm_id)
+        feed_key = universe_members_key(DAY)
+        put(
+            world.store,
+            feed_key,
+            {
+                "schema_version": "feed.v1",
+                "slot": "u",
+                "trading_day": DAY,
+                "champion": champion,
+                "members": TICKERS[:8],
+            },
+        )
+        session = json.loads(world.store.get_bytes(key))
+        session["eligibility_source"] = feed_key
+        put(world.store, key, session)
+        remove(world.store, shadow_key(U_CHAMPION, DAY))
+
+    def test_a_cut_from_the_u_champion_feed_constructs(self, world) -> None:
+        self._record_session_from_the_u_feed(world)
+        book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+        assert book.u_champion == U_CHAMPION
+
+    def test_a_feed_serving_another_u_champion_is_refused(self, world) -> None:
+        self._record_session_from_the_u_feed(world, champion="u:other_cut:dddddddddddd")
+        with pytest.raises(ContractRefusal, match="took its eligibility from the U feed"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_feed_cut_is_refused_once_u_is_reseated(self, world) -> None:
+        self._record_session_from_the_u_feed(world)
+        seat_champion(world.store, "u", "u:other_cut:dddddddddddd")
+        with pytest.raises(ContractRefusal, match="not U champion 'u:other_cut"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_missing_feed_is_refused(self, world) -> None:
+        self._record_session_from_the_u_feed(world)
+        remove(world.store, universe_members_key(DAY))
+        with pytest.raises(ContractRefusal, match="took its eligibility from the U feed"):
             construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
 
     def test_a_recorded_absence_of_u_constructs_with_no_u_champion(self, world) -> None:

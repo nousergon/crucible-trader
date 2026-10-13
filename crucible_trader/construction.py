@@ -59,7 +59,8 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
-from crucible.keys import arm_predictions_key, champion_key, shadow_key
+from crucible.documents import load_store_document
+from crucible.keys import arm_predictions_key, champion_key, shadow_key, universe_members_key
 from crucible.portfolio import PortfolioParamsError, load_portfolio_params_from_store
 from crucible.portfolio import portfolio_metric_record as _portfolio_metric_record
 from crucible.slots.arms import read_register
@@ -145,7 +146,12 @@ def resolve_strategy_arm(store: Store, *, arm_id: str, trading_day: str) -> Regi
 
 
 def _assert_session_names_the_attested_champions(
-    session: ResolvedSession, *, trading_day: str, m_champion: str, u_champion: str | None
+    store: Store,
+    session: ResolvedSession,
+    *,
+    trading_day: str,
+    m_champion: str,
+    u_champion: str | None,
 ) -> None:
     expected_alpha = arm_predictions_key(m_champion, trading_day)
     if session.alpha_source != expected_alpha:
@@ -164,11 +170,34 @@ def _assert_session_names_the_attested_champions(
             )
         return
     expected_cut = shadow_key(u_champion, trading_day)
-    if session.eligibility_source != expected_cut:
+    if session.eligibility_source == expected_cut:
+        return
+    # On a session the weekly arc did not shadow, the harness records the U
+    # champion feed `serve.daily --slot u` publishes instead
+    # (`crucible.slots.strategy`, alpha-engine-config-I12021): the same
+    # selection, republished. It is this session's cut only while the feed
+    # still names the current U champion and this session, the check the
+    # harness made when it recorded it.
+    feed_key = universe_members_key(trading_day)
+    if session.eligibility_source == feed_key:
+        feed = load_store_document(store, feed_key) if store.exists(feed_key) else {}
+        if (
+            feed.get("slot") == "u"
+            and feed.get("trading_day") == trading_day
+            and feed.get("champion") == u_champion
+        ):
+            return
         raise ContractRefusal(
-            f"the session recorded for {trading_day} took its eligibility from "
-            f"{session.eligibility_source!r}, but the U champion's cut is {expected_cut!r}."
+            f"the session recorded for {trading_day} took its eligibility from the U feed "
+            f"{feed_key!r}, which now serves slot {feed.get('slot')!r}, session "
+            f"{feed.get('trading_day')!r} and champion {feed.get('champion')!r}, not U "
+            f"champion {u_champion!r} for this session."
         )
+    raise ContractRefusal(
+        f"the session recorded for {trading_day} took its eligibility from "
+        f"{session.eligibility_source!r}, but the U champion's cut is {expected_cut!r} "
+        f"(or its feed {feed_key!r})."
+    )
 
 
 def held_tickers(previous: Mapping[str, float] | None, *, benchmark: str) -> list[str]:
@@ -240,7 +269,7 @@ def construct_target_book(
         ) from exc
     (session,) = inputs.resolved
     _assert_session_names_the_attested_champions(
-        session, trading_day=trading_day, m_champion=m_pointer.arm_id, u_champion=u_champion
+        store, session, trading_day=trading_day, m_champion=m_pointer.arm_id, u_champion=u_champion
     )
 
     constructed = construct_book(
