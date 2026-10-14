@@ -92,6 +92,31 @@ class TestTheEntryPoint:
         assert document["books"][0]["status"] == "failed"
 
 
+class TestControlsInTheDailyRun:
+    """`alpha-engine-config-I12021`: the daily run lists controls with the ruled status."""
+
+    def test_controls_are_recorded_and_the_challenger_advances(self, world) -> None:
+        controls = world.register([world.arm_id], controls=True)
+        world.record_session(world.arm_id)
+        said: list[str] = []
+
+        code = main([], environ=_env(world), clock=lambda: AFTER_CLOSE, printer=said.append)
+
+        document = json.loads(world.store.get_bytes(shadow_books_key(AS_OF.isoformat())))
+        assert code == 0
+        assert {b["arm_id"]: b["status"] for b in document["books"]} == {
+            world.arm_id: "advanced",
+            **dict.fromkeys(controls, "control_scored_by_grade"),
+        }
+        assert "1 challenger book(s), every one advanced; 2 control(s)" in said[-1]
+
+    def test_a_failed_challenger_beside_controls_fails_the_run(self, world) -> None:
+        world.register([world.arm_id], controls=True)  # no session recorded
+
+        with pytest.raises(ShadowBookFailure, match="1 of 3"):
+            main([], environ=_env(world), clock=lambda: AFTER_CLOSE)
+
+
 #: Tuesday 2026-09-15, ~22:00 ET -- when the published phase-4 gate for 09-15 is
 #: taken (`runs/gate/{day}/run.json` lands about then every trading day).
 GATE_EVENING = dt.date(2026, 9, 15)
