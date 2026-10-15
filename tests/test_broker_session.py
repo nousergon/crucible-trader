@@ -13,6 +13,7 @@ from crucible_trader.broker_session import (
     BOOT_GRACE_S,
     CONNECT_TIMEOUT_S,
     GATEWAY_NOT_READY_PREFIX,
+    IB_ERROR_PAPER_DISCLAIMER,
     READY_DEADLINE_S,
     READY_POLL_S,
     REAUTH_STEP,
@@ -468,3 +469,115 @@ class TestSdkConnectRetry:
         ib.accounts = ["U1234"]
         with pytest.raises(OrderRefusedError, match="non-paper"):
             _connect_timed(ib, uptime_s=FRESH_UPTIME_S)
+
+
+# ── alpha-engine-config-I12189: a login that is still completing ─────────────
+#
+# The 2026-10-09 cold start (measured by crucible-executor, I12220): the API
+# port opened ~71s after StartInstances and the gateway answered the first
+# accepted connect with IB error 10141 -- the paper-trading disclaimer IBC has
+# not clicked away yet. `ib_async` then drops the session with a PLAIN
+# `ConnectionError("Socket connection broken while connecting")`, which is
+# neither of the two exceptions the retry used to read as not-ready, so the
+# trader's reconcile failed on it as a defect, with no retry, inside the boot
+# grace -- the boot race the readiness wait exists to absorb.
+
+SOCKET_BROKEN = "Socket connection broken while connecting"
+
+
+class _Event:
+    """`ib_async`'s eventkit `Event`, as much of it as `_attempt_session` uses."""
+
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def connect(self, handler) -> None:
+        self.handlers.append(handler)
+
+    def disconnect(self, handler) -> None:
+        self.handlers.remove(handler)
+
+    def emit(self, *args) -> None:
+        for handler in list(self.handlers):
+            handler(*args)
+
+
+class DisclaimerIB(FlakyIB):
+    """A gateway still at the paper-trading disclaimer for its first
+    ``disclaimed`` connects: each emits IB error 10141 on ``errorEvent`` and
+    then either drops the socket (``drops=True``, what `ib_async` does) or
+    returns a connected session anyway."""
+
+    def __init__(
+        self, *, disclaimed: int, drops: bool = True, code: int = IB_ERROR_PAPER_DISCLAIMER
+    ) -> None:
+        super().__init__()
+        self.errorEvent = _Event()
+        self.disclaimed = disclaimed
+        self.drops = drops
+        self.code = code
+
+    def connect(self, host, port, clientId, timeout, readonly):  # noqa: N803 - SDK spelling
+        if self.attempts < self.disclaimed:
+            self.errorEvent.emit(-1, self.code, "an IB error message")
+            if self.drops:
+                self.attempts += 1
+                raise ConnectionError(SOCKET_BROKEN)
+        super().connect(host, port, clientId, timeout, readonly)
+
+
+class TestLoginStillCompleting:
+    @pytest.mark.parametrize(
+        "error",
+        [ConnectionError(SOCKET_BROKEN), ConnectionResetError("reset"), BrokenPipeError("pipe")],
+    )
+    def test_a_dropped_api_session_inside_the_grace_is_retried(self, error) -> None:
+        ib = FlakyIB(errors=[error, error])
+        client, clock, _ = _connect_timed(ib, uptime_s=FRESH_UPTIME_S)
+        assert client is ib and ib.connected_with is not None
+        assert (ib.attempts, ib.disconnected, clock.sleeps) == (3, 2, [READY_POLL_S] * 2)
+
+    def test_the_disclaimer_drop_is_retried_until_the_login_completes(self) -> None:
+        ib = DisclaimerIB(disclaimed=3)
+        client, clock, _ = _connect_timed(ib, uptime_s=FRESH_UPTIME_S)
+        assert client is ib and ib.connected_with is not None
+        assert ib.attempts == 4 and clock.sleeps == [READY_POLL_S] * 3
+        # The error handler is detached after every attempt, never accumulated.
+        assert ib.errorEvent.handlers == []
+
+    def test_a_connect_that_returns_through_the_disclaimer_is_dropped_and_retried(self) -> None:
+        ib = DisclaimerIB(disclaimed=2, drops=False)
+        client, clock, _ = _connect_timed(ib, uptime_s=FRESH_UPTIME_S)
+        assert client is ib
+        assert (ib.attempts, ib.disconnected, clock.sleeps) == (3, 2, [READY_POLL_S] * 2)
+        assert ib.errorEvent.handlers == []
+
+    def test_a_disclaimer_to_the_deadline_is_not_ready_and_names_the_disclaimer(self) -> None:
+        ib = DisclaimerIB(disclaimed=1000)
+        address = GatewayAddress("127.0.0.1", 4002, 7, ready_deadline_s=10.0)
+        with pytest.raises(GatewayNotReadyError) as raised:
+            _connect_timed(ib, uptime_s=FRESH_UPTIME_S, address=address)
+        message = str(raised.value)
+        assert message.startswith(GATEWAY_NOT_READY_PREFIX)
+        assert f"IB error {IB_ERROR_PAPER_DISCLAIMER}" in message and SOCKET_BROKEN in message
+        assert "after 3 attempts" in message
+        assert "HUMAN ACTION" not in message and "re-authenticate" not in message
+        assert isinstance(raised.value.__cause__, ConnectionError)
+
+    @pytest.mark.parametrize("uptime_s", [BOOT_GRACE_S, LONG_UPTIME_S, None])
+    def test_past_the_grace_a_dropped_session_is_the_human_action_in_one_attempt(
+        self, uptime_s
+    ) -> None:
+        ib = FlakyIB(errors=[ConnectionError(SOCKET_BROKEN)])
+        with pytest.raises(BrokerSessionUnavailableError) as raised:
+            _connect_timed(ib, uptime_s=uptime_s)
+        assert not isinstance(raised.value, GatewayNotReadyError)
+        assert REAUTH_STEP in str(raised.value) and SOCKET_BROKEN in str(raised.value)
+        assert ib.attempts == 1
+
+    def test_an_unrelated_error_code_on_a_connect_is_not_read_as_the_disclaimer(self) -> None:
+        # 2104 "Market data farm connection is OK" arrives on every healthy connect.
+        ib = DisclaimerIB(disclaimed=1, drops=False, code=2104)
+        client, clock, _ = _connect_timed(ib, uptime_s=FRESH_UPTIME_S)
+        assert client is ib
+        assert (ib.attempts, ib.disconnected, clock.sleeps) == (1, 0, [])
