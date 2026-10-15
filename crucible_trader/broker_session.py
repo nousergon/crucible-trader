@@ -23,11 +23,12 @@ neither re-derives them:
    indicated); only past it does the human re-login text apply. Reading a boot
    race as an expired session sends a human to fix a login that was fine. A
    listening port is not proof of a completed login (a proxy in front of the
-   gateway accepts TCP first), so inside the grace a refused or timed-out API
-   connect, or an account-less session, is retried every
-   :data:`READY_POLL_S` until the same readiness deadline, measured from the
-   start of :func:`connect`. Past the grace, or with unknown uptime, there is
-   exactly one attempt.
+   gateway accepts TCP first), so inside the grace a refused, reset, dropped
+   or timed-out API connect, a session the gateway answers with IB error
+   :data:`IB_ERROR_PAPER_DISCLAIMER`, or an account-less session, is retried
+   every :data:`READY_POLL_S` until the same readiness deadline, measured from
+   the start of :func:`connect`. Past the grace, or with unknown uptime, there
+   is exactly one attempt.
 3. **Paper only.** A session whose single managed account is not `DU…` is
    refused. The paper -> live crossing is a reserved ruling (plan §9.5, phase 6).
 4. **Read-only by construction, not by convention.** :class:`ReadOnlyBroker`
@@ -84,6 +85,14 @@ UPTIME_PATH = "/proc/uptime"
 
 #: Seconds a connect may take before it is read as "no gateway session".
 CONNECT_TIMEOUT_S = 15.0
+
+#: IB's "Paper trading disclaimer must first be accepted for API connection".
+#: IBC clicks the disclaimer away as part of a paper login, so this code means
+#: the gateway is up and its login is still completing -- not ready, never a
+#: defect. Measured by crucible-executor on the 2026-10-09 cold start: the API
+#: port opened ~71s after StartInstances and this error arrived 0.5s after the
+#: first accepted connect (alpha-engine-config-I12220).
+IB_ERROR_PAPER_DISCLAIMER = 10141
 
 #: The prefix every session-unavailable reason carries, so a manifest `reason`
 #: (and the page built from it) is classifiable by a reader without a regex over
@@ -264,22 +273,42 @@ def _attempt_session(
 ) -> tuple[str | None, BaseException | None, list[str]]:
     """One SDK connect. Returns ``(None, None, accounts)`` for a session that
     manages an account, else ``(what, cause, [])`` naming why there is no
-    session. Only a refused or timed-out connect and an account-less session are
-    read as no session; any other exception propagates as a defect."""
+    session.
+
+    Read as no session: a connect that fails with any :class:`ConnectionError`
+    (refused, reset, aborted, or `ib_async`'s own "Socket connection broken
+    while connecting", which is how a gateway still at its paper-trading
+    disclaimer drops the API session) or a timeout; a connect during which the
+    gateway reported IB error :data:`IB_ERROR_PAPER_DISCLAIMER`; and an
+    account-less session. Any other exception propagates as a defect."""
+    seen: list[int] = []
+
+    def on_error(_req_id: Any, code: Any, *_rest: Any) -> None:
+        seen.append(code)
+
+    error_event = getattr(client, "errorEvent", None)
+    if error_event is not None:
+        error_event.connect(on_error)
     try:
-        client.connect(
-            address.host,
-            address.port,
-            clientId=address.client_id,
-            timeout=CONNECT_TIMEOUT_S,
-            readonly=readonly,
-        )
-    except (ConnectionRefusedError, TimeoutError) as exc:
-        return (
-            f"{where} refused or timed out the API connect ({type(exc).__name__}: {exc})",
-            exc,
-            [],
-        )
+        try:
+            client.connect(
+                address.host,
+                address.port,
+                clientId=address.client_id,
+                timeout=CONNECT_TIMEOUT_S,
+                readonly=readonly,
+            )
+        except (ConnectionError, TimeoutError) as exc:
+            failed = f"{type(exc).__name__}: {exc}"
+            if IB_ERROR_PAPER_DISCLAIMER in seen:
+                return _disclaimer(where, failed), exc, []
+            return f"{where} refused or timed out the API connect ({failed})", exc, []
+    finally:
+        if error_event is not None:
+            error_event.disconnect(on_error)
+    if IB_ERROR_PAPER_DISCLAIMER in seen:
+        client.disconnect()
+        return _disclaimer(where, None), None, []
     accounts = list(client.managedAccounts())
     if not accounts:
         client.disconnect()
@@ -290,6 +319,15 @@ def _attempt_session(
             [],
         )
     return None, None, accounts
+
+
+def _disclaimer(where: str, failed: str | None) -> str:
+    """Why a session that met the paper-trading disclaimer is not a session."""
+    tail = f"; the connect then failed ({failed})" if failed else ""
+    return (
+        f"{where} answered the API connect with IB error {IB_ERROR_PAPER_DISCLAIMER} "
+        f"(paper-trading disclaimer not accepted yet), so its login was still completing{tail}"
+    )
 
 
 def load_sdk() -> Any:
@@ -313,7 +351,8 @@ def connect(
     listen. Then only a port that never listened, a refused or timed-out API
     connect, and an account-less session are read as no session -- classified
     by box uptime into :class:`GatewayNotReadyError` or the expired-session
-    :class:`BrokerSessionUnavailableError`. Inside the boot grace a failed API
+    :class:`BrokerSessionUnavailableError` (see :func:`_attempt_session` for
+    what counts as a failed API connect). Inside the boot grace a failed API
     connect or an account-less session is retried every :data:`READY_POLL_S`
     until ``address.ready_deadline_s`` after this call started (never sleeping
     past it), disconnecting the failed session first; past the grace, or with
