@@ -32,9 +32,17 @@ dependencies = [
     #
     # At RUNTIME the box does not use this pin: it reads `trader/release_pin`
     # from the store and installs the wheel at `releases/{sha}/`. It never
-    # follows `releases/current`. The two shas are required to agree, and that
-    # agreement is checked by the release-promotion path, not by this file.
+    # follows `releases/current`. Nothing checks that the two shas agree, and
+    # they do not have to: this pin moves when a PR here needs a newer
+    # harness, the release only through the trader's own smoke. Where the
+    # release wheel pins a package this lock pins differently, the wheel wins
+    # in the box's venv (`crucible_trader.release_env`, alpha-engine-config-
+    # I12280: a krepis pin one patch apart failed every unit on 2026-10-14/15).
     "crucible @ git+https://github.com/nousergon/crucible@38c68fc04644ef0e9fa0fa59b7b6dd3ae5443f9e",
+    # Reads the release wheel's `Requires-Dist` and compares it with this
+    # lock's pins (`crucible_trader.release_env`). Already in the lock through
+    # crucible; declared because this package imports it directly.
+    "packaging>=24.0",
 ]
 
 # NO LLM dependency, and none may be added. The fleet's standing rule confines

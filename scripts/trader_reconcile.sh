@@ -73,7 +73,13 @@ pinned_sha="${wheel#* }"
 wheel="${wheel%% *}"
 
 uv export --frozen --project "$repo" --extra ib --no-emit-project --no-hashes --format requirements-txt \
-  | grep -v '^crucible @' | grep -v '^ *#' > "$work/requirements.txt"
+  | grep -v '^crucible @' | grep -v '^ *#' > "$work/locked.txt"
+# The lock was resolved against this checkout's crucible pin, not the release:
+# where the wheel pins a package the lock pins differently, the wheel wins and
+# the dropped line is named in the journal (alpha-engine-config-I12280).
+uv run --frozen --project "$repo" python -c \
+  'import sys; from crucible_trader.release_env import main; sys.exit(main(sys.argv[1:]))' \
+  "$work/$wheel" "$work/locked.txt" > "$work/requirements.txt"
 uv venv --quiet --python 3.12 "$work/venv"
 uv pip install --quiet --python "$work/venv/bin/python" -r "$work/requirements.txt" "$work/$wheel"
 uv pip install --quiet --python "$work/venv/bin/python" --no-deps "$repo"
