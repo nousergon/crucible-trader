@@ -22,7 +22,10 @@
 # calls this script with no arguments.
 #
 # Required environment (no defaults, by design): CRUCIBLE_TRADER_STORE_URI,
-# CRUCIBLE_TRADER_IB_HOST, CRUCIBLE_TRADER_IB_PORT, CRUCIBLE_TRADER_IB_CLIENT_ID.
+# CRUCIBLE_TRADER_IB_HOST, CRUCIBLE_TRADER_IB_PORT, CRUCIBLE_TRADER_IB_CLIENT_ID,
+# CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID. The reconcile connects on the master id,
+# the gateway's Master API client ID, so it reads every API client's fills on
+# the shared paper account (alpha-engine-config-I12376).
 # Exit status is the reconcile's: non-zero whenever the manifest is not `ok`
 # (a discrepancy, a void control arm, or an unreadable book) -- the page
 # condition, never swallowed here.
@@ -35,7 +38,7 @@ elif [[ -n "${1:-}" ]]; then
   echo "usage: $0 [--genesis] (got '${1}')" >&2
   exit 2
 fi
-for var in CRUCIBLE_TRADER_STORE_URI CRUCIBLE_TRADER_IB_HOST CRUCIBLE_TRADER_IB_PORT CRUCIBLE_TRADER_IB_CLIENT_ID; do
+for var in CRUCIBLE_TRADER_STORE_URI CRUCIBLE_TRADER_IB_HOST CRUCIBLE_TRADER_IB_PORT CRUCIBLE_TRADER_IB_CLIENT_ID CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID; do
   if [[ -z "${!var:-}" ]]; then
     echo "$var is unset; reconciliation has no default store or gateway" >&2
     exit 2

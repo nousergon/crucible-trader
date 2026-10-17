@@ -12,9 +12,17 @@ real; the third is a stated, fail-loud gap, not a fabrication:**
 * ``source`` -- :class:`~crucible_trader.broker_statement.IbPaperStatementSource`
   over a :class:`~crucible_trader.broker_session.ReadOnlyBroker`. Already
   existed (`paper_smoke.py` uses the identical pair); reused, not reimplemented.
-* ``fills`` -- :func:`fills_from_ib`, new here: today's executions from the
-  connected session's own `fills()` read, mapped to
-  :class:`~crucible_trader.reconciliation.Fill`. **Not exercised against a real
+* ``fills`` -- :func:`fills_from_ib`: today's executions from an explicit
+  `reqExecutions()` on a session connected with the gateway's **Master API
+  client ID**, mapped to :class:`~crucible_trader.reconciliation.Fill`.
+  `alpha-engine-config-I12376` (Brian's option (b)): the paper account is
+  shared with the v1 executor, and IB returns executions to a session for its
+  own client id only -- so the reconcile used to see none of v1's fills and
+  graded each as a `share_delta`/`cash_delta`. A master session receives every
+  API client's executions, so the reconcile is now of the WHOLE account, and
+  the guard and its tolerances are unchanged. If the gateway is not actually
+  configured with that master id, v1's fills are simply absent and the guard
+  fails loud on them, as before; it can never pass on a missing fill. **Not exercised against a real
   IB Gateway in this change** -- there is no live box in this session (plan
   §9.5 paper->live is reserved) -- so it is tested here only against a fake
   shaped to the documented `ib_async` `Fill`/`Execution`/`CommissionReport`
@@ -80,7 +88,7 @@ class _IbFill(Protocol):  # the subset of `ib_async.Fill` read here
 
 
 class _FillReader(Protocol):
-    def fills(self) -> list[_IbFill]: ...
+    def reqExecutions(self) -> list[_IbFill]: ...  # noqa: N802 - SDK spelling
 
 
 def live_statement_source(client: Any) -> StatementSourceProtocol:
@@ -90,15 +98,18 @@ def live_statement_source(client: Any) -> StatementSourceProtocol:
 
 
 def fills_from_ib(client: _FillReader, trading_day: str) -> tuple[Fill, ...]:
-    """Today's executions on the connected session, as reconciliation `Fill`s.
+    """Today's executions on the account, as reconciliation `Fill`s.
 
-    Filtered to ``trading_day`` by the execution's own timestamp -- IB's
-    `fills()` returns the session's whole cache, not just today's. A side
+    Read with `reqExecutions()`, which asks the gateway afresh rather than
+    trusting the session's startup cache; on a Master-API-client-ID session it
+    returns every API client's executions (see the module docstring). Filtered
+    to ``trading_day`` by the execution's own timestamp -- the gateway may
+    return more than today's. A side
     this module does not recognise, or a fill with no commission report yet,
     raises rather than being priced as a guess or a zero.
     """
     fills: list[Fill] = []
-    for record in client.fills():
+    for record in client.reqExecutions():
         execution = record.execution
         if execution.time.date().isoformat() != trading_day:
             continue

@@ -29,8 +29,13 @@ class _Client:
     def __init__(self, records):
         self._records = records
 
-    def fills(self):
+    def reqExecutions(self):  # noqa: N802 - SDK spelling
         return list(self._records)
+
+    def fills(self):
+        raise AssertionError(
+            "fills() is the session's own startup cache; the reconcile asks the gateway afresh"
+        )
 
 
 class TestFillsFromIb:
@@ -57,6 +62,35 @@ class TestFillsFromIb:
         )
         (fill,) = fills_from_ib(client, DAY)
         assert fill.ticker == "AAA"
+
+    def test_another_api_clients_fills_are_the_accounts_fills(self):
+        """alpha-engine-config-I12376: the paper account is shared with the v1
+        executor (client ids 1-3). On a master session its executions arrive
+        beside the trader's own, and each is a fill of the account."""
+        client = _Client(
+            [
+                broker_fill(
+                    "UAL",
+                    side="BOT",
+                    shares=768,
+                    avg_price=50.0,
+                    commission=1.0,
+                    time=T,
+                    client_id=1,
+                ),
+                broker_fill(
+                    "HL", side="SLD", shares=100, avg_price=5.0, commission=1.0, time=T, client_id=2
+                ),
+                broker_fill(
+                    "AAA", side="BOT", shares=1, avg_price=1.0, commission=0.0, time=T, client_id=41
+                ),
+            ]
+        )
+        assert fills_from_ib(client, DAY) == (
+            Fill(ticker="UAL", shares=768, cash_usd=-38_401.0),
+            Fill(ticker="HL", shares=-100, cash_usd=499.0),
+            Fill(ticker="AAA", shares=1, cash_usd=-1.0),
+        )
 
     def test_no_fills_today_is_an_empty_tuple(self):
         assert fills_from_ib(_Client([]), DAY) == ()
