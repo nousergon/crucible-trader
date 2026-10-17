@@ -63,6 +63,15 @@ from crucible_trader.broker_statement import PAPER_ACCOUNT_PREFIX
 HOST_VAR = "CRUCIBLE_TRADER_IB_HOST"
 PORT_VAR = "CRUCIBLE_TRADER_IB_PORT"
 CLIENT_ID_VAR = "CRUCIBLE_TRADER_IB_CLIENT_ID"
+#: The IB Gateway's Master API client ID, used by ``trader.reconcile`` alone
+#: (alpha-engine-config-I12376, Brian's option (b)). IB returns executions to a
+#: session for its OWN client id only, except to the session whose client id is
+#: the gateway's configured Master API client ID, which receives every API
+#: client's executions. The paper account is shared with the v1 executor
+#: (client ids 1-3), so only a master session sees the whole account's fills.
+#: The gateway's side of the pairing (IBC ``OverrideTwsMasterClientID``) is set
+#: from the same env file by crucible-executor's ``ibgateway.service``.
+MASTER_CLIENT_ID_VAR = "CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID"
 READY_DEADLINE_VAR = "CRUCIBLE_TRADER_IB_READY_DEADLINE_S"
 BOOT_GRACE_VAR = "CRUCIBLE_TRADER_IB_BOOT_GRACE_S"
 
@@ -147,10 +156,12 @@ class GatewayAddress:
     boot_grace_s: float = BOOT_GRACE_S
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> GatewayAddress:
+    def from_env(
+        cls, env: dict[str, str] | None = None, *, client_id_var: str = CLIENT_ID_VAR
+    ) -> GatewayAddress:
         source = os.environ if env is None else env
         values = {
-            var: (source.get(var) or "").strip() for var in (HOST_VAR, PORT_VAR, CLIENT_ID_VAR)
+            var: (source.get(var) or "").strip() for var in (HOST_VAR, PORT_VAR, client_id_var)
         }
         missing = sorted(var for var, value in values.items() if not value)
         if missing:
@@ -159,10 +170,10 @@ class GatewayAddress:
                 "port is how a paper tool connects to a live gateway."
             )
         try:
-            port, client_id = int(values[PORT_VAR]), int(values[CLIENT_ID_VAR])
+            port, client_id = int(values[PORT_VAR]), int(values[client_id_var])
         except ValueError as exc:
             raise BrokerSettingsError(
-                f"{PORT_VAR}/{CLIENT_ID_VAR} must be integers: {exc}"
+                f"{PORT_VAR}/{client_id_var} must be integers: {exc}"
             ) from exc
         timing = {
             var: _non_negative_seconds(source, var, default)
@@ -178,6 +189,25 @@ class GatewayAddress:
             ready_deadline_s=timing[READY_DEADLINE_VAR],
             boot_grace_s=timing[BOOT_GRACE_VAR],
         )
+
+
+def master_address_from_env(env: dict[str, str] | None = None) -> GatewayAddress:
+    """The gateway address on the Master API client ID (:data:`MASTER_CLIENT_ID_VAR`).
+
+    For the read-only reconcile only. Refused when it equals the trader's own
+    order-capable client id (:data:`CLIENT_ID_VAR`), which must also be set: a
+    master session sees every client's orders as well as its fills, so an
+    order-capable session on it could act on the v1 executor's orders.
+    """
+    source = os.environ if env is None else env
+    master = GatewayAddress.from_env(source, client_id_var=MASTER_CLIENT_ID_VAR)
+    own = GatewayAddress.from_env(source)
+    if master.client_id == own.client_id:
+        raise BrokerSettingsError(
+            f"{MASTER_CLIENT_ID_VAR} equals {CLIENT_ID_VAR} ({own.client_id}). The master client "
+            "id is the read-only reconcile's alone; the order-capable session must never be it."
+        )
+    return master
 
 
 def _non_negative_seconds(source: Any, var: str, default: float) -> float:

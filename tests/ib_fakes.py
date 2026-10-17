@@ -42,14 +42,19 @@ def broker_fill(
     avg_price: float,
     commission: float | None = 0.0,
     time: dt.datetime = T0,
+    client_id: int = 7,
 ) -> SimpleNamespace:
     """An `ib_async.Fill`-shaped record: `reconcile_entrypoint.fills_from_ib`
     reads exactly this subset (`contract.symbol`, `execution.{time,side,shares,
-    avgPrice}`, `commissionReport.commission`)."""
+    avgPrice}`, `commissionReport.commission`). ``execution.clientId`` is the
+    API client that placed the order; it is never read, and is there so a test
+    can say which client a fill belongs to."""
     report = None if commission is None else SimpleNamespace(commission=commission)
     return SimpleNamespace(
         contract=SimpleNamespace(symbol=symbol),
-        execution=SimpleNamespace(time=time, side=side, shares=shares, avgPrice=avg_price),
+        execution=SimpleNamespace(
+            time=time, side=side, shares=shares, avgPrice=avg_price, clientId=client_id
+        ),
         commissionReport=report,
     )
 
@@ -71,7 +76,7 @@ class FakeIB:
         self.book = dict(positions or {})
         self.cash = cash
         #: `reconcile_entrypoint.fills_from_ib` reads this through the real
-        #: `.fills()` method below -- kept distinct from `_simulate_fills`
+        #: `.reqExecutions()` method below -- kept distinct from `_simulate_fills`
         #: (the order-fill-simulation toggle) so a method and a bool don't
         #: collide on the same name.
         self.broker_fills = list(broker_fills)
@@ -139,6 +144,12 @@ class FakeIB:
         return self._add(contract, order, "Submitted", self.clock())
 
     def fills(self):
+        """The session's own fills (the order router reads these)."""
+        return list(self.broker_fills)
+
+    def reqExecutions(self):  # noqa: N802 - SDK spelling
+        """Every execution on the account. The real gateway answers this way
+        only to its Master API client ID; the reconcile connects on it."""
         return list(self.broker_fills)
 
     def sleep(self, seconds):
@@ -219,6 +230,7 @@ def environ_for(store_path, **extra) -> dict[str, str]:
         "CRUCIBLE_TRADER_IB_HOST": "127.0.0.1",
         "CRUCIBLE_TRADER_IB_PORT": "4002",
         "CRUCIBLE_TRADER_IB_CLIENT_ID": "7",
+        "CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "8",
     }
     values.update(extra)
     return values
