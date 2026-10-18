@@ -26,6 +26,19 @@ name that attested M champion's predictions as its alpha and the current U
 champion's cut (or its recorded absence) as its eligibility — a session
 recorded under a champion that has since been demoted is refused, not traded.
 
+**A ruled M bench is accepted as the session's alpha source, and only as
+ruled** (`alpha-engine-config-I12024`, Brian's ruling of 2026-10-18: the M slot
+benched at zero weight, recording "no lift"). While `slots/m/bench.json`
+covers the session, the harness records the bench key as the session's alpha
+source and a ZERO vector as its alpha (`crucible.slots.strategy.resolve_session`).
+The trader accepts that session only while the bench it reads now covers the
+day, names the attested M champion, and the recorded alpha is exactly zero —
+and it REFUSES a session recorded on the champion's forecast for a day the
+bench covers, which would size on a forecast the ruling benched. The bench
+read is `crucible.bench.active_bench`, the harness's own reader; its identity
+(key and digest) is carried on the :class:`TargetBook` into the served-day
+evidence, where a new bench restarts the count.
+
 **A participation-aware cost model handed no ADV RAISES** inside the engine
 (`alpha-engine-config-I10503`). That raise propagates: no ADV at trade time is a
 refusal to size, never a cheaper charge.
@@ -59,8 +72,16 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+from crucible.bench import SlotBenchError, active_bench
 from crucible.documents import load_store_document
-from crucible.keys import arm_predictions_key, champion_key, shadow_key, universe_members_key
+from crucible.keys import (
+    arm_predictions_key,
+    champion_key,
+    shadow_key,
+    slot_bench_key,
+    universe_members_key,
+)
+from crucible.models import TraderEvidenceBench
 from crucible.portfolio import PortfolioParamsError, load_portfolio_params_from_store
 from crucible.portfolio import portfolio_metric_record as _portfolio_metric_record
 from crucible.slots.arms import read_register
@@ -107,6 +128,9 @@ class TargetBook:
     evidence: dict[str, Any]
     metric: dict[str, Any]
     session_inputs_key: str
+    #: The ruled M bench the session's alpha was served under (key and digest),
+    #: or ``None`` when the alpha is the M champion's own forecast.
+    alpha_bench: TraderEvidenceBench | None = None
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -145,6 +169,61 @@ def resolve_strategy_arm(store: Store, *, arm_id: str, trading_day: str) -> Regi
     )
 
 
+def _assert_session_alpha_source(
+    store: Store, session: ResolvedSession, *, trading_day: str, m_champion: str
+) -> TraderEvidenceBench | None:
+    """The session's alpha is the attested M champion's forecast, or the ruled bench.
+
+    Returns the bench's identity when the session was served under one, else
+    ``None``. Every disagreement between the recorded session and what the
+    store says NOW is a :class:`ContractRefusal`: each is a session whose alpha
+    nothing in force authorises.
+    """
+    try:
+        bench = active_bench(store, "m", trading_day)
+    except SlotBenchError as exc:
+        raise ContractRefusal(
+            f"the M bench record cannot be honoured on {trading_day}: {exc}. A bench the "
+            "trader cannot read is not a bench it may assume either way."
+        ) from exc
+    if bench is None:
+        expected_alpha = arm_predictions_key(m_champion, trading_day)
+        if session.alpha_source == expected_alpha:
+            return None
+        if session.alpha_source == slot_bench_key("m"):
+            raise ContractRefusal(
+                f"the session recorded for {trading_day} took its alpha from the M bench "
+                f"{session.alpha_source!r}, but no bench filed now covers {trading_day}. "
+                "Trading the zero vector would honour a ruling that is no longer filed."
+            )
+        raise ContractRefusal(
+            f"the session recorded for {trading_day} took its alpha from "
+            f"{session.alpha_source!r}, but the attested M champion's predictions are "
+            f"{expected_alpha!r}. The recorded inputs were resolved under a different M "
+            "champion, and trading them would size on a forecast no pointer authorises."
+        )
+    if session.alpha_source != bench.key:
+        raise ContractRefusal(
+            f"{bench.headline()} covers {trading_day}, but the session recorded for it took "
+            f"its alpha from {session.alpha_source!r}. Trading it would size on a forecast "
+            "the ruling benched."
+        )
+    if bench.champion_at_bench != m_champion:
+        raise ContractRefusal(
+            f"{bench.key} benches {bench.champion_at_bench!r}, but the attested M champion is "
+            f"{m_champion!r}. A bench is a ruling about one arm, and serving another under "
+            "it would honour a ruling nobody made."
+        )
+    nonzero = sum(1 for alpha in session.alpha_hat if alpha != 0.0)
+    if nonzero:
+        raise ContractRefusal(
+            f"the session recorded for {trading_day} names the M bench as its alpha source "
+            f"but carries {nonzero} non-zero alpha(s). A benched slot's weight is zero by "
+            "ruling; a session that says otherwise is not the session the ruling describes."
+        )
+    return TraderEvidenceBench(key=bench.key, digest=bench.digest)
+
+
 def _assert_session_names_the_attested_champions(
     store: Store,
     session: ResolvedSession,
@@ -152,15 +231,21 @@ def _assert_session_names_the_attested_champions(
     trading_day: str,
     m_champion: str,
     u_champion: str | None,
+) -> TraderEvidenceBench | None:
+    """The recorded session's alpha and cut are what the pointers authorise now.
+
+    Returns the ruled M bench the alpha was served under, or ``None``.
+    """
+    bench = _assert_session_alpha_source(
+        store, session, trading_day=trading_day, m_champion=m_champion
+    )
+    _assert_session_cut(store, session, trading_day=trading_day, u_champion=u_champion)
+    return bench
+
+
+def _assert_session_cut(
+    store: Store, session: ResolvedSession, *, trading_day: str, u_champion: str | None
 ) -> None:
-    expected_alpha = arm_predictions_key(m_champion, trading_day)
-    if session.alpha_source != expected_alpha:
-        raise ContractRefusal(
-            f"the session recorded for {trading_day} took its alpha from "
-            f"{session.alpha_source!r}, but the attested M champion's predictions are "
-            f"{expected_alpha!r}. The recorded inputs were resolved under a different M "
-            "champion, and trading them would size on a forecast no pointer authorises."
-        )
     if u_champion is None:
         if not session.eligibility_source.startswith("absent"):
             raise ContractRefusal(
@@ -268,7 +353,7 @@ def construct_target_book(
             f"the construction inputs for {trading_day} are not published: {exc}"
         ) from exc
     (session,) = inputs.resolved
-    _assert_session_names_the_attested_champions(
+    alpha_bench = _assert_session_names_the_attested_champions(
         store, session, trading_day=trading_day, m_champion=m_pointer.arm_id, u_champion=u_champion
     )
 
@@ -299,4 +384,5 @@ def construct_target_book(
             now_utc=now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         ),
         session_inputs_key=inputs.session_inputs_keys[0],
+        alpha_bench=alpha_bench,
     )
