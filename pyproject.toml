@@ -38,7 +38,7 @@ dependencies = [
     # release wheel pins a package this lock pins differently, the wheel wins
     # in the box's venv (`crucible_trader.release_env`, alpha-engine-config-
     # I12280: a krepis pin one patch apart failed every unit on 2026-10-14/15).
-    "crucible @ git+https://github.com/nousergon/crucible@fc5dd9daff4bc5dae18a41592f4ae3e817842759",
+    "crucible @ git+https://github.com/nousergon/crucible@72fa3a04ace4f4bb975257b12a7a359aad70a170",
     # Reads the release wheel's `Requires-Dist` and compares it with this
     # lock's pins (`crucible_trader.release_env`). Already in the lock through
     # crucible; declared because this package imports it directly.
