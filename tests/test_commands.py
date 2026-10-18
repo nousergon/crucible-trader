@@ -14,6 +14,7 @@ from ib_fakes import DAY, T0, FakeIB, FakeSdk, broker_fill, environ_for
 from s3_fake import FakeS3, FakeSsm
 
 from crucible_trader import commands
+from crucible_trader.broker_session import BrokerSettingsError
 from crucible_trader.commands import main
 from crucible_trader.drill_schedule import NONCE_ENV_VAR
 from crucible_trader.fire_drill import FIRE_DRILL_JOB, fire_drill_key
@@ -315,6 +316,57 @@ class TestReconcileCommand:
         assert manifest["status"] == "ok"
         document = json.loads(store.get_bytes(trader_reconciliation_key(DAY.isoformat())))
         assert document["genesis"] is True and document["void"] is False
+
+    def test_reconcile_connects_on_the_master_client_id_and_reads_every_clients_fills(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """alpha-engine-config-I12376 (option (b)): the reconcile connects on
+        the gateway's Master API client ID, not the trader's own, and reads the
+        account's executions afresh -- here a v1 executor fill (client 1)
+        reconciles the book it moved."""
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        ib = FakeIB(
+            positions={"AAA": 4},
+            cash=1_000.0,
+            broker_fills=(
+                broker_fill(
+                    "AAA",
+                    side="BOT",
+                    shares=4,
+                    avg_price=10.0,
+                    commission=1.0,
+                    time=T0,
+                    client_id=1,
+                ),
+            ),
+        )
+        monkeypatch.setattr(ib, "fills", _never_loaded)
+        rc, _ = _main(
+            tmp_path,
+            ["reconcile", "run", "--genesis"],
+            ib=ib,
+            environ_extra={"CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "42"},
+        )
+        assert rc == 0
+        assert ib.connected_with["clientId"] == 42
+        assert ib.connected_with["readonly"] is True
+
+    def test_reconcile_without_a_master_client_id_refuses_before_connecting(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        environ = environ_for(tmp_path)
+        del environ["CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID"]
+        with pytest.raises(BrokerSettingsError, match="CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID"):
+            main(["reconcile", "run"], environ=environ, sdk_loader=_never_loaded)
+
+    def test_order_capable_commands_keep_the_traders_own_client_id(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        ib = FakeIB(positions={"AAA": 4})
+        _main(tmp_path, ["kill-switch", "fire", "--mode", "freeze", "--cause", "test"], ib=ib)
+        assert ib.connected_with["clientId"] == 7
 
     def test_without_genesis_and_no_prior_statement_the_run_fails_loud(
         self, tmp_path, monkeypatch

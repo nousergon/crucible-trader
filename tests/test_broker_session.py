@@ -26,6 +26,7 @@ from crucible_trader.broker_session import (
     ReadOnlyBroker,
     connect,
     load_sdk,
+    master_address_from_env,
     port_listening,
     read_uptime_s,
     wait_for_port,
@@ -64,6 +65,35 @@ class Port:
     def __call__(self, host: str, port: int) -> bool:
         self.probes += 1
         return self.probes > self.refusals
+
+
+class TestMasterAddress:
+    """alpha-engine-config-I12376: the reconcile's address is the gateway's
+    Master API client ID, and never the order-capable session's own id."""
+
+    def test_the_master_client_id_is_the_reconciles_client_id(self) -> None:
+        env = {**ENV, "CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "42"}
+        assert master_address_from_env(env) == GatewayAddress("h", 4002, 42)
+
+    def test_an_unset_master_client_id_is_refused_and_never_defaults(self) -> None:
+        with pytest.raises(BrokerSettingsError, match="CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID"):
+            master_address_from_env(ENV)
+
+    def test_the_traders_own_client_id_is_still_required(self) -> None:
+        env = {**ENV, "CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "42"}
+        del env["CRUCIBLE_TRADER_IB_CLIENT_ID"]
+        with pytest.raises(BrokerSettingsError, match="CRUCIBLE_TRADER_IB_CLIENT_ID"):
+            master_address_from_env(env)
+
+    def test_a_master_id_equal_to_the_order_capable_id_is_refused(self) -> None:
+        env = {**ENV, "CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "7"}
+        with pytest.raises(BrokerSettingsError, match="must never be it"):
+            master_address_from_env(env)
+
+    def test_a_non_integer_master_id_is_refused(self) -> None:
+        env = {**ENV, "CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "master"}
+        with pytest.raises(BrokerSettingsError, match="MASTER_CLIENT_ID must be integers"):
+            master_address_from_env(env)
 
 
 class TestAddress:

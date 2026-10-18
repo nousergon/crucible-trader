@@ -42,7 +42,12 @@ from typing import Any
 from crucible.gate import kill_switch_fire_drill_reading
 from crucible.runner import RunContext, run_job
 
-from crucible_trader.broker_session import GatewayAddress, connect, load_sdk
+from crucible_trader.broker_session import (
+    GatewayAddress,
+    connect,
+    load_sdk,
+    master_address_from_env,
+)
 from crucible_trader.drill_schedule import (
     NONCE_ENV_VAR,
     SealOpening,
@@ -187,7 +192,17 @@ def main(
     else:
         job, stamp, connects = FIRE_DRILL_JOB, args.kind, True
 
-    address = GatewayAddress.from_env(source) if connects else None
+    # `trader.reconcile` connects on the gateway's Master API client ID so it
+    # sees every API client's executions on the shared paper account
+    # (alpha-engine-config-I12376); every order-capable command keeps the
+    # trader's own client id.
+    address: GatewayAddress | None
+    if not connects:
+        address = None
+    elif job == RECONCILE_JOB:
+        address = master_address_from_env(source)
+    else:
+        address = GatewayAddress.from_env(source)
     clients: list[Any] = []
 
     def body(ctx: RunContext) -> Any:
