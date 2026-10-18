@@ -69,6 +69,7 @@ from zoneinfo import ZoneInfo
 
 from crucible.calendar import is_trading_day
 from crucible.execution import EXECUTION_SHORTFALL_SCHEMA_VERSION, execution_shortfall_key
+from crucible.models import TraderEvidenceBench
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
 
@@ -207,6 +208,8 @@ def daily_session_cycle(
     # before each batch, and a shadow session has none.
     assert_trading_permitted(ctx.store, day)
     (contract,) = resolved
+    bench = result.get("alpha_bench")
+    alpha_bench = None if bench is None else TraderEvidenceBench.model_validate(bench)
 
     evidence = record_session(
         ctx.store,
@@ -214,6 +217,7 @@ def daily_session_cycle(
         mode=mode,
         calendar_date=ctx.calendar_date.isoformat(),
         put=lambda key, payload: ctx.record_output(key, payload, EVIDENCE_SCHEMA_VERSION),
+        alpha_bench=alpha_bench,
     )
     shortfall = _file_shortfall(ctx, router, champion=contract.arm_id, clock=clock)
     shadow_days = len(evidence.shadow_days())
@@ -222,8 +226,9 @@ def daily_session_cycle(
             ctx,
             served=True,
             reason=(
-                f"{mode} session on {contract.arm_id}: {evidence.trading_days} served day(s), "
-                f"{shadow_days} of them shadow"
+                f"{mode} session on {contract.arm_id}"
+                f"{'' if alpha_bench is None else f' benched at weight 0 ({alpha_bench.key})'}: "
+                f"{evidence.trading_days} served day(s), {shadow_days} of them shadow"
             ),
         )
     )
