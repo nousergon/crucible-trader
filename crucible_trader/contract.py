@@ -40,7 +40,7 @@ from typing import Literal
 from crucible.champion import ChampionPointer, ChampionUnusableError, read_champion
 from crucible.explain import verify_money_path_chain
 from crucible.keys import TRADER_EVIDENCE_KEY
-from crucible.models import TraderEvidenceBench, TraderEvidenceDocument
+from crucible.models import TraderEvidenceDocument
 from crucible.serving import PredictionsFeed, PredictionsFeedContractError, read_predictions_feed
 from crucible.store import Store
 
@@ -197,7 +197,6 @@ def record_session(
     mode: SessionMode,
     calendar_date: str | None = None,
     put: Callable[[str, bytes], object] | None = None,
-    alpha_bench: TraderEvidenceBench | None = None,
 ) -> TraderEvidenceDocument:
     """Add ``contract``'s trading day, and how it was served, to the consumer evidence.
 
@@ -221,14 +220,6 @@ def record_session(
     and a rolling total across promotions would let five one-day champions read
     as a week.
 
-    **A ruled bench is part of the identity** (`alpha-engine-config-I12024`).
-    ``alpha_bench`` is the M bench the session's alpha was served under (key and
-    digest; `crucible_trader.construction.TargetBook.alpha_bench`), or ``None``
-    for the champion's own forecast. A day served at weight zero is not a day
-    served on the champion's forecast, so a bench filed, re-filed or lifted
-    restarts the count exactly as a promotion does. The field is written only
-    when set: a document served on the forecast is byte-for-byte what it was.
-
     Idempotent within a day: recording the same trading day twice leaves the
     count unchanged, so a retried session does not inflate it. A day recorded
     `shadow` and later served `live` becomes `live` (orders did leave the trader
@@ -243,11 +234,7 @@ def record_session(
     day = contract.trading_day
     previous = _read_evidence(store)
 
-    if (
-        previous is not None
-        and previous.champion == contract.arm_id
-        and previous.alpha_bench == alpha_bench
-    ):
+    if previous is not None and previous.champion == contract.arm_id:
         days = list(previous.days_served)
         modes = dict(previous.session_modes)
         if day not in days:
@@ -267,14 +254,8 @@ def record_session(
         days_served=days,
         session_modes=modes,
         calendar_date=calendar_date or dt.date.today().isoformat(),
-        alpha_bench=alpha_bench,
     )
-    # `exclude_none` drops only `alpha_bench` (every other field is required and
-    # non-null): a reader that predates the bench still reads every document
-    # served on the forecast, and refuses only a benched one it could not grade.
-    payload = json.dumps(document.model_dump(exclude_none=True), indent=2, sort_keys=True).encode(
-        "utf-8"
-    )
+    payload = json.dumps(document.model_dump(), indent=2, sort_keys=True).encode("utf-8")
     (put or store.put_bytes)(TRADER_EVIDENCE_KEY, payload)
     return document
 

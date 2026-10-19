@@ -95,10 +95,6 @@ def session_cycle(
         "schema_version": SESSION_SCHEMA_VERSION,
         "trading_day": day,
         "m_champion": contract.arm_id,
-        # `alpha-engine-config-I12024`: the ruled M bench this session's alpha
-        # was served under, or None. Carried into the served-day evidence by
-        # `crucible_trader.daily_session`.
-        "alpha_bench": None if book.alpha_bench is None else book.alpha_bench.model_dump(),
         "s_champion": book.s_champion,
         "hold_decision": decision.decision,
         "batches_sent": sent,
