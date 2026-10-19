@@ -58,9 +58,7 @@ def _serveable(store: LocalStore, *, trading_day: str) -> None:
 
 
 def _construct(store_, **kwargs):
-    return SimpleNamespace(
-        s_champion="s:arm:def", metric={"name": "portfolio_construction"}, alpha_bench=None
-    )
+    return SimpleNamespace(s_champion="s:arm:def", metric={"name": "portfolio_construction"})
 
 
 @pytest.fixture
@@ -97,7 +95,7 @@ class LiveRouter:
         self.closed += 1
 
 
-def _cycle(store, router, *, day=DAY, resolver=None, construct=_construct):
+def _cycle(store, router, *, day=DAY, resolver=None):
     ib = FakeIB()
     ctx = ctx_for(store, SESSION_JOB, day=day)
     kwargs = {} if resolver is None else {"contract_resolver": resolver}
@@ -107,7 +105,7 @@ def _cycle(store, router, *, day=DAY, resolver=None, construct=_construct):
         router=router,
         installed_version=VERSION,
         clock=ib.clock,
-        construct=construct,
+        construct=_construct,
         **kwargs,
     )
     return ctx, result, ib
@@ -128,37 +126,6 @@ class TestAShadowSessionIsAServedDay:
         assert result["shortfall_outcome"] == "no_orders"
         assert (result["trading_days"], result["shadow_days"]) == (1, 1)
         assert result["batches_sent"] == 0
-
-    def test_a_benched_session_carries_its_bench_into_the_evidence(self, store) -> None:
-        """`alpha-engine-config-I12024`: the bench the book was built under
-        (`TargetBook.alpha_bench`) reaches `record_session`, so the served day
-        is counted under the bench's identity and the metric names it."""
-        from crucible.keys import slot_bench_key
-        from crucible.models import TraderEvidenceBench
-
-        bench = TraderEvidenceBench(key=slot_bench_key("m"), digest="sha256:" + "a" * 64)
-
-        def benched(store_, **kwargs):
-            return SimpleNamespace(
-                s_champion="s:arm:def",
-                metric={"name": "portfolio_construction"},
-                alpha_bench=bench,
-            )
-
-        _serveable(store, trading_day=DAY.isoformat())
-        ctx, result, _ = _cycle(store, ShadowRouter(), construct=benched)
-
-        evidence = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))
-        assert evidence["alpha_bench"] == bench.model_dump()
-        assert result["alpha_bench"] == bench.model_dump()
-        assert f"benched at weight 0 ({bench.key})" in ctx.metrics[-1]["status_reason"]
-
-    def test_a_forecast_session_files_no_bench(self, store) -> None:
-        _serveable(store, trading_day=DAY.isoformat())
-        _, result, _ = _cycle(store, ShadowRouter())
-
-        assert "alpha_bench" not in json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))
-        assert result["alpha_bench"] is None
 
     def test_both_artifacts_are_outputs_of_the_run(self, store) -> None:
         _serveable(store, trading_day=DAY.isoformat())
