@@ -337,3 +337,110 @@ class TestAHeldNameTheMChampionStopsPricingIsExited:
         assert tuple(book.weights.values()) == graded.weights[1]
         assert book.cost_bps == graded.book.cost_bps[1]
         assert book.turnover_one_way_ratio == graded.book.turnover[1]
+
+
+#: The ruling's tracker, as a plain `int`, the way the harness's own suites
+#: spell it (crucible `tests/test_no_stale_tracker_literals.py`).
+BENCH_TRACKER_ISSUE = 12024
+
+
+def _file_bench(world, champion: str = M_CHAMPION, *, effective: str = DAY, **overrides) -> None:
+    """A `slot_bench.v1` record filed where `crucible bench` files it, built by
+    the harness's own writer-side validator."""
+    from crucible.bench import bench_document, bench_record_bytes
+    from crucible.keys import slot_bench_key
+
+    fields = {
+        "slot": "m",
+        "champion_at_bench": champion,
+        "ruled_by": "brian",
+        "ruled_at": "2026-10-18T14:44Z",
+        "ruling_ref": "https://github.com/nousergon/alpha-engine-config/issues/12024#c1",
+        "tracker": f"alpha-engine-config-I{BENCH_TRACKER_ISSUE}",
+        "reason": "no M arm passes its serving preconditions",
+        "evidence": ["https://github.com/nousergon/alpha-engine-config/pull/12406"],
+        "effective_trading_day": effective,
+        "reexam_date": "2026-11-20",
+        "filed_by": "tester",
+        "filed_at_utc": "2026-09-10T12:00:00Z",
+        "filed_on": effective,
+        **overrides,
+    }
+    world.store.put_bytes(slot_bench_key("m"), bench_record_bytes(bench_document(**fields)))
+
+
+class TestARuledMBenchIsTheSessionsAlphaSource:
+    """`alpha-engine-config-I12024` (Brian's ruling of 2026-10-18): the M slot
+    temporarily benched at zero weight, a cutover mechanic. The harness records the bench
+    as the session's alpha source and a zero vector as its alpha; the trader
+    accepts that session only as ruled, and carries the bench's identity into
+    the served-day evidence."""
+
+    def test_a_benched_session_constructs_the_graded_book_and_names_the_bench(self, world) -> None:
+        from crucible.bench import read_slot_bench
+        from crucible.keys import slot_bench_key
+
+        _file_bench(world)
+        key = world.record_session(world.arm_id)
+        assert json.loads(world.store.get_bytes(key))["alpha_source"] == slot_bench_key("m")
+
+        traded = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+        graded = _grade_book(world)
+
+        assert tuple(traded.weights.values()) == graded.weights[0], "one book, benched or not"
+        assert traded.cost_bps == graded.book.cost_bps[0]
+        bench = read_slot_bench(world.store, "m")
+        assert bench is not None
+        assert traded.alpha_bench is not None
+        assert (traded.alpha_bench.key, traded.alpha_bench.digest) == (bench.key, bench.digest)
+        assert traded.m_champion == M_CHAMPION, "the M pointer stays in force"
+
+    def test_an_unbenched_session_carries_no_bench(self, world) -> None:
+        world.record_session(world.arm_id)
+        book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+        assert book.alpha_bench is None
+
+    def test_a_session_recorded_on_the_forecast_for_a_benched_day_is_refused(self, world) -> None:
+        world.record_session(world.arm_id)
+        _file_bench(world)
+        with pytest.raises(ContractRefusal, match="the ruling benched"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_benched_session_with_no_bench_filed_now_is_refused(self, world) -> None:
+        from crucible.keys import slot_bench_key
+
+        _file_bench(world)
+        world.record_session(world.arm_id)
+        remove(world.store, slot_bench_key("m"))
+        with pytest.raises(ContractRefusal, match="no longer filed"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_bench_ruled_on_another_arm_is_refused(self, world) -> None:
+        _file_bench(world)
+        world.record_session(world.arm_id)
+        _file_bench(world, champion="m:other:cccccccccccc")
+        with pytest.raises(ContractRefusal, match="a ruling nobody made"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_benched_session_carrying_alpha_is_refused(self, world) -> None:
+        _file_bench(world)
+        key = world.record_session(world.arm_id)
+        session = json.loads(world.store.get_bytes(key))
+        session["alpha_hat"][0] = 0.01
+        put(world.store, key, session)
+        with pytest.raises(ContractRefusal, match="non-zero alpha"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_bench_that_cannot_be_read_as_one_is_refused(self, world) -> None:
+        from crucible.keys import slot_bench_key
+
+        world.record_session(world.arm_id)
+        world.store.put_bytes(slot_bench_key("m"), b"{}")
+        with pytest.raises(ContractRefusal, match="cannot be honoured"):
+            construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+    def test_a_bench_not_yet_in_effect_changes_nothing(self, world) -> None:
+        _file_bench(world, effective=NEXT.isoformat())
+        world.record_session(world.arm_id)
+        book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+        assert book.alpha_bench is None
