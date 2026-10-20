@@ -453,6 +453,170 @@ class TestThePhase4GateGradesThisEvidence:
         assert "2 trading day(s)" in clause.detail
 
 
+#: The ruling's tracker, as a plain `int` (no hardcoded tracker literal).
+BENCH_TRACKER_ISSUE = 12024
+
+
+def _file_bench(store: LocalStore, *, effective: str, reexam: str = "2026-11-20"):
+    """File a `slot_bench.v1` record through the harness's own writer-side
+    validator, and return the identity the trader carries into its evidence."""
+    from crucible.bench import bench_document, bench_record_bytes, read_slot_bench
+    from crucible.keys import slot_bench_key
+    from crucible.models import TraderEvidenceBench
+
+    document = bench_document(
+        slot="m",
+        champion_at_bench=ARM,
+        ruled_by="brian",
+        ruled_at="2026-10-18T14:44Z",
+        ruling_ref="https://github.com/nousergon/alpha-engine-config/issues/12024#c1",
+        tracker=f"alpha-engine-config-I{BENCH_TRACKER_ISSUE}",
+        reason="no M arm passes its serving preconditions",
+        evidence=["https://github.com/nousergon/alpha-engine-config/pull/12406"],
+        effective_trading_day=effective,
+        reexam_date=reexam,
+        filed_by="tester",
+        filed_at_utc="2026-09-07T12:00:00Z",
+        filed_on=effective,
+    )
+    store.put_bytes(slot_bench_key("m"), bench_record_bytes(document))
+    bench = read_slot_bench(store, "m")
+    assert bench is not None
+    return TraderEvidenceBench(key=bench.key, digest=bench.digest)
+
+
+class TestARuledBenchIsPartOfTheServedDaysIdentity:
+    """`alpha-engine-config-I12024`: a day served with M's alpha at weight zero
+    is not a day served on M's forecast, so the bench restarts the count the
+    way a promotion does, and the same bench extends it."""
+
+    def test_a_forecast_document_carries_no_bench_field(self, store: LocalStore) -> None:
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="shadow", calendar_date=DAY)
+
+        stored = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY).decode("utf-8"))
+
+        assert "alpha_bench" not in stored
+
+    def test_a_benched_session_records_the_bench(self, store: LocalStore) -> None:
+        _serveable(store)
+        bench = _file_bench(store, effective=DAY)
+
+        document = record_session(
+            store, resolve(store, DAY), mode="shadow", calendar_date=DAY, alpha_bench=bench
+        )
+
+        stored = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY).decode("utf-8"))
+        assert document.alpha_bench == bench
+        assert stored["alpha_bench"] == bench.model_dump()
+
+    def test_benching_restarts_the_count(self, store: LocalStore) -> None:
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="shadow", calendar_date=DAY)
+        bench = _file_bench(store, effective=NEXT_DAY)
+        _serveable(store, trading_day=NEXT_DAY)
+
+        document = record_session(
+            store,
+            resolve(store, NEXT_DAY),
+            mode="shadow",
+            calendar_date=NEXT_DAY,
+            alpha_bench=bench,
+        )
+
+        assert document.days_served == [NEXT_DAY]
+
+    def test_the_same_bench_extends_the_count(self, store: LocalStore) -> None:
+        _serveable(store)
+        bench = _file_bench(store, effective=DAY)
+        record_session(
+            store, resolve(store, DAY), mode="shadow", calendar_date=DAY, alpha_bench=bench
+        )
+        _serveable(store, trading_day=NEXT_DAY)
+
+        document = record_session(
+            store,
+            resolve(store, NEXT_DAY),
+            mode="shadow",
+            calendar_date=NEXT_DAY,
+            alpha_bench=bench,
+        )
+
+        assert document.days_served == [DAY, NEXT_DAY]
+
+    def test_a_refiled_bench_restarts_the_count(self, store: LocalStore) -> None:
+        _serveable(store)
+        first = _file_bench(store, effective=DAY)
+        record_session(
+            store, resolve(store, DAY), mode="shadow", calendar_date=DAY, alpha_bench=first
+        )
+        second = _file_bench(store, effective=DAY, reexam="2026-12-18")
+        assert second.digest != first.digest
+        _serveable(store, trading_day=NEXT_DAY)
+
+        document = record_session(
+            store,
+            resolve(store, NEXT_DAY),
+            mode="shadow",
+            calendar_date=NEXT_DAY,
+            alpha_bench=second,
+        )
+
+        assert document.days_served == [NEXT_DAY]
+
+    def test_lifting_the_bench_restarts_the_count(self, store: LocalStore) -> None:
+        _serveable(store)
+        bench = _file_bench(store, effective=DAY)
+        record_session(
+            store, resolve(store, DAY), mode="shadow", calendar_date=DAY, alpha_bench=bench
+        )
+        _serveable(store, trading_day=NEXT_DAY)
+
+        document = record_session(
+            store, resolve(store, NEXT_DAY), mode="shadow", calendar_date=NEXT_DAY
+        )
+
+        assert document.alpha_bench is None
+        assert document.days_served == [NEXT_DAY]
+
+
+class TestThePhase4GateGradesABenchedWeek:
+    """The gate reads a benched week back through `crucible.gate.evaluate` as
+    shipped in the pinned wheel: it names the bench, and refuses a week whose
+    bench is no longer the one filed."""
+
+    CLAUSE = "trader_one_week_on_v2_champion"
+    WEEK = ("2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14")
+
+    def _serve_benched(self, store: LocalStore):
+        bench = _file_bench(store, effective=self.WEEK[0])
+        for day in self.WEEK:
+            _serveable(store, trading_day=day)
+            record_session(
+                store, resolve(store, day), mode="shadow", calendar_date=day, alpha_bench=bench
+            )
+        return bench
+
+    def test_a_benched_week_is_met_and_names_the_bench(self, store, phase4_clause) -> None:
+        bench = self._serve_benched(store)
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert clause.met
+        assert clause.evidence == (TRADER_EVIDENCE_KEY, bench.key)
+        assert f"benched at weight 0 ({bench.key})" in clause.detail
+        assert "M temporarily benched at zero weight" in clause.detail
+
+    def test_a_week_under_a_bench_since_refiled_is_unmet(self, store, phase4_clause) -> None:
+        self._serve_benched(store)
+        _file_bench(store, effective=self.WEEK[0], reexam="2026-12-18")
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert not clause.met and not clause.unmeasurable
+        assert "restarts the count" in clause.detail
+
+
 class TestTheFeedIsReadThroughItsPublishedSchema:
     """The consumer-contract half: this repository validates against the schema
     the harness generated and shipped, not against a copy of its own."""

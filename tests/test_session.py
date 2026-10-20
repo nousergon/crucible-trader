@@ -84,7 +84,9 @@ def _run(store, ib, router, *, alphas=HEALTHY, version=VERSION, constructed=None
 
     def construct(store_, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(s_champion="s:arm:def", metric={"name": "portfolio_construction"})
+        return SimpleNamespace(
+            s_champion="s:arm:def", metric={"name": "portfolio_construction"}, alpha_bench=None
+        )
 
     ctx = ctx_for(store, "trader.session")
     result = session_cycle(
@@ -122,6 +124,7 @@ def test_a_clear_session_constructs_and_sends_every_batch(store) -> None:
         "s_champion": "s:arm:def",
         "hold_decision": "proceed_signal_healthy",
         "batches_sent": 2,
+        "alpha_bench": None,
     }
     assert constructed[0]["trading_day"] == "2026-09-08" and constructed[0]["now"] == ib.clock()
     assert [m["name"] for m in ctx.metrics] == ["hold_book_engaged", "portfolio_construction"]
