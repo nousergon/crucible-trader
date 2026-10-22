@@ -323,7 +323,8 @@ class TestReconcileCommand:
         """alpha-engine-config-I12376 (option (b)): the reconcile connects on
         the gateway's Master API client ID, not the trader's own, and reads the
         account's executions afresh -- here a v1 executor fill (client 1)
-        reconciles the book it moved."""
+        reconciles the book it moved. The executions are asked for afresh;
+        each one's commission is the session store's, matched by execId."""
         monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
         ib = FakeIB(
             positions={"AAA": 4},
@@ -340,7 +341,6 @@ class TestReconcileCommand:
                 ),
             ),
         )
-        monkeypatch.setattr(ib, "fills", _never_loaded)
         rc, _ = _main(
             tmp_path,
             ["reconcile", "run", "--genesis"],
@@ -348,6 +348,7 @@ class TestReconcileCommand:
             environ_extra={"CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "42"},
         )
         assert rc == 0
+        assert ib.executions_requested == 1
         assert ib.connected_with["clientId"] == 42
         assert ib.connected_with["readonly"] is True
 

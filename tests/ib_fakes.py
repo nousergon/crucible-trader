@@ -43,19 +43,41 @@ def broker_fill(
     commission: float | None = 0.0,
     time: dt.datetime = T0,
     client_id: int = 7,
+    exec_id: str | None = None,
 ) -> SimpleNamespace:
-    """An `ib_async.Fill`-shaped record: `reconcile_entrypoint.fills_from_ib`
-    reads exactly this subset (`contract.symbol`, `execution.{time,side,shares,
-    avgPrice}`, `commissionReport.commission`). ``execution.clientId`` is the
-    API client that placed the order; it is never read, and is there so a test
-    can say which client a fill belongs to."""
-    report = None if commission is None else SimpleNamespace(commission=commission)
+    """An `ib_async.Fill`-shaped record as the session's fill store holds it:
+    `reconcile_entrypoint.fills_from_ib` reads exactly this subset
+    (`contract.symbol`, `execution.{execId,time,side,shares,avgPrice}`,
+    `commissionReport.{execId,commission}`). Its commission report is attached
+    (``execId`` matches) unless ``commission`` is None. ``execution.clientId``
+    is the API client that placed the order; it is never read, and is there so
+    a test can say which client a fill belongs to."""
+    exec_id = exec_id or f"{symbol}.{side}.{shares:g}.{time:%Y%m%d%H%M%S}.{client_id}"
+    report = None if commission is None else SimpleNamespace(execId=exec_id, commission=commission)
     return SimpleNamespace(
         contract=SimpleNamespace(symbol=symbol),
         execution=SimpleNamespace(
-            time=time, side=side, shares=shares, avgPrice=avg_price, clientId=client_id
+            execId=exec_id,
+            time=time,
+            side=side,
+            shares=shares,
+            avgPrice=avg_price,
+            clientId=client_id,
         ),
         commissionReport=report,
+    )
+
+
+def as_requested(record: SimpleNamespace) -> SimpleNamespace:
+    """How `ib_async` 2.1.0's `reqExecutions()` answers for an execution its
+    session store already holds (the connect's startup sync fetched it): a NEW
+    `Fill` with the SDK's default `CommissionReport()` -- ``execId=""``,
+    ``commission=0.0`` -- which no later report ever updates
+    (alpha-engine-config-I12376, the 2026-10-21 -1.00 cash_delta)."""
+    return SimpleNamespace(
+        contract=record.contract,
+        execution=record.execution,
+        commissionReport=SimpleNamespace(execId="", commission=0.0),
     )
 
 
@@ -80,6 +102,7 @@ class FakeIB:
         #: (the order-fill-simulation toggle) so a method and a bool don't
         #: collide on the same name.
         self.broker_fills = list(broker_fills)
+        self.executions_requested = 0
         self._simulate_fills = fills
         self.connect_error = connect_error
         self.connected_with: dict | None = None
@@ -149,8 +172,11 @@ class FakeIB:
 
     def reqExecutions(self):  # noqa: N802 - SDK spelling
         """Every execution on the account. The real gateway answers this way
-        only to its Master API client ID; the reconcile connects on it."""
-        return list(self.broker_fills)
+        only to its Master API client ID; the reconcile connects on it. Shaped
+        as `ib_async` 2.1.0 answers after its startup sync: new records whose
+        commission reports are unattached defaults (see `as_requested`)."""
+        self.executions_requested += 1
+        return [as_requested(record) for record in self.broker_fills]
 
     def sleep(self, seconds):
         self.clock.advance(seconds)
