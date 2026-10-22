@@ -29,6 +29,20 @@ real; the third is a stated, fail-loud gap, not a fabrication:**
   fields. A shape mismatch on the real SDK is a defect this module's own
   narrow `_READ` surface (mirroring `ReadOnlyBroker`) is built to surface
   loudly rather than swallow.
+
+  **Commissions come from the session's fill store, matched by execId**
+  (`alpha-engine-config-I12376`, 2026-10-21 run: a `cash_delta` of exactly
+  -1.00 on a day whose one v1 fill, DUOL 39 @ 142.44, carried a 1.00
+  commission). In `ib_async` 2.1.0 the connect's own startup sync already
+  requests the day's executions, so the session store (`fills()`) holds them
+  and its `commissionReport` callback updates THOSE `Fill` objects in place.
+  An explicit `reqExecutions()` then answers each already-known execution
+  with a NEW `Fill` carrying a default `CommissionReport()` -- `execId=""`,
+  `commission=0.0`, never `None` -- that nothing ever fills in. Reading the
+  commission off that answer costed every fill at zero, silently. The answer
+  still names the executions (it asks the gateway afresh); each one's cost is
+  read from the store, and only from a report whose `execId` is that
+  execution's, waiting a bounded moment for one still in flight.
 * ``cash_flows`` and ``corporate_actions`` -- **no live source exists.** IB's
   API gives no direct feed of declared non-trade cash movements (interest,
   fees) or corporate actions on held instruments; both need a source this
@@ -49,6 +63,7 @@ real; the third is a stated, fail-loud gap, not a fabrication:**
 from __future__ import annotations
 
 import datetime as dt
+import math
 from typing import Any, Protocol
 
 from crucible_trader.broker_session import ReadOnlyBroker
@@ -58,6 +73,17 @@ from crucible_trader.reconciliation import CorporateActionSet, Fill
 #: IB execution sides this module knows how to sign. Anything else is a
 #: defect surfaced loudly, never coerced.
 _SIDE_SIGN = {"BOT": 1, "SLD": -1}
+
+#: How long, in total, :func:`fills_from_ib` lets the session's event loop run
+#: for commission reports still in flight before it gives up loudly, and the
+#: step it waits in. IB sends each report just after its execution; this is
+#: headroom, not a tuning knob.
+COMMISSION_REPORT_WAIT_S = 10.0
+COMMISSION_REPORT_POLL_S = 0.5
+
+#: The TWS API's "no value" double (`ibapi.common.UNSET_DOUBLE`); a report
+#: carrying it, or any non-finite number, has no commission to cost.
+_UNSET_DOUBLE = 1.7976931348623157e308
 
 
 class UnrecognizedFillSideError(RuntimeError):
@@ -71,6 +97,7 @@ class MissingCommissionReportError(RuntimeError):
 
 
 class _Execution(Protocol):
+    execId: str  # noqa: N815 - SDK spelling
     time: dt.datetime
     side: str
     shares: float
@@ -78,6 +105,7 @@ class _Execution(Protocol):
 
 
 class _CommissionReport(Protocol):
+    execId: str  # noqa: N815 - SDK spelling
     commission: float | None
 
 
@@ -90,6 +118,10 @@ class _IbFill(Protocol):  # the subset of `ib_async.Fill` read here
 class _FillReader(Protocol):
     def reqExecutions(self) -> list[_IbFill]: ...  # noqa: N802 - SDK spelling
 
+    def fills(self) -> list[_IbFill]: ...
+
+    def sleep(self, seconds: float) -> Any: ...
+
 
 def live_statement_source(client: Any) -> StatementSourceProtocol:
     """The connected session's book, read the same way `paper_smoke` reads it:
@@ -97,36 +129,97 @@ def live_statement_source(client: Any) -> StatementSourceProtocol:
     return IbPaperStatementSource(ReadOnlyBroker(client))
 
 
-def fills_from_ib(client: _FillReader, trading_day: str) -> tuple[Fill, ...]:
+def _commission(report: _CommissionReport | None, exec_id: str) -> float | None:
+    """The commission ``report`` attaches to execution ``exec_id``, or None
+    when it attaches none: no report, a report for another execution (the
+    SDK's default `CommissionReport()` has ``execId == ""``), or no number."""
+    if report is None or getattr(report, "execId", None) != exec_id:
+        return None
+    value = report.commission
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value >= _UNSET_DOUBLE:
+        return None
+    return value
+
+
+def _store_commissions(client: _FillReader, exec_ids: set[str]) -> dict[str, float]:
+    found: dict[str, float] = {}
+    for record in client.fills():
+        exec_id = record.execution.execId
+        if exec_id in exec_ids:
+            value = _commission(record.commissionReport, exec_id)
+            if value is not None:
+                found[exec_id] = value
+    return found
+
+
+def fills_from_ib(
+    client: _FillReader,
+    trading_day: str,
+    *,
+    report_wait_s: float = COMMISSION_REPORT_WAIT_S,
+    poll_s: float = COMMISSION_REPORT_POLL_S,
+) -> tuple[Fill, ...]:
     """Today's executions on the account, as reconciliation `Fill`s.
 
-    Read with `reqExecutions()`, which asks the gateway afresh rather than
-    trusting the session's startup cache; on a Master-API-client-ID session it
-    returns every API client's executions (see the module docstring). Filtered
-    to ``trading_day`` by the execution's own timestamp -- the gateway may
-    return more than today's. A side
-    this module does not recognise, or a fill with no commission report yet,
-    raises rather than being priced as a guess or a zero.
+    The executions are read with `reqExecutions()`, which asks the gateway
+    afresh rather than trusting the session's startup cache; on a
+    Master-API-client-ID session it returns every API client's executions
+    (see the module docstring). Filtered to ``trading_day`` by the
+    execution's own timestamp -- the gateway may return more than today's --
+    and de-duplicated by ``execId``.
+
+    Each execution's commission is the one the session's fill store
+    (`fills()`) has attached to that same ``execId`` -- or the answer's own
+    report, if it carries that execId -- and never the SDK's unattached
+    default (see the module docstring). Reports still in flight are waited
+    for, letting the session's event loop run in ``poll_s`` steps for at most
+    ``report_wait_s`` in total. A side this module does not recognise, or an
+    execution still without its own commission report after that, raises
+    rather than being priced as a guess or a zero.
     """
-    fills: list[Fill] = []
+    executions: dict[str, _IbFill] = {}
     for record in client.reqExecutions():
         execution = record.execution
         if execution.time.date().isoformat() != trading_day:
             continue
-        sign = _SIDE_SIGN.get(execution.side)
-        if sign is None:
+        if execution.side not in _SIDE_SIGN:
             raise UnrecognizedFillSideError(
                 f"{record.contract.symbol!r} execution side {execution.side!r} is not one of "
                 f"{sorted(_SIDE_SIGN)}"
             )
-        report = record.commissionReport
-        if report is None or report.commission is None:
+        executions.setdefault(execution.execId, record)
+
+    commissions = {
+        exec_id: value
+        for exec_id, record in executions.items()
+        if (value := _commission(record.commissionReport, exec_id)) is not None
+    }
+    waited = 0.0
+    while True:
+        pending = set(executions) - set(commissions)
+        if pending:
+            commissions.update(_store_commissions(client, pending))
+            pending = set(executions) - set(commissions)
+        if not pending or waited >= report_wait_s:
+            break
+        client.sleep(poll_s)
+        waited += poll_s
+
+    fills: list[Fill] = []
+    for exec_id, record in executions.items():
+        execution = record.execution
+        commission = commissions.get(exec_id)
+        if commission is None:
             raise MissingCommissionReportError(
-                f"{record.contract.symbol!r} fill at {execution.time} has no commission report; "
-                "a fill cannot be costed without one"
+                f"{record.contract.symbol!r} fill {exec_id!r} at {execution.time} has no "
+                f"commission report of its own after {waited:g}s; a fill cannot be costed "
+                "without one"
             )
+        sign = _SIDE_SIGN[execution.side]
         notional = float(execution.shares) * float(execution.avgPrice)
-        commission = float(report.commission)
         fills.append(
             Fill(
                 ticker=record.contract.symbol,

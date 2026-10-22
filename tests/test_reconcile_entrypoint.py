@@ -9,9 +9,10 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
-from ib_fakes import broker_fill
+from ib_fakes import as_requested, broker_fill
 
 from crucible_trader.reconcile_entrypoint import (
+    COMMISSION_REPORT_WAIT_S,
     MissingCommissionReportError,
     UnrecognizedFillSideError,
     fills_from_ib,
@@ -26,16 +27,30 @@ OTHER_DAY = dt.datetime(2026, 9, 10, 15, 0, tzinfo=dt.UTC)
 
 
 class _Client:
-    def __init__(self, records):
-        self._records = records
+    """`reqExecutions()` answers as `ib_async` 2.1.0 does after its startup
+    sync (fresh records, unattached default reports); `fills()` is the
+    session store, whose reports the SDK attaches. ``late`` reports land in
+    the store only once the session's event loop runs (`sleep`)."""
+
+    def __init__(self, records, *, late=(), answer=as_requested):
+        self._store = list(records)
+        self._answer = [answer(r) for r in records]
+        self._late = list(late)
+        self.slept = 0.0
 
     def reqExecutions(self):  # noqa: N802 - SDK spelling
-        return list(self._records)
+        return list(self._answer)
 
     def fills(self):
-        raise AssertionError(
-            "fills() is the session's own startup cache; the reconcile asks the gateway afresh"
-        )
+        return list(self._store)
+
+    def sleep(self, seconds):
+        self.slept += seconds
+        for record in self._late:
+            for i, held in enumerate(self._store):
+                if held.execution.execId == record.execution.execId:
+                    self._store[i] = record
+        self._late = []
 
 
 class TestFillsFromIb:
@@ -106,6 +121,67 @@ class TestFillsFromIb:
         )
         with pytest.raises(MissingCommissionReportError, match="AAA"):
             fills_from_ib(client, DAY)
+
+
+class TestCommissionComesFromTheExecutionsOwnReport:
+    """alpha-engine-config-I12376, the 2026-10-21 reconcile: one v1 fill
+    (DUOL BOT 39 @ 142.44, commission 1.00) and a `cash_delta` of exactly
+    -1.00. `ib_async` 2.1.0 answers an explicit `reqExecutions()` with new
+    `Fill`s whose `CommissionReport()` is the SDK default (`commission=0.0`,
+    not None), so every fill was costed at zero without a word."""
+
+    def test_the_2026_10_21_duol_fill_is_costed_with_its_commission(self):
+        duol = broker_fill("DUOL", side="BOT", shares=39, avg_price=142.44, commission=1.0, time=T)
+        (fill,) = fills_from_ib(_Client([duol]), DAY)
+        assert fill == Fill(ticker="DUOL", shares=39, cash_usd=pytest.approx(-5_556.16))
+
+    def test_a_default_report_is_never_read_as_a_zero_commission(self):
+        unattached = as_requested(
+            broker_fill("AAA", side="BOT", shares=1, avg_price=1.0, commission=None, time=T)
+        )
+        client = _Client([unattached], answer=as_requested)
+        with pytest.raises(MissingCommissionReportError, match="AAA"):
+            fills_from_ib(client, DAY)
+
+    def test_a_report_still_in_flight_is_waited_for(self):
+        pending = broker_fill("AAA", side="SLD", shares=10, avg_price=20.0, commission=None, time=T)
+        landed = broker_fill("AAA", side="SLD", shares=10, avg_price=20.0, commission=1.0, time=T)
+        client = _Client([pending], late=[landed])
+        (fill,) = fills_from_ib(client, DAY)
+        assert fill == Fill(ticker="AAA", shares=-10, cash_usd=199.0)
+        assert 0 < client.slept < COMMISSION_REPORT_WAIT_S
+
+    def test_the_wait_for_a_report_is_bounded(self):
+        never = broker_fill("AAA", side="BOT", shares=1, avg_price=1.0, commission=None, time=T)
+        client = _Client([never])
+        with pytest.raises(MissingCommissionReportError, match="no commission report"):
+            fills_from_ib(client, DAY, report_wait_s=2.0, poll_s=0.5)
+        assert client.slept == 2.0
+
+    def test_a_report_for_another_execution_is_not_this_ones(self):
+        record = broker_fill("AAA", side="BOT", shares=1, avg_price=1.0, commission=5.0, time=T)
+        record.commissionReport.execId = "someone-else"
+        with pytest.raises(MissingCommissionReportError, match="AAA"):
+            fills_from_ib(_Client([record]), DAY, report_wait_s=0.0)
+
+    @pytest.mark.parametrize("value", [None, float("nan"), float("inf"), 1.7976931348623157e308])
+    def test_an_attached_report_without_a_number_is_no_commission(self, value):
+        record = broker_fill("AAA", side="BOT", shares=1, avg_price=1.0, commission=1.0, time=T)
+        record.commissionReport.commission = value
+        with pytest.raises(MissingCommissionReportError, match="AAA"):
+            fills_from_ib(_Client([record]), DAY, report_wait_s=0.0)
+
+    def test_the_answers_own_attached_report_is_used(self):
+        record = broker_fill("AAA", side="BOT", shares=2, avg_price=10.0, commission=1.0, time=T)
+        client = _Client([record], answer=lambda r: r)
+        assert fills_from_ib(client, DAY) == (Fill(ticker="AAA", shares=2, cash_usd=-21.0),)
+        assert client.slept == 0.0
+
+    def test_an_execution_answered_twice_is_one_fill(self):
+        record = broker_fill("AAA", side="BOT", shares=2, avg_price=10.0, commission=1.0, time=T)
+        client = _Client([record])
+        client._answer = client._answer * 2
+        assert fills_from_ib(client, DAY) == (Fill(ticker="AAA", shares=2, cash_usd=-21.0),)
 
 
 def test_live_corporate_actions_resolves_nothing_by_design():
