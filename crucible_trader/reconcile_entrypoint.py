@@ -57,7 +57,13 @@ real; the third is a stated, fail-loud gap, not a fabrication:**
   shows up as an unexplained `cash_delta` finding for the same reason: an
   undeclared movement is a discrepancy by design, not a hole.
 
-  Tracked follow-up for a real source: `alpha-engine-config-I11076`.
+  **Corporate actions now have a source** (`alpha-engine-config-I11076`, option
+  A, Brian's 2026-10-22 ruling: Polygon for corporate actions, IB for holdings
+  and cash). :func:`live_corporate_action_source` reads nousergon-data's daily
+  Polygon scan (:mod:`crucible_trader.corporate_action_feed`). When that scan is
+  absent, unreadable or not configured, it falls back to exactly the state
+  :func:`live_corporate_actions` describes, so the fail-loud default holds.
+  ``cash_flows`` (interest, fees) still has no source.
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ from typing import Any, Protocol
 
 from crucible_trader.broker_session import ReadOnlyBroker
 from crucible_trader.broker_statement import IbPaperStatementSource, StatementSourceProtocol
+from crucible_trader.corporate_action_feed import scan_provider, scans_uri_from_env
 from crucible_trader.reconciliation import CorporateActionSet, Fill
 
 #: IB execution sides this module knows how to sign. Anything else is a
@@ -237,3 +244,10 @@ def live_corporate_actions() -> CorporateActionSet:
     Empty ``resolved`` is the reconciler's own documented "cannot positively
     say nothing happened" state, not a stand-in for a real feed."""
     return CorporateActionSet(resolved=frozenset())
+
+
+def live_corporate_action_source(env: Any = None) -> Any:
+    """The live corporate-action provider: the daily Polygon scan named by
+    ``CRUCIBLE_TRADER_CORPORATE_ACTION_SCANS_URI``. Unset, missing or unreadable
+    resolves nothing, the same state as :func:`live_corporate_actions`."""
+    return scan_provider(scans_uri_from_env(env))

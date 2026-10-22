@@ -68,6 +68,12 @@ METRIC_MODULE = "crucible_trader.reconciliation"
 BROKER_STATEMENT_PREFIX = trader_broker_statement_key("2000-01-03").rsplit("/", 1)[0] + "/"
 
 
+#: A corporate-action source that needs to know what it is resolving: called
+#: with the run context, the trading day and the instruments the reconcile will
+#: look at (anchor, broker and fills), after the statements are read.
+CorporateActionProvider = Callable[[RunContext, str, frozenset[str]], CorporateActionSet]
+
+
 class ReconciliationDiscrepancyError(RuntimeError):
     """The broker disagrees with the expected book. A page, by manifest status."""
 
@@ -107,11 +113,15 @@ def reconcile_cycle(
     source: StatementSourceProtocol,
     fills: Sequence[Fill],
     cash_flows: Sequence[CashFlow],
-    corporate_actions: CorporateActionSet,
+    corporate_actions: CorporateActionSet | CorporateActionProvider,
     genesis: bool = False,
     reconciler: Reconciler = reconcile,
 ) -> ReconciliationResult:
-    """The job body. See the module docstring for the order and the raises."""
+    """The job body. See the module docstring for the order and the raises.
+
+    ``corporate_actions`` is either the day's set, or a
+    :data:`CorporateActionProvider` asked for it once the statements are read.
+    """
     day = ctx.trading_day.isoformat()
     broker = source.read_statement(day)
     anchor_entry = latest_anchor(ctx.store, day)
@@ -119,6 +129,13 @@ def reconcile_cycle(
     if anchor_entry is not None:
         anchor_key, anchor_payload, anchor = anchor_entry
         ctx.record_input(anchor_key, anchor_payload, BROKER_STATEMENT_SCHEMA_VERSION)
+    if not isinstance(corporate_actions, CorporateActionSet):
+        universe = (
+            frozenset(broker.positions)
+            | frozenset(anchor.positions if anchor is not None else ())
+            | frozenset(f.ticker for f in fills)
+        )
+        corporate_actions = corporate_actions(ctx, day, universe)
 
     inputs = ReconciliationInputs(
         trading_day=day,
