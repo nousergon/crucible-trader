@@ -97,6 +97,13 @@ def read_scan(base_uri: str, day: str, *, s3_client: Any = None) -> ScanRead:
 
         s3_client = boto3.client("s3")
     try:
+        # LIST the exact key first: under a prefix-conditioned list grant a GET
+        # on an absent key is a 403, which would read as a permission fault.
+        listing = s3_client.list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
+        if not any(o.get("Key") == key for o in listing.get("Contents", ())):
+            reason = f"corporate-action scan {uri} does not exist"
+            logger.warning("%s; every instrument stays unresolved", reason)
+            return ScanRead(uri, None, None, reason)
         payload = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
     except Exception as exc:  # noqa: BLE001 - every read failure is "unknown", reported
         code = getattr(exc, "response", {}).get("Error", {}).get("Code", type(exc).__name__)

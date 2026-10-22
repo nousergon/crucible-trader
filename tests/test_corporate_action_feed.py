@@ -75,6 +75,14 @@ class FakeS3:
     def __init__(self, objects):
         self.objects = objects
 
+    def list_objects_v2(self, *, Bucket, Prefix, MaxKeys):
+        if self.objects == "denied":
+            err = Exception("AccessDenied")
+            err.response = {"Error": {"Code": "AccessDenied"}}
+            raise err
+        keys = [k for b, k in self.objects if b == Bucket and k.startswith(Prefix)]
+        return {"Contents": [{"Key": k} for k in keys[:MaxKeys]]}
+
     def get_object(self, *, Bucket, Key):
         try:
             body = self.objects[(Bucket, Key)]
@@ -170,7 +178,12 @@ def test_a_scan_that_is_not_trustworthy_raises(doc):
 
 def test_a_missing_scan_is_unknown_not_empty():
     read = read_scan(BASE, DAY.isoformat(), s3_client=FakeS3({}))
-    assert read.document is None and "NoSuchKey" in read.reason
+    assert read.document is None and "does not exist" in read.reason
+
+
+def test_an_unreadable_scan_is_unknown_and_names_the_error():
+    read = read_scan(BASE, DAY_ISO, s3_client=FakeS3("denied"))
+    assert read.document is None and "AccessDenied" in read.reason
 
 
 def test_the_env_var_is_required_and_has_no_default():
