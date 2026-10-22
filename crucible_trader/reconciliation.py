@@ -103,7 +103,11 @@ class CorporateAction:
     """A same-day action on one instrument.
 
     ``split``: ``ratio`` is new shares per old (2.0 for 2-for-1, 0.1 for 1-for-10).
-    ``cash_dividend``: ``amount_per_share`` in USD, paid on the anchored holding.
+    ``cash_dividend``: ``amount_per_share`` in USD, paid on ``entitled_shares``:
+    the holding at the record date, which is what the broker pays on. ``None``
+    falls back to the anchored holding, which is only right when the record
+    date is the anchor's day. A dividend can be paid on an instrument no longer
+    held, so its cash counts whether or not the ticker is in today's book.
     Any other ``kind`` is carried so it can be REFUSED as a finding.
     """
 
@@ -111,6 +115,7 @@ class CorporateAction:
     kind: str
     ratio: float | None = None
     amount_per_share: float | None = None
+    entitled_shares: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -393,13 +398,18 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
             )
         )
 
+    paid_on = sorted(
+        set(universe)
+        | {a.ticker for a in inputs.corporate_actions.actions if a.kind == "cash_dividend"}
+    )
     dividends = {
         ticker: sum(
-            (a.amount_per_share or 0.0) * anchor.get(ticker, 0)
+            (a.amount_per_share or 0.0)
+            * (a.entitled_shares if a.entitled_shares is not None else anchor.get(ticker, 0))
             for a in actions.get(ticker, ())
             if a.kind == "cash_dividend"
         )
-        for ticker in universe
+        for ticker in paid_on
     }
     expected_cash = (
         inputs.anchor.cash_usd

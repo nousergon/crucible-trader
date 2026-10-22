@@ -65,7 +65,7 @@ from crucible_trader.kill_switch import (
 from crucible_trader.paper_smoke import open_configured_store
 from crucible_trader.reconcile_entrypoint import (
     fills_from_ib,
-    live_corporate_actions,
+    live_corporate_action_source,
     live_statement_source,
 )
 from crucible_trader.reconciliation_job import RECONCILE_JOB, reconcile_cycle
@@ -215,7 +215,7 @@ def main(
                 source=live_statement_source(client),
                 fills=fills_from_ib(client, ctx.trading_day.isoformat()),
                 cash_flows=(),
-                corporate_actions=live_corporate_actions(),
+                corporate_actions=live_corporate_action_source(),
                 genesis=args.genesis,
             )
         if address is None:
