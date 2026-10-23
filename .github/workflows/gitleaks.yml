@@ -1,0 +1,25 @@
+# Weekly full-history secret scan (alpha-engine-config-I3005).
+#
+# GitHub's native secret scanning matches its known provider-token formats on
+# push only. It does not catch internal-shaped secrets, and it cannot see
+# history committed before push protection existed. This caller runs the
+# fleet's shared, checksum-pinned gitleaks scan over the whole history: on
+# every push to main and weekly. A clean local run of the same gitleaks
+# version (8.30.1) over this repo's full history found 0 leaks on 2026-10-23,
+# so this starts green. No baseline file is needed.
+name: Gitleaks scan
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * MON"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gitleaks:
+    uses: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml@51206172feb68a6b6908197e2d4348568b8af061 # main 2026-10-22
