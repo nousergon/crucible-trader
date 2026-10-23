@@ -46,12 +46,10 @@ import json
 import logging
 import os
 from collections.abc import Callable, Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from crucible_trader.reconciliation import CorporateAction, CorporateActionSet
-
-if TYPE_CHECKING:
-    from crucible_trader.reconciliation_job import CorporateActionProvider
+from crucible_trader.reconciliation_job import CorporateActionProvider
 
 logger = logging.getLogger(__name__)
 
