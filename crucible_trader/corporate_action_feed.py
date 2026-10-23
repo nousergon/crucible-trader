@@ -49,6 +49,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from crucible_trader.reconciliation import CorporateAction, CorporateActionSet
+from crucible_trader.reconciliation_job import CorporateActionProvider
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,7 @@ def stored_holdings(store: Any) -> Callable[[str], Mapping[str, int] | None]:
     return holdings_on
 
 
-def scan_provider(base_uri: str | None, *, s3_client: Any = None):
+def scan_provider(base_uri: str | None, *, s3_client: Any = None) -> CorporateActionProvider:
     """The live :data:`~crucible_trader.reconciliation_job.CorporateActionProvider`.
 
     ``base_uri`` ``None`` (the env var is not set) resolves nothing, which is
