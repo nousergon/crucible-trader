@@ -87,6 +87,10 @@ jobs:
         run: |
           set -euo pipefail
           uv run --frozen basedpyright
+          if ! git diff --quiet -- .basedpyright/baseline.json; then
+            echo "::warning::type errors were fixed but .basedpyright/baseline.json was not shrunk; run basedpyright locally and commit the smaller baseline."
+            git checkout -- .basedpyright/baseline.json
+          fi
           if [ -n "${BASE_REF}" ] && git fetch --quiet --depth=1 origin "${BASE_REF}" \
              && git cat-file -e "FETCH_HEAD:.basedpyright/baseline.json" 2>/dev/null; then
             git show "FETCH_HEAD:.basedpyright/baseline.json" > /tmp/baseline-base.json
