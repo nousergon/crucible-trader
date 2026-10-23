@@ -27,6 +27,7 @@ from crucible_trader.kill_switch import (
     TradingHaltedError,
     halt_document,
 )
+from crucible_trader.order_intent import order_intent_key, read_order_intent
 from crucible_trader.order_router import (
     ORDER_REF_PREFIX,
     PAPER_GATEWAY_PORT,
@@ -44,6 +45,7 @@ from crucible_trader.order_router import (
     RoutingDisabledError,
     RoutingRefusedError,
     ShadowRouter,
+    UnknownOrderStateError,
     build_router,
     open_paper_router,
     order_key,
@@ -662,3 +664,90 @@ def test_an_execution_record_names_its_order_and_fill() -> None:
     document = record.to_document()
     assert document["order_ref"] == order.order_ref and document["broker_status"] == "Filled"
     assert document["shortfall_bps"] == pytest.approx(100.0)
+
+
+# -- durable order intent (alpha-engine-config-I12558) -------------------------------
+
+
+def test_the_intent_is_durable_before_the_order_reaches_the_broker(store) -> None:
+    ib = RoutingIB()
+    seen: list[dict | None] = []
+    ib.on_place = lambda: seen.append(read_order_intent(store, DAY, "AAA"))
+    _route(_router(store, ib), _book({"AAA": 0.1}))
+    (intent,) = seen  # read at the moment placeOrder ran
+    assert intent is not None and intent["order_ref"] == ib.order_calls[0][1].orderRef
+    assert intent["order_key"] == order_key(DAY, "AAA") and intent["account"] == ACCOUNT
+    assert intent["side"] == "buy" and intent["quantity"] == 100
+
+
+class _RefusingStore(LocalStore):
+    def compare_and_swap(self, key, expected, payload):
+        raise RuntimeError("store unavailable")
+
+
+def test_an_intent_that_cannot_be_written_sends_nothing(tmp_path) -> None:
+    store = _RefusingStore(tmp_path)
+    ib = RoutingIB()
+    router = _router(store, ib)
+    (batch,) = router.batches(_book({"AAA": 0.1}))
+    with pytest.raises(RuntimeError, match="store unavailable"):
+        router.send(batch)
+    assert ib.order_calls == []
+
+
+def test_an_unqualifiable_name_writes_no_intent(store) -> None:
+    ib = RoutingIB()
+    router = _router(store, ib, quote=lambda symbol: 100.0)
+    (batch,) = router.batches(_book({"AAA": 0.1}))
+    ib.unqualified.add("AAA")
+    with pytest.raises(RoutingRefusedError, match="qualify AAA"):
+        router.send(batch)
+    assert read_order_intent(store, DAY, "AAA") is None
+
+
+def test_a_submit_whose_response_was_lost_is_never_re_sent(store) -> None:
+    """The first session claims AAA's intent, then the socket drops inside
+    placeOrder. The broker never shows the order. The retry must NOT send AAA
+    again; it sends the rest of the batch and stops loud."""
+    first = RoutingIB()
+
+    def dropped(contract, order):
+        raise ConnectionError("socket closed during placeOrder")
+
+    first.placeOrder = dropped
+    router = _router(store, first)
+    (batch,) = router.batches(_book({"AAA": 0.1}))
+    with pytest.raises(ConnectionError):
+        router.send(batch)
+    assert read_order_intent(store, DAY, "AAA") is not None
+
+    retry_ib = RoutingIB()  # the broker knows nothing of AAA
+    retry = _router(store, retry_ib)
+    batches = list(retry.batches(_book({"AAA": 0.1, "BBB": 0.1})))
+    with pytest.raises(UnknownOrderStateError, match="NOT re-sent") as exc:
+        for b in batches:
+            retry.send(b)
+    assert [c.symbol for c, _ in retry_ib.order_calls] == ["BBB"]
+    assert [r.order.decision.symbol for r in retry.records] == ["BBB"]
+    (conflict,) = exc.value.unknown
+    assert conflict.key == order_intent_key(DAY, "AAA")
+
+
+def test_two_concurrent_sessions_submit_one_order(store) -> None:
+    """Two sessions on one store, before either order shows in the broker's lists."""
+    ib_a, ib_b = RoutingIB(), RoutingIB()
+    a, b = _router(store, ib_a), _router(store, ib_b)
+    (batch_a,) = a.batches(_book({"AAA": 0.1}))
+    (batch_b,) = b.batches(_book({"AAA": 0.1}))
+    a.send(batch_a)
+    with pytest.raises(UnknownOrderStateError):
+        b.send(batch_b)
+    assert len(ib_a.order_calls) + len(ib_b.order_calls) == 1
+
+
+def test_an_order_the_broker_knows_is_adopted_whatever_the_intent_says(store) -> None:
+    ib = RoutingIB(stall=True)  # still working, so the retry plans AAA again
+    _route(_router(store, ib, fill_timeout_s=1.0), _book({"AAA": 0.1}))
+    retry = _router(store, ib, fill_timeout_s=1.0)
+    _route(retry, _book({"AAA": 0.1}))
+    assert len(ib.order_calls) == 1 and retry.records[0].disposition == "adopted"

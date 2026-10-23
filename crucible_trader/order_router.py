@@ -43,6 +43,17 @@ orders, completed API orders, and executions). A key already present is ADOPTED
 double-submit, and the adopted order's original decision price is recovered from
 the broker's own record for the shortfall row.
 
+**A durable intent is written before every submit** (`alpha-engine-config-I12558`,
+:mod:`crucible_trader.order_intent`). Immediately before `placeOrder`, after the
+contract qualifies, the router creates ONE immutable intent document per (day,
+symbol) by conditional create. A failed write sends nothing. An intent that
+already exists for an order the broker does NOT know is an UNKNOWN outcome --
+the earlier submit may have reached IB -- so that order is never re-sent: the
+rest of the batch still goes, every order already at the broker is recorded,
+and the batch then raises :class:`UnknownOrderStateError` naming each unknown
+key, which stops the session loud. The broker's refs are still read first, so an
+order the broker knows is adopted exactly as before.
+
 **The broker plumbing is v1's, ported, not invented** (`crucible-executor`
 `executor/ibkr.py`): `Stock(symbol, "SMART", "USD")` qualified before use; a
 `MarketOrder` with `tif="DAY"`, `outsideRth=False`, `transmit=True` (the fields
@@ -81,6 +92,11 @@ from crucible_trader.execution_shortfall import (
     decide,
 )
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
+from crucible_trader.order_intent import (
+    OrderIntentConflictError,
+    claim_order_intent,
+    order_intent_document,
+)
 
 __all__ = [
     "ExecutionRecord",
@@ -88,6 +104,7 @@ __all__ = [
     "PlannedOrder",
     "RouterConfig",
     "ShadowRouter",
+    "UnknownOrderStateError",
     "build_router",
     "open_paper_router",
     "plan_orders",
@@ -156,6 +173,18 @@ class ForeignPositionError(RoutingRefusedError):
 
 class OrderRefError(RoutingRefusedError):
     """A broker order carries this router's key and a ref it cannot read."""
+
+
+class UnknownOrderStateError(RoutingRefusedError):
+    """An order whose intent exists but which the broker does not know. Never re-sent."""
+
+    def __init__(self, unknown: Sequence[OrderIntentConflictError]) -> None:
+        self.unknown = tuple(unknown)
+        super().__init__(
+            f"{len(self.unknown)} order(s) have a durable intent and no broker record, so "
+            "their outcome is unknown and they were NOT re-sent: "
+            + "; ".join(str(e) for e in self.unknown)
+        )
 
 
 def assert_paper(account: str | None, port: int) -> None:
@@ -524,6 +553,7 @@ class PaperOrderRouter:
     def send(self, batch: Sequence[Any]) -> None:
         known = self._known_refs()
         placed: list[tuple[PlannedOrder, Any, dt.datetime]] = []
+        unknown: list[OrderIntentConflictError] = []
         try:
             for order in batch:
                 # The kill switch, re-read before EVERY order.
@@ -532,7 +562,13 @@ class PaperOrderRouter:
                     prior = parse_order_ref(known[order.key])
                     self._records.append(self._record(prior, "adopted", "Adopted", None))
                     continue
-                placed.append((order, self._place(order), self._clock()))
+                try:
+                    trade = self._place(order)
+                except OrderIntentConflictError as conflict:
+                    # Intent exists, broker does not know the order: unknown, never re-sent.
+                    unknown.append(conflict)
+                    continue
+                placed.append((order, trade, self._clock()))
         except BaseException:
             # Whatever stopped the batch, the orders already at the broker are recorded.
             self._record_placed(placed)
@@ -544,11 +580,33 @@ class PaperOrderRouter:
             self._client.sleep(POLL_INTERVAL_S)
             waited += POLL_INTERVAL_S
         self._record_placed(placed)
+        if unknown:
+            raise UnknownOrderStateError(unknown)
+
+    def _claim_intent(self, order: PlannedOrder) -> None:
+        """The durable intent, written before the submit. Raises; never sends past it."""
+        d = order.decision
+        claim_order_intent(
+            self._store,
+            order_intent_document(
+                order_key=order.key,
+                order_ref=order.order_ref,
+                trading_day=order.trading_day,
+                symbol=d.symbol,
+                side=d.side,
+                quantity=int(d.quantity),
+                decision_price=float(d.decision_price),
+                account=self._config.account,  # type: ignore[arg-type]
+                intended_at=self._clock(),
+            ),
+        )
 
     def _place(self, order: PlannedOrder) -> Any:
         contract = self._sdk.Stock(order.decision.symbol, "SMART", "USD")
         if not _qualified(self._client, contract):
             raise RoutingRefusedError(f"IB could not qualify {order.decision.symbol}")
+        # The last step before the broker: nothing below runs unless the intent is durable.
+        self._claim_intent(order)
         ib_order = self._sdk.MarketOrder(order.action, int(order.decision.quantity))
         ib_order.orderRef = order.order_ref
         ib_order.account = self._config.account
