@@ -72,6 +72,7 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "ruff>=0.16.6",
+    "basedpyright>=1.40",
 ]
 
 [build-system]
@@ -93,7 +94,16 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# ANN: every function in production code carries full annotations (fleet strict-typing
+# rollout, 2026-10-23). ANN401 (`Any` in a signature) is left to basedpyright's
+# `reportExplicitAny` below, which covers every `Any`, not only signatures, and is
+# baselined rather than all-or-nothing.
+select = ["E", "F", "I", "UP", "B", "ANN"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are type-checked by nothing yet; annotating fixtures is a later ratchet.
+"tests/**" = ["ANN"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -122,3 +132,25 @@ show_missing = true
 # EXECUTING code by an author. A regex over source text cannot know whether a
 # block runs. So the denominator is every statement in `crucible_trader/`.
 exclude_lines = []
+
+[tool.basedpyright]
+# Strict typing gate (fleet strict-typing rollout, 2026-10-23). CI runs this in
+# the `lint + tests` job and it is BLOCKING.
+#
+# `.basedpyright/baseline.json` records the errors that existed when the gate was
+# switched on. basedpyright ignores exactly those and fails on any NEW error, so
+# every new or changed line is held to strict from day one. The baseline shrinks
+# by itself as old errors are fixed; CI refuses a PR that grows any rule's count.
+# Never regenerate it (`--writebaseline`) to get a PR green: fix the code, or
+# suppress one line with `# pyright: ignore[<rule>]` and say why.
+include = ["crucible_trader", "scripts"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+# Strict mode does not flag an explicit `Any`; this does. A needed `Any` (an
+# untyped SDK object, raw JSON) gets a line-level ignore with a reason.
+reportExplicitAny = "error"
+# A bare `# type: ignore` silences every rule on the line; only rule-scoped
+# `# pyright: ignore[rule]` comments are honoured.
+enableTypeIgnoreComments = false
+reportIgnoreCommentWithoutRule = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
