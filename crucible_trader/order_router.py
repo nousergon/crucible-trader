@@ -596,7 +596,7 @@ class PaperOrderRouter:
                 side=d.side,
                 quantity=int(d.quantity),
                 decision_price=float(d.decision_price),
-                account=self._config.account,  # type: ignore[arg-type]
+                account=self._config.account,  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
                 intended_at=self._clock(),
             ),
         )

@@ -36,7 +36,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from crucible.store import ETAG_ABSENT, PointerConflictError, Store
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs; same import is baselined in every other module
 
 __all__ = [
     "ORDER_INTENTS_PREFIX",
@@ -77,7 +77,7 @@ class OrderIntentError(RuntimeError):
 class OrderIntentConflictError(OrderIntentError):
     """The intent for this (day, symbol) already exists: the order is unknown."""
 
-    def __init__(self, key: str, existing: Mapping[str, Any] | None) -> None:
+    def __init__(self, key: str, existing: Mapping[str, Any] | None) -> None:  # pyright: ignore[reportExplicitAny]  # raw JSON document
         self.key = key
         self.existing = dict(existing) if existing is not None else None
         prior = (existing or {}).get("order_ref", "<unreadable>")
@@ -109,7 +109,7 @@ def order_intent_document(
     decision_price: float,
     account: str,
     intended_at: dt.datetime,
-) -> dict[str, Any]:
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     """The immutable record of one order about to be submitted."""
     if side not in ("buy", "sell"):
         raise OrderIntentError(f"side {side!r} is not buy or sell")
@@ -129,7 +129,7 @@ def order_intent_document(
     }
 
 
-def _parse(key: str, payload: bytes) -> dict[str, Any]:
+def _parse(key: str, payload: bytes) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     try:
         document = json.loads(payload)
     except ValueError as exc:
@@ -140,10 +140,10 @@ def _parse(key: str, payload: bytes) -> dict[str, Any]:
         raise OrderIntentError(
             f"{key!r} is schema {document['schema_version']!r}, not {ORDER_INTENT_SCHEMA_VERSION}"
         )
-    return document
+    return document  # pyright: ignore[reportUnknownVariableType]  # json.loads output, checked against _REQUIRED above
 
 
-def read_order_intent(store: Store, trading_day: str, symbol: str) -> dict[str, Any] | None:
+def read_order_intent(store: Store, trading_day: str, symbol: str) -> dict[str, Any] | None:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     """The intent for (day, symbol), or ``None`` when none was ever written."""
     key = order_intent_key(trading_day, symbol)
     if not store.exists(key):
@@ -151,7 +151,7 @@ def read_order_intent(store: Store, trading_day: str, symbol: str) -> dict[str, 
     return _parse(key, store.get_bytes(key))
 
 
-def claim_order_intent(store: Store, document: Mapping[str, Any]) -> str:
+def claim_order_intent(store: Store, document: Mapping[str, Any]) -> str:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     """Create the intent, or raise. Returns the store's version token.
 
     The conditional create IS the guard; there is no read-then-write window.
@@ -165,7 +165,7 @@ def claim_order_intent(store: Store, document: Mapping[str, Any]) -> str:
         return store.compare_and_swap(key, ETAG_ABSENT, payload)
     except PointerConflictError:
         try:
-            existing: dict[str, Any] | None = _parse(key, store.get_bytes(key))
+            existing: dict[str, Any] | None = _parse(key, store.get_bytes(key))  # pyright: ignore[reportExplicitAny]  # raw JSON document
         except (KeyError, OrderIntentError):
             existing = None
         raise OrderIntentConflictError(key, existing) from None

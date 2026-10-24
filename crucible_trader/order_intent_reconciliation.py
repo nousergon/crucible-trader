@@ -36,7 +36,7 @@ import datetime as dt
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from crucible.store import Store
+from crucible.store import Store  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs; same import is baselined in every other module
 
 from crucible_trader.order_intent import (
     ORDER_INTENTS_PREFIX,
@@ -85,12 +85,12 @@ class BrokerExecution:
     shares: float
 
 
-def _status(trade: Any) -> str:
+def _status(trade: Any) -> str:  # pyright: ignore[reportExplicitAny]  # untyped IB SDK object
     return str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
 
 
 def broker_records_from_client(
-    client: Any,
+    client: Any,  # pyright: ignore[reportExplicitAny]  # untyped IB SDK object
 ) -> tuple[list[BrokerOrder], list[BrokerExecution]]:
     """The broker's orders and executions, read from a connected session.
 
@@ -110,7 +110,7 @@ def broker_records_from_client(
     return orders, executions
 
 
-def intents_for_day(store: Store, trading_day: str) -> list[dict[str, Any]]:
+def intents_for_day(store: Store, trading_day: str) -> list[dict[str, Any]]:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     """Every intent written for ``trading_day``, sorted by symbol.
 
     An unreadable intent raises :class:`OrderIntentError`: a reconciliation
@@ -124,7 +124,7 @@ def intents_for_day(store: Store, trading_day: str) -> list[dict[str, Any]]:
         if "/" in name or not name.endswith(".json"):
             raise OrderIntentError(f"{key!r} is not an intent key under {prefix!r}")
         symbols.append(name[: -len(".json")])
-    intents: list[dict[str, Any]] = []
+    intents: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny]  # raw JSON document
     for symbol in sorted(symbols):
         intent = read_order_intent(store, trading_day, symbol)
         if intent is None:  # listed, then gone: never read as absent
@@ -138,7 +138,7 @@ def _key_of(ref: str) -> str:
 
 
 def _classify(
-    intent: Mapping[str, Any],
+    intent: Mapping[str, Any],  # pyright: ignore[reportExplicitAny]  # raw JSON document
     orders: Sequence[BrokerOrder],
     filled: float,
 ) -> str:
@@ -157,12 +157,12 @@ def _classify(
 def reconcile_order_intents(
     *,
     trading_day: str,
-    intents: Iterable[Mapping[str, Any]],
+    intents: Iterable[Mapping[str, Any]],  # pyright: ignore[reportExplicitAny]  # raw JSON document
     orders: Iterable[BrokerOrder],
     executions: Iterable[BrokerExecution],
     key_prefix: str,
     now: dt.datetime,
-) -> dict[str, Any]:
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     """The ``order_intent_reconciliation.v1`` document for one trading day.
 
     ``key_prefix`` is the router's own ``orderRef`` prefix (``crucible-trader``);
@@ -181,7 +181,7 @@ def reconcile_order_intents(
             filled_by_key[key] = filled_by_key.get(key, 0.0) + e.shares
             exec_refs.setdefault(key, set()).add(e.order_ref)
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny]  # raw JSON document
     seen: set[str] = set()
     for intent in intents:
         key = str(intent["order_key"])
