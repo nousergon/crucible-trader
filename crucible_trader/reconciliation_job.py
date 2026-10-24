@@ -43,6 +43,7 @@ from crucible_trader.broker_statement import (
     BrokerStatement,
     StatementSourceProtocol,
     statement_from_document,
+    statement_schema_version,
 )
 from crucible_trader.reconciliation import (
     RECONCILIATION_SCHEMA_VERSION,
@@ -128,7 +129,7 @@ def reconcile_cycle(
     anchor = None
     if anchor_entry is not None:
         anchor_key, anchor_payload, anchor = anchor_entry
-        ctx.record_input(anchor_key, anchor_payload, BROKER_STATEMENT_SCHEMA_VERSION)
+        ctx.record_input(anchor_key, anchor_payload, statement_schema_version(anchor_payload))
     if not isinstance(corporate_actions, CorporateActionSet):
         universe = (
             frozenset(broker.positions)
