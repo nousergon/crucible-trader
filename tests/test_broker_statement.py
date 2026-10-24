@@ -98,3 +98,82 @@ class TestIbPaperReader:
     def test_refusals(self, ib, match):
         with pytest.raises(BrokerStatementError, match=match):
             IbPaperStatementSource(ib).read_statement(DAY)
+
+
+class TestAccruedCash:
+    """`alpha-engine-config-I11076` phase 0: the accrual is recorded, softly."""
+
+    def test_v2_round_trip_carries_the_accrual(self):
+        s = BrokerStatement("DU1", DAY, {"AAA": 1}, 5.0, accrued_cash_usd=12.34)
+        doc = s.to_document()
+        assert doc["schema_version"] == "broker_statement.v2"
+        assert doc["accrued_cash_usd"] == 12.34
+        assert statement_from_document(doc) == s
+
+    def test_a_v1_statement_still_reads_as_accrual_not_recorded(self):
+        v1 = {
+            "schema_version": "broker_statement.v1",
+            "account": "DU1",
+            "trading_day": DAY,
+            "source": "ib_paper",
+            "positions": {"AAA": 1},
+            "cash_usd": 5.0,
+        }
+        s = statement_from_document(v1)
+        assert s.accrued_cash_usd is None
+        assert s.positions == {"AAA": 1}
+
+    def test_each_version_has_an_exact_field_set(self):
+        v2 = BrokerStatement("DU1", DAY, {}, 0.0).to_document()
+        with pytest.raises(BrokerStatementError, match="fields"):
+            statement_from_document({**v2, "schema_version": "broker_statement.v1"})
+        missing = {k: v for k, v in v2.items() if k != "accrued_cash_usd"}
+        with pytest.raises(BrokerStatementError, match="fields"):
+            statement_from_document(missing)
+
+    def test_a_non_finite_accrual_cannot_be_constructed(self):
+        with pytest.raises(BrokerStatementError, match="accrued_cash_usd"):
+            BrokerStatement("DU1", DAY, {}, 0.0, accrued_cash_usd=float("inf"))
+
+    def test_the_reader_records_the_one_usd_accrued_cash_row(self):
+        ib = FakeIB(
+            summary=(
+                cash(1000.5),
+                cash(7.25, tag="AccruedCash"),
+                cash(9.0, tag="AccruedCash", currency="BASE"),
+                cash(3.0, tag="AccruedCash", account="DU2"),
+            )
+        )
+        assert IbPaperStatementSource(ib).read_statement(DAY).accrued_cash_usd == 7.25
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            (),
+            (cash(1.0, tag="AccruedCash"), cash(2.0, tag="AccruedCash")),
+            (cash("", tag="AccruedCash"),),
+            (cash("nan", tag="AccruedCash"),),
+        ],
+        ids=["absent", "duplicated", "unparsable", "non-finite"],
+    )
+    def test_an_unreadable_accrual_is_none_and_never_stops_the_read(self, rows):
+        """This reader also serves the kill switch and the order router."""
+        ib = FakeIB(summary=(cash(1000.5), *rows))
+        s = IbPaperStatementSource(ib).read_statement(DAY)
+        assert s.accrued_cash_usd is None
+        assert s.cash_usd == 1000.5
+
+    def test_settled_cash_is_still_strict(self):
+        ib = FakeIB(summary=(cash(7.25, tag="AccruedCash"),))
+        with pytest.raises(BrokerStatementError, match="TotalCashValue"):
+            IbPaperStatementSource(ib).read_statement(DAY)
+
+    def test_lineage_records_the_version_the_stored_bytes_declare(self):
+        import json
+
+        from crucible_trader.broker_statement import statement_schema_version
+
+        v1 = json.dumps({"schema_version": "broker_statement.v1"}).encode()
+        assert statement_schema_version(v1) == "broker_statement.v1"
+        with pytest.raises(BrokerStatementError):
+            statement_schema_version(json.dumps({"schema_version": "x"}).encode())
