@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 0,
+    "account_files": 0,
+    "bucket_hits": 0,
+    "bucket_files": 0,
+    "files": 0
+  },
+  "files": {}
+}
