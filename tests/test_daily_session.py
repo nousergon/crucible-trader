@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 from types import SimpleNamespace
@@ -25,7 +26,9 @@ from crucible.store import LocalStore
 from ib_fakes import FakeIB, FakeSdk, ctx_for, environ_for
 from test_contract import ARM, _feed, _put
 from test_contract import _serveable as _contract_holds
+from test_order_router import _book as order_book
 from test_session import SHA, VERSION, _halt, _pin_document
+from test_simulated_broker import write_panel
 
 from crucible_trader import daily_session as module
 from crucible_trader.broker_session import OrderRefusedError
@@ -36,10 +39,22 @@ from crucible_trader.daily_session import (
     daily_session_cycle,
     main,
     run_daily_session,
+    run_staging_session,
 )
 from crucible_trader.execution_shortfall import build_no_orders_document
 from crucible_trader.kill_switch import TradingHaltedError
-from crucible_trader.order_router import RouterConfig, ShadowRouter, build_router
+from crucible_trader.order_router import (
+    RouterConfig,
+    ShadowRouter,
+    StagingRoutingRefusedError,
+    build_router,
+)
+from crucible_trader.simulated_broker import (
+    SIMULATED_FILLS_SCHEMA_VERSION,
+    SimulatedFillsRefusedError,
+    StagingSessionConfig,
+    simulated_fills_key,
+)
 
 DAY = dt.date(2026, 9, 11)
 #: Friday 2026-09-11, 10:15 ET: the session runs pre-close and binds to the
@@ -356,3 +371,220 @@ class TestTheEntryPoint:
         )
 
         assert said[-1].endswith("routed session filed")
+
+
+# -- staging (alpha-engine-config-I12507, S-19) --------------------------------------
+
+
+def _no_sdk():
+    pytest.fail("a staging session loaded the broker SDK")
+
+
+def _staging_env(store, **extra):
+    return environ_for(
+        store.root,
+        NE_ENV="staging",
+        CRUCIBLE_TRADER_SIMULATED_FILLS="on",
+        CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD="50000",
+        CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD="100000",
+        **extra,
+    )
+
+
+def _simulated_world(store, monkeypatch) -> None:
+    _serveable(store, trading_day=BOUND)
+    write_panel(store, day=BOUND)
+    book = dataclasses.replace(
+        order_book(day=BOUND),
+        metric={
+            "name": "portfolio_construction",
+            "module": "fixture",
+            "metric_type": "operational",
+            "value": 1.0,
+            "unit": "flag",
+            "n_floor": 1,
+            "status": "OK",
+            "status_reason": "fixture book",
+            "source_path": "fixture",
+            "last_updated_utc": "2026-09-11T14:15:00Z",
+        },
+    )
+    monkeypatch.setattr(module, "construct_target_book", lambda store_, **kw: book)
+
+
+class TestAStagingSession:
+    def test_it_writes_a_complete_run_and_fills_by_simulation_with_no_broker(
+        self, store, monkeypatch
+    ) -> None:
+        _simulated_world(store, monkeypatch)
+        said: list[str] = []
+
+        code = main(
+            [],
+            environ=_staging_env(store),
+            sdk_loader=_no_sdk,
+            version_reader=lambda: VERSION,
+            clock=lambda: NOW,
+            printer=said.append,
+            router_factory=lambda config, **kw: pytest.fail("the prod router was built"),
+        )
+
+        assert code == 0
+        assert said[-1].endswith("staging simulated session filed (no broker)")
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
+        outputs = {o["key"]: o["schema_version"] for o in manifest["outputs"]}
+        assert outputs[simulated_fills_key(BOUND)] == SIMULATED_FILLS_SCHEMA_VERSION
+        assert execution_shortfall_key(BOUND) in outputs
+        assert TRADER_EVIDENCE_KEY in outputs
+
+        evidence = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))
+        assert evidence["session_modes"] == {BOUND: "shadow"}
+        shortfall = json.loads(store.get_bytes(execution_shortfall_key(BOUND)))
+        assert shortfall["outcome"] == "no_orders"
+        assert "filled by simulation" in shortfall["outcome_reason"]
+        fills = json.loads(store.get_bytes(simulated_fills_key(BOUND)))
+        assert [(o["symbol"], o["filled_quantity"], o["fill_price"]) for o in fills["orders"]] == [
+            ("AAA", 300.0, 100.0),
+            ("BBB", 400.0, 50.0),
+        ]
+        assert fills["fill_source"] == "simulated_close"
+        (simulated,) = [
+            m for m in manifest["metrics"] if m["name"] == "trader_session_simulated_fills"
+        ]
+        assert simulated["value"] == 2.0
+        assert "no broker" in simulated["status_reason"]
+
+    def test_the_session_document_says_simulated(self, store, monkeypatch) -> None:
+        _simulated_world(store, monkeypatch)
+        captured: list[dict] = []
+        real = module.daily_session_cycle
+
+        def spy(ctx, **kw):
+            result = real(ctx, **kw)
+            captured.append(result)
+            return result
+
+        monkeypatch.setattr(module, "daily_session_cycle", spy)
+        config = StagingSessionConfig.from_env(_staging_env(store))
+        assert config is not None
+        run_staging_session(
+            store, config=config, installed_version=VERSION, clock=lambda: NOW, run_mode="live"
+        )
+
+        assert captured[0]["session_mode"] == "shadow"
+        # An all-cash simulated book has no sells: one batch, the buys.
+        assert captured[0]["batches_sent"] == 1
+
+    @pytest.mark.parametrize("value", ["ib_paper", "off"])
+    def test_staging_can_never_route(self, store, value) -> None:
+        with pytest.raises(StagingRoutingRefusedError):
+            main(
+                [],
+                environ=_staging_env(store, CRUCIBLE_TRADER_ORDER_ROUTING=value),
+                sdk_loader=_no_sdk,
+                version_reader=lambda: VERSION,
+                clock=lambda: NOW,
+                printer=lambda line: None,
+            )
+        assert not store.exists(manifest_key(SESSION_JOB, BOUND))
+
+    def test_prod_never_simulates(self, store) -> None:
+        env = _staging_env(store)
+        del env["NE_ENV"]
+        with pytest.raises(SimulatedFillsRefusedError):
+            main(
+                [],
+                environ=env,
+                sdk_loader=_no_sdk,
+                version_reader=lambda: VERSION,
+                clock=lambda: NOW,
+                printer=lambda line: None,
+            )
+        assert not store.exists(manifest_key(SESSION_JOB, BOUND))
+
+    def test_a_staging_session_without_simulated_fills_is_shadow_with_no_broker(
+        self, store, monkeypatch
+    ) -> None:
+        _serveable(store, trading_day=BOUND)
+        monkeypatch.setattr(module, "construct_target_book", _construct)
+        env = _staging_env(store)
+        del env["CRUCIBLE_TRADER_SIMULATED_FILLS"]
+        said: list[str] = []
+
+        main(
+            [],
+            environ=env,
+            sdk_loader=_no_sdk,
+            version_reader=lambda: VERSION,
+            clock=lambda: NOW,
+            printer=said.append,
+        )
+
+        assert said[-1].endswith("staging shadow session filed (no broker)")
+        assert json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))["session_modes"] == {
+            BOUND: "shadow"
+        }
+        assert not store.exists(simulated_fills_key(BOUND))
+
+    def test_a_held_staging_day_files_no_fills(self, store) -> None:
+        config = StagingSessionConfig.from_env(_staging_env(store))
+        assert config is not None
+        ctx = run_staging_session(
+            store, config=config, installed_version=VERSION, clock=lambda: NOW, run_mode="live"
+        )
+
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
+        assert ctx.metrics[-1]["value"] == 0.0
+        assert not store.exists(simulated_fills_key(BOUND))
+        assert not store.exists(TRADER_EVIDENCE_KEY)
+
+
+class TestTheProdPathIsUnchanged:
+    """With the flag off, the prod entry point writes byte-identical artifacts."""
+
+    @staticmethod
+    def _run(tmp_path, name, extra, monkeypatch):
+        s = LocalStore(tmp_path / name)
+        s.put_bytes(TRADER_PIN_KEY, json.dumps(_pin_document(SHA)).encode())
+        _serveable(s, trading_day=BOUND)
+        monkeypatch.setattr(module, "construct_target_book", _construct)
+        ib = FakeIB()
+        seen: list[RouterConfig] = []
+        said: list[str] = []
+
+        def factory(config, **kw):
+            seen.append(config)
+            return build_router(config, **kw)
+
+        main(
+            [],
+            environ=environ_for(s.root, **extra),
+            sdk_loader=FakeSdk(ib),
+            version_reader=lambda: VERSION,
+            clock=lambda: NOW,
+            printer=said.append,
+            router_factory=factory,
+        )
+        artifacts = {
+            key: s.get_bytes(key) for key in (TRADER_EVIDENCE_KEY, execution_shortfall_key(BOUND))
+        }
+        return seen, ib.connected_with, ib.order_calls, said[-1].split(": ")[-1], artifacts
+
+    def test_unset_off_and_prod_are_the_same_session(self, tmp_path, monkeypatch) -> None:
+        runs = [
+            self._run(tmp_path, name, extra, monkeypatch)
+            for name, extra in (
+                ("unset", {}),
+                ("off", {"CRUCIBLE_TRADER_SIMULATED_FILLS": "off"}),
+                ("prod", {"NE_ENV": "prod"}),
+            )
+        ]
+        baseline = runs[0]
+        assert baseline[0] == [RouterConfig(enabled=False)]
+        assert baseline[1]["readonly"] is True
+        assert baseline[2] == []
+        assert baseline[3] == "shadow session filed"
+        for run in runs[1:]:
+            assert run == baseline
