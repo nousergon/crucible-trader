@@ -104,8 +104,11 @@ __all__ = [
     "PlannedOrder",
     "RouterConfig",
     "ShadowRouter",
+    "StagingRoutingRefusedError",
     "UnknownOrderStateError",
+    "assert_staging_never_routes",
     "build_router",
+    "is_staging",
     "open_paper_router",
     "plan_orders",
 ]
@@ -114,6 +117,11 @@ __all__ = [
 ROUTING_VAR = "CRUCIBLE_TRADER_ORDER_ROUTING"
 ROUTING_ENABLED_VALUE = "ib_paper"
 ROUTING_DISABLED_VALUES: frozenset[str] = frozenset({"", "off"})
+
+#: The fleet's environment selector (`nousergon_lib.env.ENV_VAR`). Read here
+#: for ONE purpose: staging never routes (`alpha-engine-config-I12507`).
+ENVIRONMENT_VAR = "NE_ENV"
+STAGING_ENVIRONMENT = "staging"
 
 #: The paper account the router trades. Required when routing is on.
 ACCOUNT_VAR = "CRUCIBLE_TRADER_IB_ACCOUNT"
@@ -175,6 +183,10 @@ class OrderRefError(RoutingRefusedError):
     """A broker order carries this router's key and a ref it cannot read."""
 
 
+class StagingRoutingRefusedError(RoutingRefusedError):
+    """The routing switch is present in staging. Staging never routes."""
+
+
 class UnknownOrderStateError(RoutingRefusedError):
     """An order whose intent exists but which the broker does not know. Never re-sent."""
 
@@ -199,6 +211,27 @@ def assert_paper(account: str | None, port: int) -> None:
         raise NotPaperError(
             f"gateway port {port} is not the IB Gateway paper port {PAPER_GATEWAY_PORT}. The "
             "order router connects to the paper port only."
+        )
+
+
+def is_staging(source: Mapping[str, str]) -> bool:
+    """Whether :data:`ENVIRONMENT_VAR` names staging (case and whitespace ignored)."""
+    return (source.get(ENVIRONMENT_VAR) or "").strip().lower() == STAGING_ENVIRONMENT
+
+
+def assert_staging_never_routes(source: Mapping[str, str]) -> None:
+    """Refuse :data:`ROUTING_VAR` in staging, whatever its value, before anything opens.
+
+    Present at all is refused -- ``off`` and empty included -- because staging's
+    env declares the switch absent, and an env file that names it is one edit
+    from ``ib_paper``. Outside staging this returns without reading anything else.
+    """
+    if is_staging(source) and ROUTING_VAR in source:
+        raise StagingRoutingRefusedError(
+            f"{ROUTING_VAR}={source[ROUTING_VAR]!r} is set under "
+            f"{ENVIRONMENT_VAR}={STAGING_ENVIRONMENT}. Staging never routes: its orders are "
+            "simulated (crucible_trader.simulated_broker) and the IB paper account is shared "
+            "with the v1 executor, so a staging order would land on the v1 executor's book."
         )
 
 
@@ -238,6 +271,7 @@ class RouterConfig:
     def from_env(cls, env: Mapping[str, str] | None = None) -> RouterConfig:
         """Resolve from the environment. Unset :data:`ROUTING_VAR` is shadow."""
         source = os.environ if env is None else env
+        assert_staging_never_routes(source)
         switch = (source.get(ROUTING_VAR) or "").strip()
         if switch in ROUTING_DISABLED_VALUES:
             return cls(enabled=False)

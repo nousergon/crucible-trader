@@ -43,6 +43,15 @@ operator decision (I11545 ruling 3), not a deploy.
   after placing orders still files its shortfall document, so the orders that
   reached the broker are on the record, then fails.
 
+**In staging there is no broker at all** (`alpha-engine-config-I12507`, S-19).
+Under ``NE_ENV=staging`` :func:`main` runs :func:`run_staging_session`: no SDK
+is loaded and no gateway is connected; the plan is filled by simulation at the
+session close when ``CRUCIBLE_TRADER_SIMULATED_FILLS=on`` and is shadow
+otherwise (`crucible_trader.simulated_broker`). The routing switch present in
+staging, or simulated fills switched on outside it, raise before anything
+opens. Outside staging, with the flag unset or ``off``, the path below is the
+prod path unchanged.
+
 **The hold-book safeguard is handed a READ-ONLY broker**
 (:class:`ReadOnlyHoldControl`, over a `readonly` gateway session): a `hold`
 reads the statement and the accepted orders and changes nothing, and the two
@@ -82,11 +91,25 @@ from crucible_trader.contract import (
     record_session,
     resolve,
 )
-from crucible_trader.kill_switch import IbBrokerControl, assert_trading_permitted, utcnow
-from crucible_trader.order_router import RouterConfig, build_router
+from crucible_trader.kill_switch import (
+    BrokerControl,
+    IbBrokerControl,
+    assert_trading_permitted,
+    utcnow,
+)
+from crucible_trader.order_router import RouterConfig, ShadowRouter, build_router
 from crucible_trader.paper_smoke import installed_crucible_version, open_configured_store
 from crucible_trader.session import session_cycle
 from crucible_trader.settings import Settings
+from crucible_trader.simulated_broker import (
+    FILL_SOURCE,
+    SIMULATED_FILLS_SCHEMA_VERSION,
+    SIMULATED_SLIPPAGE_BPS,
+    SimulatedFillRouter,
+    StagingHoldControl,
+    StagingSessionConfig,
+    simulated_fills_key,
+)
 
 __all__ = [
     "SESSION_JOB",
@@ -94,6 +117,7 @@ __all__ = [
     "daily_session_cycle",
     "main",
     "run_daily_session",
+    "run_staging_session",
 ]
 
 #: The job every session files its manifest under
@@ -155,7 +179,7 @@ def _file_shortfall(
 def daily_session_cycle(
     ctx: RunContext,
     *,
-    broker: IbBrokerControl,
+    broker: BrokerControl,
     router: Any,
     installed_version: str,
     clock: Callable[[], dt.datetime] = utcnow,
@@ -298,6 +322,79 @@ def run_daily_session(
             close()
 
 
+def run_staging_session(
+    store: Store,
+    *,
+    config: StagingSessionConfig,
+    installed_version: str,
+    clock: Callable[[], dt.datetime] = utcnow,
+    run_mode: str | None = None,
+) -> RunContext:
+    """Run one STAGING session as `trader.session`: no broker, no SDK, no connection.
+
+    `alpha-engine-config-I12507`. The same :func:`daily_session_cycle` prod runs,
+    handed :class:`~crucible_trader.simulated_broker.StagingHoldControl` and
+    either a :class:`~crucible_trader.simulated_broker.SimulatedFillRouter`
+    (simulated fills on) or the shadow router. A served simulated session also
+    files its fills at `simulated_fills_key(day)`.
+    """
+
+    def body(ctx: RunContext) -> dict[str, object]:
+        day = ctx.trading_day.isoformat()
+        router: SimulatedFillRouter | ShadowRouter = (
+            SimulatedFillRouter(config, store=ctx.store, trading_day=day, clock=clock)
+            if config.simulated
+            else ShadowRouter()
+        )
+        result: dict[str, object] = daily_session_cycle(
+            ctx,
+            broker=StagingHoldControl(),
+            router=router,
+            installed_version=installed_version,
+            clock=clock,
+        )
+        if not isinstance(router, SimulatedFillRouter) or result["outcome"] != "served":
+            return result
+        key = simulated_fills_key(day)
+        ctx.record_output(
+            key,
+            router.simulated_fills_payload(
+                champion=str(result["m_champion"]), trading_day=day, now=clock()
+            ),
+            SIMULATED_FILLS_SCHEMA_VERSION,
+        )
+        # The run manifest says what the session was: the evidence records the
+        # day as `shadow` (no order left the trader), this metric that its plan
+        # was filled by simulation.
+        ctx.record_metric(
+            {
+                "name": "trader_session_simulated_fills",
+                "module": METRIC_MODULE,
+                "metric_type": "operational",
+                "value": float(len(router.records)),
+                "unit": "count",
+                "n_floor": 1,
+                "status": "OK",
+                "status_reason": (
+                    f"staging simulated session: {len(router.records)} fill(s) at the session "
+                    f"close ({FILL_SOURCE}, {SIMULATED_SLIPPAGE_BPS} bps declared); no broker"
+                ),
+                "source_path": key,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        return {**result, "session_mode": "simulated", "simulated_fills_key": key}
+
+    return run_job(
+        SESSION_JOB,
+        body,
+        store=store,
+        now=clock(),
+        run_mode=run_mode,
+        transient_retry=False,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -317,6 +414,23 @@ def main(
         printer(f"SKIP: {today} is not an NYSE session; a session serves trading days only")
         return 0
     source = None if environ is None else dict(environ)
+    # `None` outside staging, so the prod path below is exactly what it was.
+    # Raises -- before any SDK load -- on routing in staging or simulation in prod.
+    staging = StagingSessionConfig.from_env(source)
+    if staging is not None:
+        ctx = run_staging_session(
+            open_configured_store(Settings.from_env(source)),
+            config=staging,
+            installed_version=version_reader(),
+            clock=clock,
+            run_mode=args.run_mode,
+        )
+        mode = "simulated" if staging.simulated else "shadow"
+        printer(
+            f"trader.session {ctx.trading_day} {ctx.run_id}: staging {mode} session filed "
+            "(no broker)"
+        )
+        return 0
     settings = Settings.from_env(source)
     address = GatewayAddress.from_env(source)
     router_config = RouterConfig.from_env(source)
