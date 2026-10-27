@@ -240,6 +240,30 @@ class TestClassification:
         (finding,) = reconcile(inputs(anchor, statement({}, cash=112.0))).discrepancies
         assert (finding.klass, finding.side, finding.delta) == ("cash_delta", "broker_over", 12.0)
 
+    def test_cash_is_compared_on_the_cent_grid_the_broker_reports_on(self):
+        # 2026-10-27 (alpha-engine-config-I12376): anchor and broker are both
+        # cent-rounded IB figures, fills carry six-decimal commissions. The raw
+        # residual landed at -0.0104 with no break, and a raw float tolerance
+        # of one cent failed it. On the cent grid it is one cent off: clean.
+        anchor = statement({"AAA": 1}, cash=29_566.68, day=PREV)
+        fill = (Fill("AAA", -1, 1_349.054_412),)  # expected 30915.734412
+        broker = statement({}, cash=30_915.72)
+        assert reconcile(inputs(anchor, broker, fills=fill)).clean
+
+    def test_two_cents_off_the_cent_grid_is_still_a_finding(self):
+        anchor = statement({"AAA": 1}, cash=29_566.68, day=PREV)
+        fill = (Fill("AAA", -1, 1_349.064_412),)  # expected 30915.744412 -> .74
+        broker = statement({}, cash=30_915.72)
+        (finding,) = reconcile(inputs(anchor, broker, fills=fill)).discrepancies
+        assert (finding.klass, finding.side) == ("cash_delta", "broker_under")
+
+    def test_the_10_26_avg_price_break_still_fails(self):
+        anchor = statement({"AAA": 1}, cash=21_712.41, day=PREV)
+        fill = (Fill("AAA", -1, 7_853.72),)  # expected 29566.13, broker 29566.68
+        broker = statement({}, cash=29_566.68)
+        (finding,) = reconcile(inputs(anchor, broker, fills=fill)).discrepancies
+        assert (finding.klass, finding.delta) == ("cash_delta", 0.55)
+
     def test_stale_anchor_is_a_finding(self):
         result = reconcile(inputs(statement({}, day="2026-09-08"), statement({})))
         assert classes(result) == ["stale_anchor"]
