@@ -1,40 +1,34 @@
-## What & why
+<!--
+ONE paragraph, at most 120 words, four sentences in this order:
+  1. What changes, in plain words.
+  2. Why: the tracked issue, the observed defect (with its date), or the ruling.
+  3. Proof: what you ran BEFORE opening and its result ("will verify in CI" is not acceptable).
+  4. What the merge does: the workflow it triggers and what goes live, or that nothing does.
+No headings, tables, bullet lists, file lists or retold diff. A fifth sentence only for an
+out-of-scope finding (name the alpha-engine-config-I<N> it was filed as) or a cross-repo merge order.
+Rules: nous-ergon-ops policies/change-control-policy.md § PR body requirements.
 
-<!-- Reference the tracked issue (`alpha-engine-config-I<N>` — that repo is this
-     one's tracker), a concrete observed defect, or a named ruling. A closing
-     keyword only works for an issue in THIS repository; the tracker issue is
-     closed by hand after merge. -->
+Before opening, confirm (do not paste into the body):
+  - `uv lock --check`, `uv run --frozen ruff check && uv run --frozen ruff format --check` clean
+  - `uv run --frozen pytest -q --cov=crucible_trader --cov-config=pyproject.toml` passed
+  - for a contract change, the NEGATIVE cases covered are named in the proof sentence
+-->
 
-## Measured
 
-<!-- What was measured, against what, and when. Not "should work". -->
+Tracker: alpha-engine-config-I
+Deploy-mechanism: N/A
+Merge: auto · Operator: none · Money-path: none
 
-## Test plan
-
-<!-- Confirm the suite passed BEFORE opening this PR. "Will verify in CI" is not
-     acceptable.
-       uv lock --check
-       uv run --frozen ruff check && uv run --frozen ruff format --check
-       uv run --frozen pytest -q --cov=crucible_trader --cov-config=pyproject.toml
-     For a contract change, name the NEGATIVE cases covered. -->
-
-## Money-path impact
-
-**Money-path:** <!-- `none`, or name what changes about orders, sizing, the
-kill switch, the account guard, reconciliation, or the refusal path. A change
-that can alter an order is never bundled with anything else. -->
-
-## Deploy mechanism
-
-**Deploy-mechanism:** <!-- the workflow that fires on merge, or `N/A`. This
-repository pins a release explicitly; a merge here does not move
-`trader/release_pin`. -->
-
-## Out of scope
-
-<!-- Findings this PR does not fix. Each one filed on
-     `nousergon/alpha-engine-config` with its issue number named here. -->
-
----
-
-Prepared by: <model-name> via [Claude Code](https://claude.com/claude-code)
+<!--
+Tracker: always. Add ` · Closes #<N>` only for an issue in THIS repo (the keyword is inert across repos).
+Deploy-mechanism: the workflow the merge triggers, or N/A. Machine-read keys (Tracker, Deploy-mechanism,
+  Depends-on, Verified-when) each start their own line; human-read fields share the Merge line.
+Merge: `auto` (standing lane, auto-merge armed) or `Brian, red line N (which)`:
+  1 access widening · 2 trading risk limits/sizing · 3 safety-guard weakening · 4 irreversible data delete · 5 budget increase.
+Operator: `none`, or `pre-merge`/`post-merge` plus the exact one-line guarded wrapper (registered in director/post-merge/).
+Money-path: always present. `none`, or name what changes about orders, sizing, the kill switch,
+  the account guard, reconciliation or the refusal path. A change that can alter an order is never bundled.
+Deploy-mechanism: this repo pins a release explicitly; a merge does not move trader/release_pin.
+Last line, for agent-authored PRs (never a model name):
+🤖 Generated with [Claude Code](https://claude.com/claude-code) · https://claude.ai/code/session_…
+-->
