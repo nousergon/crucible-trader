@@ -50,7 +50,24 @@ RECONCILIATION_SCHEMA_VERSION = "broker_reconciliation.v1"
 #: Cash agreement tolerance. One cent: IB reports cash to the cent, and any
 #: larger unexplained movement (an undeclared interest posting, a fee) is a
 #: discrepancy to be explained by a declared cash flow, not absorbed.
+#:
+#: It is measured on the CENT GRID (`_cash_cents_off`), never on the raw float
+#: residual. Both the anchor and the broker cash are IB `TotalCashValue`
+#: figures already rounded to the cent, while fills are costed at full
+#: precision (IB commissions carry six decimals). The raw residual of two
+#: cent-rounded numbers plus an unrounded flow therefore carries up to a cent
+#: of pure rounding noise, which sits exactly on a one-cent float tolerance:
+#: 10-23 residual +0.01 passed, 10-27 residual -0.01 failed with no break
+#: (alpha-engine-config-I12376).
 CASH_TOLERANCE_USD = 0.01
+_CASH_TOLERANCE_CENTS = round(CASH_TOLERANCE_USD * 100)
+
+
+def _cash_cents_off(broker_cash: float, expected_cash: float) -> int:
+    """How many whole cents the broker's cash is off the expected cash, once the
+    expected side is rounded to the cent grid the broker reports on."""
+    return round(broker_cash * 100) - round(expected_cash * 100)
+
 
 #: The corporate-action kinds this reconciler can apply. Anything else that is
 #: RESOLVED for a held instrument is an `unhandled_corporate_action` finding.
@@ -418,11 +435,13 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         + sum(dividends.values())
     )
     residual = inputs.broker.cash_usd - expected_cash
-    if abs(residual) > CASH_TOLERANCE_USD:
+    if abs(_cash_cents_off(inputs.broker.cash_usd, expected_cash)) > _CASH_TOLERANCE_CENTS:
         unpaid = [
             t
             for t, amount in dividends.items()
-            if amount and abs(residual + amount) <= CASH_TOLERANCE_USD
+            if amount
+            and abs(_cash_cents_off(inputs.broker.cash_usd, expected_cash - amount))
+            <= _CASH_TOLERANCE_CENTS
         ]
         if unpaid:
             findings.append(
