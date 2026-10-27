@@ -44,14 +44,19 @@ def broker_fill(
     time: dt.datetime = T0,
     client_id: int = 7,
     exec_id: str | None = None,
+    price: float | None = None,
 ) -> SimpleNamespace:
     """An `ib_async.Fill`-shaped record as the session's fill store holds it:
     `reconcile_entrypoint.fills_from_ib` reads exactly this subset
-    (`contract.symbol`, `execution.{execId,time,side,shares,avgPrice}`,
+    (`contract.symbol`, `execution.{execId,time,side,shares,price}`,
     `commissionReport.{execId,commission}`). Its commission report is attached
     (``execId`` matches) unless ``commission`` is None. ``execution.clientId``
     is the API client that placed the order; it is never read, and is there so
-    a test can say which client a fill belongs to."""
+    a test can say which client a fill belongs to. ``price`` is this
+    execution's own price and defaults to ``avg_price``, which is what IB
+    reports for an order's first (or only) execution; ``avgPrice`` is the
+    order's cumulative average, so the two differ from a second partial fill
+    on."""
     exec_id = exec_id or f"{symbol}.{side}.{shares:g}.{time:%Y%m%d%H%M%S}.{client_id}"
     report = None if commission is None else SimpleNamespace(execId=exec_id, commission=commission)
     return SimpleNamespace(
@@ -61,6 +66,7 @@ def broker_fill(
             time=time,
             side=side,
             shares=shares,
+            price=avg_price if price is None else price,
             avgPrice=avg_price,
             clientId=client_id,
         ),
