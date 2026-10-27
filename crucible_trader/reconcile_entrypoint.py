@@ -108,7 +108,9 @@ class _Execution(Protocol):
     time: dt.datetime
     side: str
     shares: float
-    avgPrice: float  # noqa: N815 - SDK spelling
+    #: This execution's own price. `avgPrice` (the order's cumulative average,
+    #: beside `cumQty`) is deliberately not read: see `fills_from_ib`.
+    price: float
 
 
 class _CommissionReport(Protocol):
@@ -226,7 +228,13 @@ def fills_from_ib(
                 "without one"
             )
         sign = _SIDE_SIGN[execution.side]
-        notional = float(execution.shares) * float(execution.avgPrice)
+        # `execution.price`, never `execution.avgPrice`: IB's `avgPrice` is the
+        # ORDER's cumulative average up to this execution (it travels with
+        # `cumQty`), so `shares * avgPrice` summed over an order's partial
+        # executions is not what the broker debited. The 2026-10-26 run (24
+        # executions across 10 orders) read +0.55 broker_over on exactly that,
+        # while the same orders at their final average reconciled to the cent.
+        notional = float(execution.shares) * float(execution.price)
         fills.append(
             Fill(
                 ticker=record.contract.symbol,

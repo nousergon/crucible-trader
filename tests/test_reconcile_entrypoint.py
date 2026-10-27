@@ -78,6 +78,39 @@ class TestFillsFromIb:
         (fill,) = fills_from_ib(client, DAY)
         assert fill.ticker == "AAA"
 
+    def test_a_partially_filled_order_is_costed_at_each_executions_own_price(self):
+        """2026-10-26 (DUO952222): IB's `execution.avgPrice` is the ORDER's
+        cumulative average, so costing each partial execution at it read a
+        +0.55 broker_over cash_delta the broker never had. Two executions of
+        one buy: 100 @ 10.00 then 100 @ 10.10. The second carries
+        avgPrice 10.05; the broker debited 2010.00, not 2005.00."""
+        client = _Client(
+            [
+                broker_fill(
+                    "AAA",
+                    side="BOT",
+                    shares=100,
+                    avg_price=10.0,
+                    commission=0.5,
+                    time=T,
+                    exec_id="e1",
+                ),
+                broker_fill(
+                    "AAA",
+                    side="BOT",
+                    shares=100,
+                    avg_price=10.05,
+                    price=10.10,
+                    commission=0.5,
+                    time=T,
+                    exec_id="e2",
+                ),
+            ]
+        )
+        fills = fills_from_ib(client, DAY)
+        assert sum(f.shares for f in fills) == 200
+        assert sum(f.cash_usd for f in fills) == pytest.approx(-(1000.0 + 1010.0) - 1.0)
+
     def test_another_api_clients_fills_are_the_accounts_fills(self):
         """alpha-engine-config-I12376: the paper account is shared with the v1
         executor (client ids 1-3). On a master session its executions arrive
