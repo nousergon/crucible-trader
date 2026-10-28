@@ -240,22 +240,34 @@ class TestClassification:
         (finding,) = reconcile(inputs(anchor, statement({}, cash=112.0))).discrepancies
         assert (finding.klass, finding.side, finding.delta) == ("cash_delta", "broker_over", 12.0)
 
-    def test_cash_is_compared_on_the_cent_grid_the_broker_reports_on(self):
+    def test_a_cents_wide_gap_is_rounded_to_ib_and_recorded(self):
         # 2026-10-27 (alpha-engine-config-I12376): anchor and broker are both
         # cent-rounded IB figures, fills carry six-decimal commissions. The raw
-        # residual landed at -0.0104 with no break, and a raw float tolerance
-        # of one cent failed it. On the cent grid it is one cent off: clean.
+        # residual landed at -0.0104 with no break. Brian, 2026-10-28: track to
+        # cents and round small cents-wide gaps to IB's reported cash.
         anchor = statement({"AAA": 1}, cash=29_566.68, day=PREV)
         fill = (Fill("AAA", -1, 1_349.054_412),)  # expected 30915.734412
         broker = statement({}, cash=30_915.72)
-        assert reconcile(inputs(anchor, broker, fills=fill)).clean
+        result = reconcile(inputs(anchor, broker, fills=fill))
+        assert result.clean
+        assert result.expected_cash_usd == 30_915.72
+        assert result.cash_rounded_to_broker_usd == -0.01
+        assert result.to_document()["cash_rounded_to_broker_usd"] == -0.01
 
-    def test_two_cents_off_the_cent_grid_is_still_a_finding(self):
-        anchor = statement({"AAA": 1}, cash=29_566.68, day=PREV)
-        fill = (Fill("AAA", -1, 1_349.064_412),)  # expected 30915.744412 -> .74
-        broker = statement({}, cash=30_915.72)
-        (finding,) = reconcile(inputs(anchor, broker, fills=fill)).discrepancies
-        assert (finding.klass, finding.side) == ("cash_delta", "broker_under")
+    def test_exact_agreement_records_zero_rounding(self):
+        anchor = statement({}, cash=100.0, day=PREV)
+        result = reconcile(inputs(anchor, statement({}, cash=100.0)))
+        assert result.clean
+        assert result.cash_rounded_to_broker_usd == 0.0
+
+    def test_five_cents_is_rounded_and_six_cents_is_a_finding(self):
+        anchor = statement({}, cash=100.0, day=PREV)
+        assert reconcile(inputs(anchor, statement({}, cash=100.05))).clean
+        (finding,) = reconcile(inputs(anchor, statement({}, cash=99.94))).discrepancies
+        assert (finding.klass, finding.side, finding.delta) == ("cash_delta", "broker_under", -0.06)
+        assert (
+            reconcile(inputs(anchor, statement({}, cash=99.94))).cash_rounded_to_broker_usd is None
+        )
 
     def test_the_10_26_avg_price_break_still_fails(self):
         anchor = statement({"AAA": 1}, cash=21_712.41, day=PREV)

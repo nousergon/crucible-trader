@@ -47,19 +47,22 @@ from crucible_trader.broker_statement import BrokerStatement
 
 RECONCILIATION_SCHEMA_VERSION = "broker_reconciliation.v1"
 
-#: Cash agreement tolerance. One cent: IB reports cash to the cent, and any
-#: larger unexplained movement (an undeclared interest posting, a fee) is a
-#: discrepancy to be explained by a declared cash flow, not absorbed.
+#: Cash agreement tolerance, on the CENT GRID (Brian, 2026-10-28: "only track
+#: down to cents and when there are small cents-wide differences round to the
+#: IB reporting"). IB `TotalCashValue` is the ground truth for cash and is
+#: reported to the cent, so the expected side is rounded to that grid
+#: (`_cash_cents_off`) and a gap of up to this many cents is ROUNDED TO IB: the
+#: result takes IB's figure as the expected cash and records the absorbed
+#: amount as `cash_rounded_to_broker_usd`, so every adjustment stays visible.
+#: Anything larger (an undeclared interest posting, a fee, the 10-26 $0.55
+#: avgPrice break) is a `cash_delta` to be explained, never absorbed.
 #:
-#: It is measured on the CENT GRID (`_cash_cents_off`), never on the raw float
-#: residual. Both the anchor and the broker cash are IB `TotalCashValue`
-#: figures already rounded to the cent, while fills are costed at full
-#: precision (IB commissions carry six decimals). The raw residual of two
-#: cent-rounded numbers plus an unrounded flow therefore carries up to a cent
-#: of pure rounding noise, which sits exactly on a one-cent float tolerance:
-#: 10-23 residual +0.01 passed, 10-27 residual -0.01 failed with no break
+#: Why a band and not one cent: the anchor and the broker cash are both
+#: cent-rounded IB figures while fills are costed at IB's six-decimal
+#: commissions, so the raw residual carries rounding noise of about a cent:
+#: 10-23 +0.01 passed and 10-27 -0.01 failed with every position matched
 #: (alpha-engine-config-I12376).
-CASH_TOLERANCE_USD = 0.01
+CASH_TOLERANCE_USD = 0.05
 _CASH_TOLERANCE_CENTS = round(CASH_TOLERANCE_USD * 100)
 
 
@@ -219,6 +222,10 @@ class ReconciliationResult:
     broker_cash_usd: float
     cash_residual_usd: float | None
     discrepancies: tuple[Discrepancy, ...]
+    #: Cents absorbed by rounding to IB's reported cash (signed, broker minus
+    #: the unrounded expected; 0.0 when they agreed to the cent). None when the
+    #: gap was a finding or there was no expected cash.
+    cash_rounded_to_broker_usd: float | None = None
 
     @property
     def match_rate(self) -> float | None:
@@ -249,6 +256,7 @@ class ReconciliationResult:
             "expected_cash_usd": self.expected_cash_usd,
             "broker_cash_usd": self.broker_cash_usd,
             "cash_residual_usd": self.cash_residual_usd,
+            "cash_rounded_to_broker_usd": self.cash_rounded_to_broker_usd,
             "discrepancies": [d.to_document() for d in self.discrepancies],
         }
 
@@ -468,6 +476,11 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
                     "broker cash differs from anchor + fills + declared flows + dividends",
                 )
             )
+        rounded_to_broker = None
+    else:
+        # A cents-wide gap: IB's reported cash is the truth, so the expected
+        # side is rounded to it and the absorbed amount is recorded.
+        rounded_to_broker = round(residual, 2) + 0.0  # + 0.0: never -0.0
 
     resolved_rows = [t for t in universe if t in inputs.corporate_actions.resolved]
     return _result(
@@ -476,6 +489,7 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         expected,
         expected_cash,
         findings,
+        cash_rounded_to_broker_usd=rounded_to_broker,
         n_comparable=len(resolved_rows),
         # Matches over RESOLVED rows only: an unresolved instrument that happens
         # to agree is not a verified match (v1's `OK_UNVERIFIED` beside 1.000).
@@ -492,6 +506,7 @@ def _result(
     *,
     n_comparable: int = 0,
     n_matched: int = 0,
+    cash_rounded_to_broker_usd: float | None = None,
 ) -> ReconciliationResult:
     order = {klass: i for i, klass in enumerate(DISCREPANCY_CLASSES)}
     return ReconciliationResult(
@@ -504,11 +519,20 @@ def _result(
         n_matched=n_matched,
         expected_positions=dict(sorted(expected.items())),
         broker_positions=dict(sorted(broker.items())),
-        expected_cash_usd=None if expected_cash is None else round(expected_cash, 2),
+        # Rounded to IB: the expected cash IS the broker's reported figure. The
+        # raw residual below stays, because the control arm plants against it.
+        expected_cash_usd=(
+            None
+            if expected_cash is None
+            else inputs.broker.cash_usd
+            if cash_rounded_to_broker_usd is not None
+            else round(expected_cash, 2)
+        ),
         broker_cash_usd=inputs.broker.cash_usd,
         cash_residual_usd=(
             None if expected_cash is None else round(inputs.broker.cash_usd - expected_cash, 2)
         ),
+        cash_rounded_to_broker_usd=None if expected_cash is None else cash_rounded_to_broker_usd,
         discrepancies=tuple(sorted(findings, key=lambda d: (order[d.klass], d.instrument))),
     )
 
