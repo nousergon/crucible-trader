@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "_comment": "Derived dividend entitlements for dividends whose record session predates the trader's first stored broker statement (crucible_trader/dividend_entitlements.py, alpha-engine-config-I12376). Each is an ESTIMATE, cross-checked by the broker's credit: the owed amount must match the credited cash to the cent band, or the credit stays an unexplained cash_delta.",
+  "entitlements": [
+    {
+      "ticker": "SPY",
+      "pay_date": "2026-10-30",
+      "record_session": "2026-09-17",
+      "entitled_shares": 10,
+      "amount_per_share": 1.888834,
+      "estimated": true,
+      "source": "the v1 executor's IB-recorded close positions for 2026-09-17 (SPY 10, bought that session); the trader's first stored statement is 2026-10-09",
+      "ruling": "Brian 2026-10-30T23:26Z, 'can't you just back into it?' (Director relay)"
+    }
+  ]
+}
