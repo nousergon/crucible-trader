@@ -43,6 +43,7 @@ from typing import Any
 from crucible_trader.broker_statement import BrokerStatement
 from crucible_trader.reconciliation import (
     CASH_INSTRUMENT,
+    CashFlow,
     CorporateAction,
     CorporateActionSet,
     Discrepancy,
@@ -156,6 +157,8 @@ def replay_base(inputs: ReconciliationInputs) -> ReconciliationInputs:
         corporate_actions=CorporateActionSet(resolved=frozenset(broker.positions)),
         previous_trading_day=None,
         genesis=False,
+        # The replay anchors on the broker's own cash, so nothing is owed in it.
+        owed_dividends=(),
     )
 
 
@@ -172,8 +175,21 @@ def plant(
             broker, cash_usd=broker.cash_usd + PLANTED_CASH_DELTA_USD
         )
         residual = baseline.cash_residual_usd or 0.0
+        # Hold the baseline's late-dividend credits fixed: the plant moves the
+        # cash, so re-matching them would fold the credits into the planted
+        # delta and the arm would grade the matcher, not the plant.
+        credited = {c.key for c in baseline.dividend_credits}
+        held = tuple(
+            CashFlow(f"owed dividend credited: {c.ticker} {c.pay_date}", c.amount_usd)
+            for c in baseline.dividend_credits
+        )
         return (
-            dataclasses.replace(base, broker=planted_broker),
+            dataclasses.replace(
+                base,
+                broker=planted_broker,
+                cash_flows=(*base.cash_flows, *held),
+                owed_dividends=tuple(o for o in base.owed_dividends if o.key not in credited),
+            ),
             Plant(klass, CASH_INSTRUMENT, round(residual + PLANTED_CASH_DELTA_USD, 2)),
         )
     if klass not in ("share_delta", "corporate_action"):

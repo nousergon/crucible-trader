@@ -39,6 +39,8 @@ function with planted discrepancies.
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
+import itertools
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal
@@ -136,6 +138,9 @@ class CorporateAction:
     ratio: float | None = None
     amount_per_share: float | None = None
     entitled_shares: int | None = None
+    #: How ``entitled_shares`` was established, and whether it is an estimate.
+    entitlement_source: str = "stored broker statement"
+    estimated: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,6 +157,46 @@ class CorporateActionSet:
     actions: tuple[CorporateAction, ...] = ()
 
 
+#: How long a dividend the broker has not applied may stay owed before it is a
+#: finding of its own. IB's paper account has credited a paid dividend days
+#: after its pay date; it has never taken this long.
+OWED_DIVIDEND_MAX_DAYS = 10
+
+#: The most owed dividends a single day's cash is matched against. The match
+#: tries every combination, so this bounds it (2**12 sums).
+OWED_DIVIDEND_MATCH_LIMIT = 12
+
+
+@dataclasses.dataclass(frozen=True)
+class OwedDividend:
+    """A dividend paid on an earlier pay date that the broker had not applied.
+
+    The anchor is the broker's own statement, so a dividend the broker credits
+    a day or more after its pay date arrives as cash nobody declared. Without
+    this record that credit is an unexplained `cash_delta` -- and the pay-date
+    shortfall that preceded it was already a finding, so one dividend paid late
+    would fail two sessions. A credit is matched to an owed dividend only when
+    the cash agrees to the cent band; anything else stays a finding.
+
+    ``entitlement_source`` says how the entitled shares were established and
+    ``estimated`` marks a derived entitlement (principle: a missing input is
+    estimated, and marked estimated).
+    """
+
+    ticker: str
+    pay_date: str
+    amount_usd: float
+    entitlement_source: str = "stored broker statement"
+    estimated: bool = False
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.ticker, self.pay_date)
+
+    def to_document(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
 @dataclasses.dataclass(frozen=True)
 class ReconciliationInputs:
     trading_day: str
@@ -163,6 +208,9 @@ class ReconciliationInputs:
     previous_trading_day: str | None = None
     #: Declared by an operator, never inferred from a missing anchor.
     genesis: bool = False
+    #: Dividends paid on an EARLIER pay date that the broker had not applied
+    #: (:class:`OwedDividend`); a credit today is matched against these.
+    owed_dividends: tuple[OwedDividend, ...] = ()
 
     def __post_init__(self) -> None:
         if self.broker.trading_day != self.trading_day:
@@ -226,6 +274,10 @@ class ReconciliationResult:
     #: the unrounded expected; 0.0 when they agreed to the cent). None when the
     #: gap was a finding or there was no expected cash.
     cash_rounded_to_broker_usd: float | None = None
+    #: Owed dividends the broker credited today, matched to the cash.
+    dividend_credits: tuple[OwedDividend, ...] = ()
+    #: Dividends paying today that the broker did not apply: owed from today.
+    dividends_unpaid: tuple[OwedDividend, ...] = ()
 
     @property
     def match_rate(self) -> float | None:
@@ -258,6 +310,8 @@ class ReconciliationResult:
             "cash_residual_usd": self.cash_residual_usd,
             "cash_rounded_to_broker_usd": self.cash_rounded_to_broker_usd,
             "discrepancies": [d.to_document() for d in self.discrepancies],
+            "dividend_credits": [d.to_document() for d in self.dividend_credits],
+            "dividends_unpaid": [d.to_document() for d in self.dividends_unpaid],
         }
 
 
@@ -442,7 +496,30 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         + sum(c.cash_usd for c in inputs.cash_flows)
         + sum(dividends.values())
     )
+    credits = _match_owed_credits(
+        inputs.broker.cash_usd, expected_cash, dividends, inputs.owed_dividends
+    )
+    expected_cash += sum(c.amount_usd for c in credits)
+    credited = {c.key for c in credits}
+    for owed in inputs.owed_dividends:
+        if owed.key in credited:
+            continue
+        days = (_date(inputs.trading_day) - _date(owed.pay_date)).days
+        if days > OWED_DIVIDEND_MAX_DAYS:
+            findings.append(
+                Discrepancy(
+                    "corporate_action",
+                    owed.ticker,
+                    owed.amount_usd,
+                    None,
+                    -owed.amount_usd,
+                    "broker",
+                    f"the {owed.ticker} dividend paid {owed.pay_date} "
+                    f"({owed.amount_usd:.2f}) is still not credited after {days} days",
+                )
+            )
     residual = inputs.broker.cash_usd - expected_cash
+    unpaid_today: list[OwedDividend] = []
     if abs(_cash_cents_off(inputs.broker.cash_usd, expected_cash)) > _CASH_TOLERANCE_CENTS:
         unpaid = [
             t
@@ -452,6 +529,14 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
             <= _CASH_TOLERANCE_CENTS
         ]
         if unpaid:
+            unpaid_today.append(
+                OwedDividend(
+                    unpaid[0],
+                    inputs.trading_day,
+                    round(dividends[unpaid[0]], 2),
+                    *_entitlement(actions.get(unpaid[0], ())),
+                )
+            )
             findings.append(
                 Discrepancy(
                     "corporate_action",
@@ -494,6 +579,8 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         # Matches over RESOLVED rows only: an unresolved instrument that happens
         # to agree is not a verified match (v1's `OK_UNVERIFIED` beside 1.000).
         n_matched=sum(1 for t in resolved_rows if expected.get(t, 0) == broker.get(t, 0)),
+        dividend_credits=credits,
+        dividends_unpaid=tuple(unpaid_today),
     )
 
 
@@ -507,6 +594,8 @@ def _result(
     n_comparable: int = 0,
     n_matched: int = 0,
     cash_rounded_to_broker_usd: float | None = None,
+    dividend_credits: tuple[OwedDividend, ...] = (),
+    dividends_unpaid: tuple[OwedDividend, ...] = (),
 ) -> ReconciliationResult:
     order = {klass: i for i, klass in enumerate(DISCREPANCY_CLASSES)}
     return ReconciliationResult(
@@ -534,7 +623,49 @@ def _result(
         ),
         cash_rounded_to_broker_usd=None if expected_cash is None else cash_rounded_to_broker_usd,
         discrepancies=tuple(sorted(findings, key=lambda d: (order[d.klass], d.instrument))),
+        dividend_credits=dividend_credits,
+        dividends_unpaid=dividends_unpaid,
     )
+
+
+def _date(day: str) -> dt.date:
+    return dt.date.fromisoformat(day)
+
+
+def _entitlement(actions: Iterable[CorporateAction]) -> tuple[str, bool]:
+    """How a ticker's paying dividend established its entitled shares. Only
+    called for a ticker that has a paying dividend."""
+    action = next(a for a in actions if a.kind == "cash_dividend")
+    return action.entitlement_source, action.estimated
+
+
+def _match_owed_credits(
+    broker_cash: float,
+    expected_cash: float,
+    dividends: Mapping[str, float],
+    owed: Sequence[OwedDividend],
+) -> tuple[OwedDividend, ...]:
+    """The smallest set of ``owed`` dividends whose credit explains today's cash.
+
+    Tried in order of size, starting from none, so a day whose cash already
+    agrees credits nothing and a day short exactly one of today's dividends is
+    still that finding. A set matches when the cash agrees within the cent band
+    with it credited -- either outright, or short exactly one of today's
+    dividends (credited late and paying late on the same day). No set matching
+    leaves the gap to the findings below, unchanged: a credit that does not
+    agree with what was owed is never absorbed.
+    """
+    candidates = list(owed)[:OWED_DIVIDEND_MATCH_LIMIT]
+    today = [amount for amount in dividends.values() if amount]
+    for size in range(len(candidates) + 1):
+        for subset in itertools.combinations(candidates, size):
+            with_credit = expected_cash + sum(c.amount_usd for c in subset)
+            if abs(_cash_cents_off(broker_cash, with_credit)) <= _CASH_TOLERANCE_CENTS or any(
+                abs(_cash_cents_off(broker_cash, with_credit - amount)) <= _CASH_TOLERANCE_CENTS
+                for amount in today
+            ):
+                return tuple(subset)
+    return ()
 
 
 def _net_fills(fills: Iterable[Fill]) -> dict[str, int]:

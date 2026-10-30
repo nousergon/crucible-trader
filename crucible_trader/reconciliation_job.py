@@ -45,6 +45,11 @@ from crucible_trader.broker_statement import (
     statement_from_document,
     statement_schema_version,
 )
+from crucible_trader.dividend_entitlements import (
+    OWED_BOOTSTRAP_FROM,
+    load_declared_entitlements,
+    owed_dividends,
+)
 from crucible_trader.reconciliation import (
     RECONCILIATION_SCHEMA_VERSION,
     CashFlow,
@@ -67,6 +72,9 @@ METRIC_MODULE = "crucible_trader.reconciliation"
 #: The listing prefix of every stored statement, derived from the harness's key
 #: function (any valid day) so the key shape has one owner.
 BROKER_STATEMENT_PREFIX = trader_broker_statement_key("2000-01-03").rsplit("/", 1)[0] + "/"
+
+#: The listing prefix of every stored reconciliation result, derived the same way.
+RECONCILIATION_PREFIX = trader_reconciliation_key("2000-01-03").rsplit("/", 1)[0] + "/"
 
 
 #: A corporate-action source that needs to know what it is resolving: called
@@ -108,6 +116,20 @@ def latest_anchor(store: Store, trading_day: str) -> tuple[str, bytes, BrokerSta
     return key, payload, statement_from_document(json.loads(payload.decode("utf-8")))
 
 
+def stored_results(store: Store, trading_day: str) -> dict[str, tuple[str, bytes]]:
+    """Stored reconciliation results from :data:`OWED_BOOTSTRAP_FROM` up to
+    (not including) ``trading_day``, as ``day -> (key, payload)``. A result that
+    exists and does not read raises; it is never skipped."""
+    out: dict[str, tuple[str, bytes]] = {}
+    for key in store.list_keys(RECONCILIATION_PREFIX):
+        if not key.endswith(".json"):
+            continue
+        day = key.removeprefix(RECONCILIATION_PREFIX).removesuffix(".json")
+        if OWED_BOOTSTRAP_FROM <= day < trading_day:
+            out[day] = (key, store.get_bytes(key))
+    return out
+
+
 def reconcile_cycle(
     ctx: RunContext,
     *,
@@ -138,6 +160,12 @@ def reconcile_cycle(
         )
         corporate_actions = corporate_actions(ctx, day, universe)
 
+    documents: dict[str, dict[str, object]] = {}
+    for prior_day, (key, payload) in stored_results(ctx.store, day).items():
+        ctx.record_input(key, payload, RECONCILIATION_SCHEMA_VERSION)
+        documents[prior_day] = json.loads(payload.decode("utf-8"))
+    owed = owed_dividends(documents, today=day, declared=load_declared_entitlements())
+
     inputs = ReconciliationInputs(
         trading_day=day,
         broker=broker,
@@ -147,6 +175,7 @@ def reconcile_cycle(
         corporate_actions=corporate_actions,
         previous_trading_day=previous_trading_day(ctx.trading_day).isoformat(),
         genesis=genesis,
+        owed_dividends=owed,
     )
     result = reconciler(inputs)
     verdict = run_control_arm(inputs, reconciler=reconciler)
