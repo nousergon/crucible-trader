@@ -14,6 +14,7 @@ import pytest
 
 from crucible_trader.broker_statement import BrokerStatement
 from crucible_trader.reconciliation import (
+    CorporateAction,
     CorporateActionSet,
     Discrepancy,
     Fill,
@@ -65,6 +66,43 @@ class TestTheRealReconcilerPasses:
         broker = BrokerStatement("DU1", DAY, {"AAA": 11}, 700.0)
         verdict = run_control_arm(live_inputs(broker=broker))
         assert verdict.passed, verdict.reason()
+
+    def test_an_unpaid_dividend_displaced_by_the_cash_plant_is_not_a_drop(self):
+        # The 2026-10-29 shape: broker cash is short exactly one dividend, so
+        # the baseline's cash finding is a corporate_action on the payer. The
+        # cash plant moves the cash, that row becomes a cash_delta, and the
+        # arm must read it as displaced, not as a real finding dropped.
+        actions = CorporateActionSet(
+            resolved=frozenset({"AAA"}),
+            actions=(CorporateAction("AAA", "cash_dividend", amount_per_share=1.25),),
+        )
+        inputs = live_inputs(corporate_actions=actions)  # 12.50 owed, not paid
+        baseline = reconcile(replay_base(inputs))
+        assert [(d.klass, d.instrument) for d in baseline.discrepancies] == [
+            ("corporate_action", "AAA")
+        ]
+        verdict = run_control_arm(inputs)
+        assert verdict.passed, verdict.reason()
+
+    def test_a_dropped_share_finding_beside_an_unpaid_dividend_still_fails(self):
+        actions = CorporateActionSet(
+            resolved=frozenset({"AAA"}),
+            actions=(CorporateAction("AAA", "cash_dividend", amount_per_share=1.25),),
+        )
+        real_break = BrokerStatement("DU1", DAY, {"AAA": 11}, 800.0)
+
+        def drops_shares_when_cash_planted(inputs):
+            result = reconcile(inputs)
+            if inputs.broker.cash_usd != 800.0:
+                kept = tuple(d for d in result.discrepancies if d.klass != "share_delta")
+                return dataclasses.replace(result, discrepancies=kept)
+            return result
+
+        verdict = run_control_arm(
+            live_inputs(broker=real_break, corporate_actions=actions),
+            reconciler=drops_shares_when_cash_planted,
+        )
+        assert verdict.missed == ("cash_delta",)
 
     def test_genesis_day_is_exercised_too(self):
         inputs = ReconciliationInputs(

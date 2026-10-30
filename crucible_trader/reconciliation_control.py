@@ -28,7 +28,8 @@ symbol (:data:`PLANT_PREFIX`).
 **What "detected" means is exact, not approximate.** Each replay's findings are
 diffed against an unplanted replay of the same inputs: the plant must add
 exactly one finding, with the planted class, instrument and delta, and remove
-nothing but (for the cash plant) the baseline's own cash finding it displaced.
+nothing but (for the cash plant) the baseline's own cash finding it displaced,
+whether that is a `cash_delta` or an unpaid-dividend `corporate_action`.
 A reconciler that reports the plant AND silently drops a real finding fails.
 """
 
@@ -213,7 +214,7 @@ def run_control_arm(
         after = {_key(d) for d in reconciler(planted_inputs).discrepancies}
         added, removed = after - before, before - after
         if klass == "cash_delta":
-            removed = {k for k in removed if not (k[0] == "cash_delta" and k[1] == CASH_INSTRUMENT)}
+            removed = {k for k in removed if not _is_cash_finding(k, baseline)}
         hit = [
             k
             for k in added
@@ -236,6 +237,28 @@ def run_control_arm(
             )
         )
     return ControlVerdict(tuple(outcomes))
+
+
+def _is_cash_finding(key: tuple[object, ...], baseline: ReconciliationResult) -> bool:
+    """Whether ``key`` is the baseline's cash finding, the one row the cash plant
+    displaces by moving the broker's cash.
+
+    That row is a `cash_delta` on USD when the residual is unexplained, and a
+    `corporate_action` on the paying ticker when it is exactly an unpaid
+    dividend. Both compare the same two figures (expected cash, broker cash),
+    which is what identifies them; a share finding compares share counts.
+    2026-10-29: an unpaid MU dividend was displaced, the arm called it a
+    dropped real finding, and the session was voided.
+    """
+    klass, instrument, expected, actual = key[0], key[1], key[2], key[3]
+    if klass == "cash_delta" and instrument == CASH_INSTRUMENT:
+        return True
+    return (
+        klass == "corporate_action"
+        and baseline.expected_cash_usd is not None
+        and expected == baseline.expected_cash_usd
+        and actual == baseline.broker_cash_usd
+    )
 
 
 def _key(d: Discrepancy) -> tuple[Any, ...]:
