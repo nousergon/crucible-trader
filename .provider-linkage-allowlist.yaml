@@ -1,0 +1,16 @@
+# .provider-linkage-allowlist.yaml — pre-cleared provider-linkage matches
+# (alpha-engine-config-I7777). Schema: nousergon-lib
+# scripts/provider_linkage_guard.py::load_allowlist.
+schema_version: 1
+entries:
+  - path: uv.lock
+    pattern: "openai:dist"
+    reason: >-
+      Transitive, through krepis: the lock resolves krepis's `openai` extra,
+      which is krepis's own OpenAI-wire transport (`krepis/llm.py`), so the
+      `openai` distribution appears in the lock. No module in this repo
+      imports `openai` or constructs a provider client; every model call
+      goes through krepis by model group (alpha-engine-config-I10473 is why
+      the extra is pinned).
+    expires: "2027-04-30"
+    tracking: alpha-engine-config-I7777
