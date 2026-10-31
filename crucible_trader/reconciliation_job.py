@@ -18,6 +18,10 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    durable order intents against them
    (:mod:`crucible_trader.order_intent_reconciliation`) and write that document
    as an output with its own MetricRecord (see :func:`reconcile_intents_step`);
+5b. file every break found by 3, 4 and 5a as an `exception.v1` record
+   (:mod:`crucible_trader.exception_record`, `alpha-engine-config-I12892`
+   phase 0) -- best effort, and never a change to what step 6 decides or pages
+   (see :func:`file_exception_records`);
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding exists. Either makes
    the manifest `status: failed`, which is the page condition (§4.6), and the
@@ -35,7 +39,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from crucible.calendar import is_trading_day
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
@@ -53,6 +58,13 @@ from crucible_trader.dividend_entitlements import (
     OWED_BOOTSTRAP_FROM,
     load_declared_entitlements,
     owed_dividends,
+)
+from crucible_trader.exception_record import (
+    EXCEPTION_SCHEMA_VERSION,
+    exception_day_document,
+    exceptions_key,
+    records_from_broker_reconciliation,
+    records_from_order_intent_reconciliation,
 )
 from crucible_trader.order_intent_reconciliation import (
     RECONCILIATION_SCHEMA_VERSION as INTENT_RECONCILIATION_SCHEMA_VERSION,
@@ -222,9 +234,16 @@ def reconcile_cycle(
         result, verdict, now=now, source_path=trader_reconciliation_key(day)
     ):
         ctx.record_metric(metric)
-    if order_records is not None:
-        orders, executions = order_records
-        reconcile_intents_step(ctx, orders=orders, executions=executions)
+    intent_document: dict[str, Any] | None = None  # pyright: ignore[reportExplicitAny]  # raw JSON document
+    try:
+        if order_records is not None:
+            orders, executions = order_records
+            intent_document = reconcile_intents_step(ctx, orders=orders, executions=executions)
+    finally:
+        # In a `finally` so a step-5a raise still files the broker breaks, and
+        # `file_exception_records` never raises, so the raise (or step 6's
+        # page) is exactly what it would have been without it.
+        file_exception_records(ctx, document, intent_document, now=now)
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())
@@ -238,7 +257,7 @@ def reconcile_intents_step(
     *,
     orders: Sequence[BrokerOrder],
     executions: Sequence[BrokerExecution],
-) -> None:
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw JSON document
     """Step 5a: the day's durable order intents against the broker. Read-only.
 
     `alpha-engine-config-I12558` (audit FIN-03): the intent reconciler had no
@@ -294,6 +313,80 @@ def reconcile_intents_step(
             ),
             "source_path": key,
             "last_updated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    )
+    return document
+
+
+#: The MetricRecord that says whether step 5b filed the day's breaks.
+EXCEPTION_RECORDS_METRIC = "exception_records_filed"
+
+
+def file_exception_records(
+    ctx: RunContext,
+    broker_document: Mapping[str, object],
+    intent_document: Mapping[str, object] | None,
+    *,
+    now: str,
+) -> None:
+    """Step 5b: file the day's breaks as `exception.v1` records. Never raises.
+
+    `alpha-engine-config-I12892` phase 0: a break was a page and nothing else,
+    so no later proposal or decision had an item to point at. This step builds
+    one record per break from the documents steps 3-5a already wrote (the
+    broker findings, a void control arm, and every order-intent row in a break
+    class) and files them together at
+    :func:`~crucible_trader.exception_record.exceptions_key`, plus one
+    ``exception_records_filed`` MetricRecord. A day with no break files nothing
+    and adds no metric, so a clean run is byte-for-byte what it was.
+
+    It reads the detectors' documents and decides nothing. A failure to build or
+    write the records is CAUGHT and reported as that metric with status FAIL --
+    because the alternative is worse: a raise here would replace step 6's page
+    (whose reason names every finding) with a storage error, or fail a run the
+    detectors passed. The page is the control; this record rides beside it.
+    """
+    day = ctx.trading_day.isoformat()
+    key = exceptions_key(day)
+    count = 0
+    try:
+        records = records_from_broker_reconciliation(broker_document, detected_at=now)
+        if intent_document is not None:
+            records += records_from_order_intent_reconciliation(
+                intent_document, void=broker_document.get("void") is True
+            )
+        count = len(records)
+        if records:
+            ctx.record_output(
+                key,
+                json.dumps(exception_day_document(day, records), indent=2, sort_keys=True).encode(
+                    "utf-8"
+                ),
+                EXCEPTION_SCHEMA_VERSION,
+            )
+    except Exception as exc:  # noqa: BLE001 - see docstring: must never mask the page
+        status, value = "FAIL", None
+        reason = (
+            f"exception records for {day} were NOT filed ({count} breaks): "
+            + (f"{type(exc).__name__}: {exc}")[:400]
+        )
+    else:
+        if not records:
+            return
+        status, value = "OK", float(count)
+        reason = f"{count} exception records filed for {day}"
+    ctx.record_metric(
+        {
+            "name": EXCEPTION_RECORDS_METRIC,
+            "module": "crucible_trader.exception_record",
+            "metric_type": "operational",
+            "value": value,
+            "unit": "count" if value is not None else None,
+            "n_floor": 0,
+            "status": status,
+            "status_reason": reason,
+            "source_path": key,
+            "last_updated_utc": now,
         }
     )
 

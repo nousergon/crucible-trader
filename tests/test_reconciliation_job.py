@@ -16,9 +16,16 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement, BrokerStatementError
+from crucible_trader.exception_record import (
+    CONTROL_ARM_VOID,
+    exceptions_key,
+    validate_exception_day_document,
+)
+from crucible_trader.order_intent_reconciliation import BrokerExecution, BrokerOrder
 from crucible_trader.reconciliation import CorporateActionSet, Fill, reconcile
 from crucible_trader.reconciliation_control import ReconciliationVoidError
 from crucible_trader.reconciliation_job import (
+    EXCEPTION_RECORDS_METRIC,
     RECONCILE_JOB,
     ReconciliationDiscrepancyError,
     latest_anchor,
@@ -117,8 +124,10 @@ class TestFailures:
             )
         assert "share_delta: AAA" in str(raised.value) and "delta=-3" in str(raised.value)
         assert "side=broker_under" in str(raised.value)
-        # Outputs are written BEFORE the raise, so the failed manifest carries them.
-        assert len(ctx.outputs) == 2
+        # Outputs are written BEFORE the raise, so the failed manifest carries them:
+        # the statement, the result, and the break as an exception record (I12892).
+        assert [o["key"] for o in ctx.outputs][2] == exceptions_key(DAY.isoformat())
+        assert len(ctx.outputs) == 3
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)
         assert {m["status"] for m in ctx.metrics} == {"FAIL", "OK"}
@@ -296,3 +305,149 @@ class TestThePhase4GateGradesThisReconciliation:
         clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
         assert not clause.met
         assert "run_mode `replay`" in clause.detail
+
+
+class TestExceptionRecords:
+    """Step 5b (`alpha-engine-config-I12892` phase 0): every break is filed as an
+    `exception.v1` record beside the page, and the page is exactly what it was."""
+
+    def _discrepant(self, store, ctx, **kw):
+        put_anchor(store)
+        with pytest.raises(ReconciliationDiscrepancyError) as raised:
+            reconcile_cycle(
+                ctx,
+                source=FixedSource({"AAA": 9}, 800.0),
+                fills=(Fill("AAA", 2, -200.0),),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                **kw,
+            )
+        return str(raised.value)
+
+    def test_a_break_is_filed_beside_an_unchanged_page(self, store, tmp_path):
+        page = self._discrepant(store, ctx_for(store))
+        day = output(store, exceptions_key(DAY.isoformat()))
+        validate_exception_day_document(day)
+        (record,) = day["records"]
+        assert record["class"] == "share_delta" and record["amount"] == -3.0
+        assert record["detected_by"]["manifest_key"] == f"runs/{RECONCILE_JOB}/2026-09-11/run.json"
+        # The page is byte-identical to the one a run without step 5b raises.
+        other = LocalStore(tmp_path / "other")
+        ctx = ctx_for(other)
+        ctx.store = _NoExceptionWrites(other)
+        assert self._discrepant(other, ctx) == page
+
+    def test_a_clean_cycle_files_nothing_and_adds_no_metric(self, store):
+        put_anchor(store)
+        ctx, _ = cycle(store, FixedSource({"AAA": 12}, 800.0))
+        assert not store.exists(exceptions_key(DAY.isoformat()))
+        assert EXCEPTION_RECORDS_METRIC not in {m["name"] for m in ctx.metrics}
+
+    def test_the_metric_counts_what_was_filed(self, store):
+        ctx = ctx_for(store)
+        self._discrepant(store, ctx)
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_RECORDS_METRIC]
+        MetricRecordRow.model_validate(metric)
+        assert metric["status"] == "OK" and metric["value"] == 1.0
+
+    def test_a_failed_write_never_masks_the_page(self, store):
+        ctx = ctx_for(store)
+        ctx.store = _NoExceptionWrites(store)
+        page = self._discrepant(store, ctx)
+        assert "share_delta: AAA" in page and "delta=-3" in page
+        assert not store.exists(exceptions_key(DAY.isoformat()))
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_RECORDS_METRIC]
+        MetricRecordRow.model_validate(metric)
+        assert metric["status"] == "FAIL" and metric["value"] is None
+        assert (
+            "NOT filed" in metric["status_reason"] and "PermissionError" in metric["status_reason"]
+        )
+
+    def test_a_void_run_files_the_void_first(self, store):
+        put_anchor(store)
+        ctx = ctx_for(store)
+
+        def blind(inputs):
+            import dataclasses
+
+            return dataclasses.replace(reconcile(inputs), discrepancies=())
+
+        with pytest.raises(ReconciliationVoidError):
+            reconcile_cycle(
+                ctx,
+                source=FixedSource({"AAA": 99}, 0.0),
+                fills=(),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                reconciler=blind,
+            )
+        (record,) = output(store, exceptions_key(DAY.isoformat()))["records"]
+        assert record["class"] == CONTROL_ARM_VOID and record["detected_by"]["void"] is True
+
+    def test_order_intent_breaks_join_the_same_day_file(self, store):
+        put_anchor(store)
+        ctx = ctx_for(store)
+        orphan = BrokerOrder(
+            order_ref="crucible-trader|2026-09-11|ZZZ|buy|1|1.0|t", status="Filled"
+        )
+        reconcile_cycle(
+            ctx,
+            source=FixedSource({"AAA": 12}, 800.0),
+            fills=(Fill("AAA", 2, -200.0),),
+            cash_flows=(),
+            corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+            order_records=([orphan], list[BrokerExecution]()),
+        )
+        (record,) = output(store, exceptions_key(DAY.isoformat()))["records"]
+        assert record["class"] == "orphan" and record["instrument"] == "ZZZ"
+
+    def test_a_raising_intent_step_still_files_the_broker_breaks(self, store, monkeypatch):
+        import crucible_trader.reconciliation_job as job
+
+        def boom(*_a, **_k):
+            raise RuntimeError("unreadable intent")
+
+        monkeypatch.setattr(job, "intents_for_day", boom)
+        put_anchor(store)
+        with pytest.raises(RuntimeError, match="unreadable intent"):
+            reconcile_cycle(
+                ctx_for(store),
+                source=FixedSource({"AAA": 9}, 800.0),
+                fills=(Fill("AAA", 2, -200.0),),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                order_records=([], []),
+            )
+        (record,) = output(store, exceptions_key(DAY.isoformat()))["records"]
+        assert record["class"] == "share_delta"
+
+    def test_a_failed_manifest_carries_the_record_and_still_validates(self, store):
+        put_anchor(store)
+        with pytest.raises(ReconciliationDiscrepancyError):
+            run_reconciliation(
+                store,
+                FixedSource({"AAA": 13}, 800.0),
+                trading_day=DAY,
+                fills=(Fill("AAA", 2, -200.0),),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                run_mode="replay",
+            )
+        manifest = read_manifest(store, RECONCILE_JOB, DAY.isoformat())  # validates on read
+        assert manifest["status"] == "failed" and "share_delta: AAA" in manifest["reason"]
+        assert exceptions_key(DAY.isoformat()) in {o["key"] for o in manifest["outputs"]}
+
+
+class _NoExceptionWrites:
+    """The store, except that writing an exception record fails."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def put_bytes(self, key, payload):
+        if key.startswith("trader/exceptions/"):
+            raise PermissionError("denied")
+        return self._inner.put_bytes(key, payload)
