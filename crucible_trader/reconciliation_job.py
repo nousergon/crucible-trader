@@ -14,6 +14,10 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    (:func:`crucible_trader.reconciliation_control.run_control_arm`);
 5. write today's statement (tomorrow's anchor) and the reconciliation result as
    outputs, and one MetricRecord per headline number;
+5a. when the caller hands it the broker's order records, reconcile the day's
+   durable order intents against them
+   (:mod:`crucible_trader.order_intent_reconciliation`) and write that document
+   as an output with its own MetricRecord (see :func:`reconcile_intents_step`);
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding exists. Either makes
    the manifest `status: failed`, which is the page condition (§4.6), and the
@@ -50,6 +54,17 @@ from crucible_trader.dividend_entitlements import (
     load_declared_entitlements,
     owed_dividends,
 )
+from crucible_trader.order_intent_reconciliation import (
+    RECONCILIATION_SCHEMA_VERSION as INTENT_RECONCILIATION_SCHEMA_VERSION,
+)
+from crucible_trader.order_intent_reconciliation import (
+    BrokerExecution,
+    BrokerOrder,
+    intents_for_day,
+    order_intent_reconciliation_key,
+    reconcile_order_intents,
+)
+from crucible_trader.order_router import ORDER_REF_PREFIX
 from crucible_trader.reconciliation import (
     RECONCILIATION_SCHEMA_VERSION,
     CashFlow,
@@ -139,11 +154,15 @@ def reconcile_cycle(
     corporate_actions: CorporateActionSet | CorporateActionProvider,
     genesis: bool = False,
     reconciler: Reconciler = reconcile,
+    order_records: tuple[Sequence[BrokerOrder], Sequence[BrokerExecution]] | None = None,
 ) -> ReconciliationResult:
     """The job body. See the module docstring for the order and the raises.
 
     ``corporate_actions`` is either the day's set, or a
     :data:`CorporateActionProvider` asked for it once the statements are read.
+    ``order_records`` is the broker's orders and executions
+    (:func:`~crucible_trader.order_intent_reconciliation.broker_records_from_client`);
+    when given, step 5a runs.
     """
     day = ctx.trading_day.isoformat()
     broker = source.read_statement(day)
@@ -203,12 +222,80 @@ def reconcile_cycle(
         result, verdict, now=now, source_path=trader_reconciliation_key(day)
     ):
         ctx.record_metric(metric)
+    if order_records is not None:
+        orders, executions = order_records
+        reconcile_intents_step(ctx, orders=orders, executions=executions)
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())
     if not result.clean:
         raise ReconciliationDiscrepancyError(page_text(result))
     return result
+
+
+def reconcile_intents_step(
+    ctx: RunContext,
+    *,
+    orders: Sequence[BrokerOrder],
+    executions: Sequence[BrokerExecution],
+) -> None:
+    """Step 5a: the day's durable order intents against the broker. Read-only.
+
+    `alpha-engine-config-I12558` (audit FIN-03): the intent reconciler had no
+    production caller, so an intent whose submit was lost was discoverable by
+    nobody. This step reads every intent for the run's trading day, classifies
+    it against the broker's own records, and files the
+    ``order_intent_reconciliation`` document at
+    :func:`~crucible_trader.order_intent_reconciliation.order_intent_reconciliation_key`
+    plus one MetricRecord, ``order_intent_reconciliation_breaks``, whose status
+    is FAIL while any intent is in a break class. Every row carries its class
+    and age.
+
+    It places, cancels and re-sends nothing: what to do about an ``unknown``
+    intent stays a human decision. It does not change this job's manifest
+    status either -- a break is reported in the document and the metric, and
+    whether it should page (fail the run, which the cutover gate reads) is a
+    separate ruling. An intent that cannot be read DOES raise, because a
+    reconciliation that skipped it would report clean over it.
+    """
+    day = ctx.trading_day.isoformat()
+    now = dt.datetime.now(dt.UTC)
+    document = reconcile_order_intents(
+        trading_day=day,
+        intents=intents_for_day(ctx.store, day),
+        orders=orders,
+        executions=executions,
+        key_prefix=ORDER_REF_PREFIX,
+        now=now,
+    )
+    key = order_intent_reconciliation_key(day)
+    ctx.record_output(
+        key,
+        json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+        INTENT_RECONCILIATION_SCHEMA_VERSION,
+    )
+    breaks = document["breaks"]
+    by_key = {row["order_key"]: row for row in document["rows"]}
+    ctx.record_metric(
+        {
+            "name": "order_intent_reconciliation_breaks",
+            "module": "crucible_trader.order_intent_reconciliation",
+            "metric_type": "operational",
+            "value": float(len(breaks)),
+            "unit": "count",
+            "n_floor": 0,
+            "status": "OK" if document["clean"] else "FAIL",
+            "status_reason": (
+                f"{document['intents']} intents on {day}, every one terminal or working "
+                "at the broker and none overfilled, mismatched or corrupt"
+                if document["clean"]
+                else f"{len(breaks)} order-intent breaks on {day}: "
+                + " | ".join(f"{k} {by_key[k]['class']}" for k in breaks)
+            ),
+            "source_path": key,
+            "last_updated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    )
 
 
 def page_text(result: ReconciliationResult) -> str:

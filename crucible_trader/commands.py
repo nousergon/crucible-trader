@@ -62,6 +62,7 @@ from crucible_trader.kill_switch import (
     release,
     utcnow,
 )
+from crucible_trader.order_intent_reconciliation import broker_records_from_client
 from crucible_trader.paper_smoke import open_configured_store
 from crucible_trader.reconcile_entrypoint import (
     fills_from_ib,
@@ -217,6 +218,7 @@ def main(
                 cash_flows=(),
                 corporate_actions=live_corporate_action_source(),
                 genesis=args.genesis,
+                order_records=broker_records_from_client(client),
             )
         if address is None:
             return release(ctx, cause=args.cause, clock=clock)
