@@ -19,6 +19,8 @@ from crucible_trader.commands import main
 from crucible_trader.drill_schedule import NONCE_ENV_VAR
 from crucible_trader.fire_drill import FIRE_DRILL_JOB, fire_drill_key
 from crucible_trader.kill_switch import KILL_SWITCH_JOB, kill_switch_event_key, read_state
+from crucible_trader.order_intent import claim_order_intent, order_intent_document
+from crucible_trader.order_intent_reconciliation import order_intent_reconciliation_key
 from crucible_trader.reconciliation_job import RECONCILE_JOB, ReconciliationDiscrepancyError
 
 
@@ -348,7 +350,8 @@ class TestReconcileCommand:
             environ_extra={"CRUCIBLE_TRADER_IB_MASTER_CLIENT_ID": "42"},
         )
         assert rc == 0
-        assert ib.executions_requested == 1
+        # Once for the fills, once for the order-intent reconciliation (I12558).
+        assert ib.executions_requested == 2
         assert ib.connected_with["clientId"] == 42
         assert ib.connected_with["readonly"] is True
 
@@ -393,6 +396,79 @@ class TestReconcileCommand:
         store = LocalStore(tmp_path)
         keys = [k for k in store.list_keys(f"runs/{RECONCILE_JOB}/") if k.endswith("/run.json")]
         assert len(keys) == 1 and f"runs/{RECONCILE_JOB}/{DAY.isoformat()}/run.json" == keys[0]
+
+
+class TestReconcileCommandOrderIntents:
+    """`alpha-engine-config-I12558` (audit FIN-03/04): the daily reconcile is
+    now the production caller of the intent reconciler. Planted through the
+    real command, the real runner and the fake broker's own read surface."""
+
+    REF = f"crucible-trader|{DAY.isoformat()}|AAA|buy|4|10.0|2026-09-08T13:30:00.000000Z"
+
+    def _claim(self, store, qty: int = 4) -> None:
+        claim_order_intent(
+            store,
+            order_intent_document(
+                order_key=f"crucible-trader|{DAY.isoformat()}|AAA",
+                order_ref=self.REF,
+                trading_day=DAY.isoformat(),
+                symbol="AAA",
+                side="buy",
+                quantity=qty,
+                decision_price=10.0,
+                account="DU1",
+                intended_at=T0,
+            ),
+        )
+
+    def _run(self, tmp_path, monkeypatch, shares: float) -> tuple[dict, dict]:
+        monkeypatch.setattr(commands, "run_job", _real_run_job_on_day)
+        store = LocalStore(tmp_path)
+        self._claim(store)
+        fills = (
+            ()
+            if shares == 0
+            else (
+                broker_fill(
+                    "AAA",
+                    side="BOT",
+                    shares=shares,
+                    avg_price=10.0,
+                    commission=1.0,
+                    time=T0,
+                    order_ref=self.REF,
+                ),
+            )
+        )
+        ib = FakeIB(positions={"AAA": int(shares)} if shares else {}, broker_fills=fills)
+        rc, _ = _main(tmp_path, ["reconcile", "run", "--genesis"], ib=ib)
+        assert rc == 0 and ib.order_calls == [] and ib.cancel_calls == 0
+        manifest = _only_manifest(store, RECONCILE_JOB)
+        document = json.loads(store.get_bytes(order_intent_reconciliation_key(DAY.isoformat())))
+        assert order_intent_reconciliation_key(DAY.isoformat()) in {
+            o["key"] for o in manifest["outputs"]
+        }
+        (metric,) = [
+            m for m in manifest["metrics"] if m["name"] == "order_intent_reconciliation_breaks"
+        ]
+        return document, metric
+
+    def test_an_exact_fill_is_clean(self, tmp_path, monkeypatch) -> None:
+        document, metric = self._run(tmp_path, monkeypatch, shares=4)
+        assert document["clean"] is True and document["rows"][0]["class"] == "filled"
+        assert metric["status"] == "OK" and metric["value"] == 0.0
+
+    def test_an_overfill_is_a_visible_break(self, tmp_path, monkeypatch) -> None:
+        document, metric = self._run(tmp_path, monkeypatch, shares=8)
+        assert document["rows"][0]["class"] == "overfilled" and document["clean"] is False
+        assert metric["status"] == "FAIL" and metric["value"] == 1.0
+        assert "overfilled" in metric["status_reason"]
+
+    def test_a_lost_submit_is_unknown_and_aged_never_resent(self, tmp_path, monkeypatch) -> None:
+        document, metric = self._run(tmp_path, monkeypatch, shares=0)
+        (row,) = document["rows"]
+        assert row["class"] == "unknown" and "age_hours" in row
+        assert metric["status"] == "FAIL"
 
 
 def test_a_drill_reads_its_nonce_from_the_process_environment_by_default(

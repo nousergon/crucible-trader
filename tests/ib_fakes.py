@@ -45,6 +45,8 @@ def broker_fill(
     client_id: int = 7,
     exec_id: str | None = None,
     price: float | None = None,
+    order_ref: str = "",
+    account: str = "DU1",
 ) -> SimpleNamespace:
     """An `ib_async.Fill`-shaped record as the session's fill store holds it:
     `reconcile_entrypoint.fills_from_ib` reads exactly this subset
@@ -69,6 +71,8 @@ def broker_fill(
             price=avg_price if price is None else price,
             avgPrice=avg_price,
             clientId=client_id,
+            orderRef=order_ref,
+            acctNumber=account,
         ),
         commissionReport=report,
     )
@@ -160,6 +164,12 @@ class FakeIB:
 
     def trades(self):
         return list(self._trades)
+
+    def reqAllOpenOrders(self):  # noqa: N802 - SDK spelling
+        return self.openTrades()
+
+    def reqCompletedOrders(self, apiOnly):  # noqa: N802, N803 - SDK spelling
+        return [t for t in self._trades if t not in self.openTrades()]
 
     # order-capable calls
     def reqGlobalCancel(self):  # noqa: N802 - SDK spelling
