@@ -569,7 +569,15 @@ def test_the_order_ref_round_trips_the_sizing_decision() -> None:
 # -- caps and refusals (the plan, before any order) -------------------------------------
 
 
-def _plan(book, *, positions=None, quote=None, order_cap=50_000.0, session_cap=100_000.0):
+def _plan(
+    book,
+    *,
+    positions=None,
+    quote=None,
+    order_cap=50_000.0,
+    session_cap=100_000.0,
+    inherited=frozenset(),
+):
     return plan_orders(
         book,
         positions=positions or {},
@@ -577,6 +585,7 @@ def _plan(book, *, positions=None, quote=None, order_cap=50_000.0, session_cap=1
         clock=FakeClock(),
         max_order_notional_usd=order_cap,
         max_session_notional_usd=session_cap,
+        inherited=inherited,
     )
 
 
@@ -602,6 +611,44 @@ def test_a_position_the_book_does_not_know_is_never_traded() -> None:
         _plan(_book(), positions={"ZZZ": 10})
     with pytest.raises(ForeignPositionError, match="SPY"):  # a sentinel is not tradable
         _plan(_book(), positions={"SPY": 10})
+
+
+def test_an_inherited_name_the_book_lacks_is_sold_whole() -> None:
+    sells, buys = _plan(
+        _book(),
+        positions={"ZZZ": 10, "SPY": 3},
+        quote={**PRICES, "ZZZ": 40.0, "SPY": 500.0}.get,
+        inherited=frozenset({"ZZZ", "SPY"}),
+    )
+    sold = {o.decision.symbol: o.decision.quantity for o in sells}
+    assert sold == {"ZZZ": 10, "SPY": 3}
+    assert {o.decision.symbol for o in buys} == {"AAA", "BBB"}
+
+
+def test_an_inherited_name_the_book_holds_is_sized_by_the_book() -> None:
+    sells, buys = _plan(_book(), positions={"AAA": 400}, inherited=frozenset({"AAA"}))
+    assert [(o.decision.symbol, o.decision.quantity) for o in sells] == [("AAA", 100)]
+    assert {o.decision.symbol for o in buys} == {"BBB"}
+
+
+def test_an_undeclared_foreign_name_is_still_refused_beside_an_inherited_one() -> None:
+    with pytest.raises(ForeignPositionError, match="QQQ"):
+        _plan(
+            _book(),
+            positions={"ZZZ": 10, "QQQ": 1},
+            quote={**PRICES, "ZZZ": 40.0}.get,
+            inherited=frozenset({"ZZZ"}),
+        )
+
+
+def test_inherited_sells_count_against_the_caps() -> None:
+    with pytest.raises(RiskCapExceededError, match="ZZZ"):
+        _plan(
+            _book(),
+            positions={"ZZZ": 1_000},
+            quote={**PRICES, "ZZZ": 100.0}.get,
+            inherited=frozenset({"ZZZ"}),
+        )
 
 
 def test_a_short_target_is_refused() -> None:
