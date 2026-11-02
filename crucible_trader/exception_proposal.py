@@ -12,7 +12,7 @@ A proposal names:
 * ``nature`` -- one of :data:`NATURES`:
 
   - ``event``: the books are right and the world moved (a split the broker has
-    not applied yet, a partial fill the broker closed, a cent of rounding);
+    not applied yet, a partial fill the broker closed);
   - ``defect``: something in our own pipeline or at the broker is wrong and has
     to be fixed at its cause;
   - ``detector``: the check itself could not be trusted that day (a void
@@ -66,7 +66,6 @@ __all__ = [
     "NATURES",
     "PROPOSAL_SCHEMA_VERSION",
     "PROPOSER",
-    "ROUNDING_ADJUSTMENT_MAX_USD",
     "RULESET_VERSION",
     "Proposal",
     "main",
@@ -79,14 +78,13 @@ PROPOSAL_SCHEMA_VERSION = "exception_proposal.v1"
 
 #: Bumped whenever any rule below changes what it proposes. A new version is a
 #: new proposal id, so agreement earned under old rules never carries over.
-RULESET_VERSION = "deterministic.2026-11-02"
+RULESET_VERSION = "deterministic.2026-11-02b"
 
 PROPOSER = "crucible-trader.exception_proposal"
 
 NATURES: tuple[str, ...] = ("event", "defect", "detector")
 
 ACTIONS: tuple[str, ...] = (
-    "post_rounding_adjustment",
     "await_broker_corporate_action",
     "book_corporate_action_manually",
     "accept_partial_fill",
@@ -98,14 +96,6 @@ ACTIONS: tuple[str, ...] = (
     "refresh_anchor",
     "investigate_detector",
 )
-
-#: A cash break this small is rounding between our six-decimal commissions and
-#: the broker's cent-rounded cash, and is booked to the broker's figure
-#: (crucible-trader#66: "small cent gaps round to IB"). Anything larger is a
-#: defect until explained. The detector already absorbs gaps up to its own
-#: band (`reconciliation.CASH_TOLERANCE_USD`), so what reaches this rule is
-#: above that band.
-ROUNDING_ADJUSTMENT_MAX_USD = 1.00
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,31 +113,22 @@ def _fixed(
     return lambda _record: rule
 
 
-def _cash(record: Mapping[str, object]) -> _Rule:
-    amount = record["amount"]
-    if isinstance(amount, int | float) and abs(amount) <= ROUNDING_ADJUSTMENT_MAX_USD:
-        return _Rule(
-            "cash.rounding",
-            "event",
-            "post_rounding_adjustment",
-            f"cash is off by ${abs(amount):.2f}, within ${ROUNDING_ADJUSTMENT_MAX_USD:.2f}: "
-            "rounding against the broker's cent figure; book to the broker",
-        )
-    return _Rule(
-        "cash.unexplained",
-        "defect",
-        "investigate_cash",
-        "cash differs by more than rounding; find the missing or wrong cash entry",
-    )
-
-
 _B = SOURCE_BROKER_RECONCILIATION
 _I = SOURCE_ORDER_INTENT_RECONCILIATION
 
 #: One rule per (source, class). Exhaustive over `CLASSES_BY_SOURCE`, asserted
 #: at import: a detector that gains a class without a rule fails loudly here.
 _RULES: Mapping[tuple[str, str], Callable[[Mapping[str, object]], _Rule]] = {
-    (_B, "cash_delta"): _cash,
+    # Every cash break that reaches a record is above the detector's own
+    # rounding band (`reconciliation.CASH_TOLERANCE_USD`, 5 cents, recorded as
+    # `cash_rounded_to_broker_usd`; Brian 2026-10-28, crucible-trader#66). So
+    # none is rounding: each is a cash entry to find, never one to absorb.
+    (_B, "cash_delta"): _fixed(
+        "cash.unexplained",
+        "defect",
+        "investigate_cash",
+        "cash differs by more than the 5-cent rounding band; find the missing or wrong cash entry",
+    ),
     (_B, "share_delta"): _fixed(
         "shares.delta",
         "defect",
