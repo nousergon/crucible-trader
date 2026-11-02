@@ -14,7 +14,6 @@ from crucible_trader.exception_proposal import (
     ACTIONS,
     NATURES,
     PROPOSAL_SCHEMA_VERSION,
-    ROUNDING_ADJUSTMENT_MAX_USD,
     main,
     proposals_from_store,
     propose,
@@ -120,17 +119,12 @@ def test_only_events_are_ever_promotable():
         assert proposal.promotable == (proposal.nature == "event"), proposal
 
 
-def test_small_cash_gap_is_a_rounding_event_and_a_large_one_a_defect():
-    small, large = broker_records(
-        [
-            finding("cash_delta", instrument="USD", delta=-ROUNDING_ADJUSTMENT_MAX_USD),
-            finding("cash_delta", instrument="USD2", delta=-10.0),
-        ]
-    )
-    assert propose(small, proposed_at=LATER).action == "post_rounding_adjustment"
-    assert propose(small, proposed_at=LATER).nature == "event"
-    assert propose(large, proposed_at=LATER).action == "investigate_cash"
-    assert propose(large, proposed_at=LATER).nature == "defect"
+def test_every_cash_break_is_a_defect_because_rounding_never_reaches_a_record():
+    for delta in (-0.06, -1.0, -10.0):
+        (record,) = broker_records([finding("cash_delta", instrument="USD", delta=delta)])
+        proposal = propose(record, proposed_at=LATER)
+        assert proposal.action == "investigate_cash"
+        assert proposal.nature == "defect" and not proposal.promotable
 
 
 def test_a_void_run_holds_every_proposal_and_promotes_nothing():
