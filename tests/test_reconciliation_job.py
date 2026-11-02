@@ -32,6 +32,7 @@ from crucible_trader.reconciliation_job import (
     previous_trading_day,
     reconcile_cycle,
     run_reconciliation,
+    unpaged_cash_usd,
 )
 
 DAY = dt.date(2026, 9, 11)
@@ -451,3 +452,80 @@ class _NoExceptionWrites:
         if key.startswith("trader/exceptions/"):
             raise PermissionError("denied")
         return self._inner.put_bytes(key, payload)
+
+
+class TestCashTiers:
+    """Brian 2026-11-02: up to 5 cents is rounding (no finding); a `cash_delta`
+    up to $1 is filed and queued but does not page; above $1 pages; and the
+    month's unpaged cash pages once it passes the cap."""
+
+    NOV = dt.date(2026, 11, 4)
+
+    def run(self, store, cash, *, positions=None, prior=None):
+        put_anchor(store, day="2026-11-03")
+        for day, document in (prior or {}).items():
+            store.put_bytes(reconciliation_key(day), json.dumps(document).encode())
+        ctx = ctx_for(store, day=self.NOV)
+        result = reconcile_cycle(
+            ctx,
+            source=FixedSource(positions or {"AAA": 12}, cash),
+            fills=(Fill("AAA", 2, -200.0),),
+            cash_flows=(),
+            corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+        )
+        return ctx, result
+
+    def test_a_low_band_gap_is_filed_and_watched_but_does_not_page(self, store):
+        ctx, result = self.run(store, 800.40)
+        assert not result.clean and result.discrepancies[0].klass == "cash_delta"
+        assert exceptions_key(self.NOV.isoformat()) in [o["key"] for o in ctx.outputs]
+        statuses = {m["name"]: m["status"] for m in ctx.metrics}
+        assert statuses["broker_reconciliation_discrepancies"] == "WATCH"
+        assert statuses["broker_reconciliation_unpaged_cash_mtd_usd"] == "OK"
+        unpaged = next(
+            m for m in ctx.metrics if m["name"] == "broker_reconciliation_unpaged_cash_mtd_usd"
+        )
+        assert unpaged["value"] == pytest.approx(0.40)
+        for metric in ctx.metrics:
+            MetricRecordRow.model_validate(metric)
+
+    def test_exactly_one_dollar_does_not_page_and_a_cent_more_does(self, store, tmp_path):
+        self.run(store, 801.00)
+        with pytest.raises(ReconciliationDiscrepancyError, match="no-page band"):
+            self.run(LocalStore(tmp_path / "other"), 801.01)
+
+    def test_a_low_band_gap_beside_any_other_finding_pages(self, store):
+        with pytest.raises(ReconciliationDiscrepancyError, match="share_delta: AAA"):
+            self.run(store, 800.40, positions={"AAA": 11})
+
+    def test_the_monthly_cap_pages_on_many_small_gaps(self, store):
+        prior = {
+            "2026-11-02": {"cash_rounded_to_broker_usd": -0.05, "discrepancies": []},
+            "2026-11-03": {
+                "cash_rounded_to_broker_usd": None,
+                "discrepancies": [{"klass": "cash_delta", "delta": -0.90}] * 5,
+            },
+            # Another month never counts toward November's cap.
+            "2026-10-30": {
+                "cash_rounded_to_broker_usd": 0.0,
+                "discrepancies": [{"klass": "cash_delta", "delta": 0.99}] * 9,
+            },
+        }
+        with pytest.raises(ReconciliationDiscrepancyError, match=r"5\.05 USD, over the 5\.00"):
+            self.run(store, 800.50, prior=prior)
+
+    def test_unpaged_cash_reads_stored_results_defensively(self):
+        assert unpaged_cash_usd({}) == 0.0
+        assert unpaged_cash_usd(
+            {
+                "cash_rounded_to_broker_usd": 0.03,
+                "discrepancies": [
+                    {"klass": "cash_delta", "delta": -0.5},
+                    {"klass": "cash_delta", "delta": 4.0},
+                    {"klass": "cash_delta", "delta": None},
+                    {"klass": "share_delta", "delta": -0.5},
+                    "not a mapping",
+                ],
+            }
+        ) == pytest.approx(0.53)
+        assert unpaged_cash_usd({"discrepancies": "not a list"}) == 0.0
