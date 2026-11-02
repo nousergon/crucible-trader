@@ -23,9 +23,21 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    phase 0) -- best effort, and never a change to what step 6 decides or pages
    (see :func:`file_exception_records`);
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
-   :class:`ReconciliationDiscrepancyError` when any finding exists. Either makes
-   the manifest `status: failed`, which is the page condition (§4.6), and the
-   reason names every finding's instrument, delta and side.
+   :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
+   :func:`paging_decision`). Either makes the manifest `status: failed`, which
+   is the page condition (§4.6), and the reason names every finding's
+   instrument, delta and side.
+
+**Cash tiers** (Brian, 2026-11-02, AI House thread; extends the 5-cent band of
+crucible-trader#66). A cash gap of 5 cents or less never becomes a finding: the
+reconciler rounds to IB and records it as `cash_rounded_to_broker_usd`. A
+`cash_delta` finding of at most :data:`CASH_PAGE_THRESHOLD_USD` is still a
+finding -- written to the result, filed as an `exception.v1` record, `clean` is
+false and every metric row says `WATCH` -- but on its own it does not page.
+Anything larger pages, as does any other class of finding, and so does the
+month's running total of unpaged cash (rounding plus low-band gaps, absolute)
+once it passes :data:`MONTHLY_UNPAGED_CASH_CAP_USD`, so many small gaps cannot
+add up unseen.
 
 **Registered in the harness contract** (crucible-PR297): `trader.reconcile` is
 in `crucible.models.JOB_VALUES`, both keys are owned by `crucible.keys`
@@ -37,10 +49,11 @@ OUTPUTS (`alpha-engine-config-I10414`). Nothing here declares a key shape.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from crucible.calendar import is_trading_day
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
@@ -108,6 +121,81 @@ RECONCILIATION_PREFIX = trader_reconciliation_key("2000-01-03").rsplit("/", 1)[0
 #: with the run context, the trading day and the instruments the reconcile will
 #: look at (anchor, broker and fills), after the statements are read.
 CorporateActionProvider = Callable[[RunContext, str, frozenset[str]], CorporateActionSet]
+
+
+#: The largest `cash_delta` (absolute USD) that is filed and queued but does not
+#: page on its own. Above it, a cash gap pages.
+CASH_PAGE_THRESHOLD_USD = 1.00
+
+#: The month-to-date total (absolute USD) of cash the job has NOT paged on --
+#: every `cash_rounded_to_broker_usd` plus every low-band `cash_delta` -- above
+#: which today pages anyway. An estimate set 2026-11-02; Brian may change it.
+MONTHLY_UNPAGED_CASH_CAP_USD = 5.00
+
+
+def _low_band_cash(discrepancy: Mapping[str, object]) -> float | None:
+    """The absolute delta of a `cash_delta` at or under the page threshold, else
+    ``None`` (any other class, a missing delta, or a gap that pages)."""
+    if discrepancy.get("klass") != "cash_delta":
+        return None
+    delta = discrepancy.get("delta")
+    if not isinstance(delta, int | float) or abs(delta) > CASH_PAGE_THRESHOLD_USD:
+        return None
+    return abs(float(delta))
+
+
+def unpaged_cash_usd(document: Mapping[str, object]) -> float:
+    """Cash one stored result did not page on: the absolute rounding absorbed
+    plus every low-band `cash_delta`. A pre-tier result counts the same way, so
+    the cap only ever errs toward paging."""
+    rounded = document.get("cash_rounded_to_broker_usd")
+    total = abs(float(rounded)) if isinstance(rounded, int | float) else 0.0
+    discrepancies = document.get("discrepancies")
+    rows = cast("list[object]", discrepancies) if isinstance(discrepancies, list) else []
+    for d in rows:
+        low = _low_band_cash(cast("Mapping[str, object]", d)) if isinstance(d, Mapping) else None
+        total += low or 0.0
+    return round(total, 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class PagingDecision:
+    """Whether step 6 pages on today's findings, and the month's unpaged cash."""
+
+    pages: bool
+    unpaged_cash_mtd_usd: float
+    reason: str
+
+
+def paging_decision(
+    result: ReconciliationResult, prior_documents: Mapping[str, Mapping[str, object]]
+) -> PagingDecision:
+    """Today pages when any finding is not a low-band `cash_delta`, or when the
+    month's unpaged cash, today included, is over the cap. ``prior_documents``
+    is day -> stored result; only days in today's calendar month count."""
+    month = result.trading_day[:7]
+    mtd = round(
+        sum(unpaged_cash_usd(d) for day, d in prior_documents.items() if day[:7] == month)
+        + unpaged_cash_usd(result.to_document()),
+        2,
+    )
+    paging = [d for d in result.discrepancies if _low_band_cash(d.to_document()) is None]
+    if paging:
+        return PagingDecision(True, mtd, f"{len(paging)} finding(s) above the no-page band")
+    if mtd > MONTHLY_UNPAGED_CASH_CAP_USD:
+        return PagingDecision(
+            True,
+            mtd,
+            f"unpaged cash this month is {mtd:.2f} USD, over the "
+            f"{MONTHLY_UNPAGED_CASH_CAP_USD:.2f} USD cap",
+        )
+    if result.discrepancies:
+        return PagingDecision(
+            False,
+            mtd,
+            f"cash gap within {CASH_PAGE_THRESHOLD_USD:.2f} USD: filed and queued, not paged",
+        )
+    return PagingDecision(False, mtd, "no finding")
 
 
 class ReconciliationDiscrepancyError(RuntimeError):
@@ -230,8 +318,9 @@ def reconcile_cycle(
         rows_in=len(broker.positions) + len(inputs.fills), rows_out=len(result.discrepancies)
     )
     now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    decision = paging_decision(result, documents)
     for metric in metric_records(
-        result, verdict, now=now, source_path=trader_reconciliation_key(day)
+        result, verdict, now=now, source_path=trader_reconciliation_key(day), decision=decision
     ):
         ctx.record_metric(metric)
     intent_document: dict[str, Any] | None = None  # pyright: ignore[reportExplicitAny]  # raw JSON document
@@ -247,8 +336,8 @@ def reconcile_cycle(
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())
-    if not result.clean:
-        raise ReconciliationDiscrepancyError(page_text(result))
+    if decision.pages:
+        raise ReconciliationDiscrepancyError(f"{page_text(result)} [{decision.reason}]")
     return result
 
 
@@ -401,17 +490,23 @@ def page_text(result: ReconciliationResult) -> str:
 
 
 def metric_records(
-    result: ReconciliationResult, verdict: ControlVerdict, *, now: str, source_path: str
-) -> list[dict]:
+    result: ReconciliationResult,
+    verdict: ControlVerdict,
+    *,
+    now: str,
+    source_path: str,
+    decision: PagingDecision,
+) -> list[dict[str, object]]:
     """MetricRecord rows (`crucible.models.MetricRecordRow`). Status comes from
-    the FINDINGS: a 1.000 rate beside any finding is FAIL, and no comparable
-    rows is `N/A-LOW-N`, never OK."""
-    status = "OK" if result.clean else "FAIL"
+    the FINDINGS: a 1.000 rate beside any finding is FAIL (or `WATCH` when the
+    only findings are low-band cash gaps that do not page), and no comparable
+    rows is `N/A-LOW-N`, never OK. ``decision`` is :func:`paging_decision`'s."""
+    status = "OK" if result.clean else ("FAIL" if decision.pages else "WATCH")
     headline = result.discrepancies[0].page_line() if result.discrepancies else None
 
     def row(
         name: str, value: float | None, unit: str, n_floor: int, row_status: str, reason: str
-    ) -> dict:
+    ) -> dict[str, object]:
         return {
             "name": name,
             "module": METRIC_MODULE,
@@ -472,6 +567,15 @@ def metric_records(
             f"broker cash minus expected cash on {result.trading_day}"
             if result.cash_residual_usd is not None
             else "no anchor statement, so there is no expected cash",
+        ),
+        row(
+            "broker_reconciliation_unpaged_cash_mtd_usd",
+            decision.unpaged_cash_mtd_usd,
+            "usd",
+            1,
+            "OK" if decision.unpaged_cash_mtd_usd <= MONTHLY_UNPAGED_CASH_CAP_USD else "FAIL",
+            f"cash not paged on in {result.trading_day[:7]} (rounding plus gaps up to "
+            f"{CASH_PAGE_THRESHOLD_USD:.2f} USD), cap {MONTHLY_UNPAGED_CASH_CAP_USD:.2f} USD",
         ),
         row(
             "broker_reconciliation_control_detected",
