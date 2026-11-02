@@ -91,6 +91,7 @@ from crucible_trader.execution_shortfall import (
     build_shortfall_document,
     decide,
 )
+from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
 from crucible_trader.order_intent import (
     OrderIntentConflictError,
@@ -356,14 +357,17 @@ def plan_orders(
     clock: Callable[[], dt.datetime],
     max_order_notional_usd: float,
     max_session_notional_usd: float,
+    inherited: frozenset[str] = frozenset(),
 ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...]]:
     """(sells, buys) moving ``positions`` to ``book``, or a refusal. Sends nothing.
 
     Target shares are ``floor(weight * book notional / decision price)``; every
-    cap is checked over the whole plan before it is returned.
+    cap is checked over the whole plan before it is returned. A held name in
+    ``inherited`` (`crucible_trader.inherited_positions`) that the book does
+    not contain is planned to zero rather than refused.
     """
     weights = _tradable(book)
-    foreign = sorted(set(positions) - set(weights))
+    foreign = sorted(set(positions) - set(weights) - inherited)
     if foreign:
         raise ForeignPositionError(
             f"the account holds {foreign}, which the book for {book.trading_day} does not "
@@ -379,11 +383,15 @@ def plan_orders(
             f"the book's tradable weights sum to {gross:.6f} > 1: gross exceeds the book notional"
         )
 
+    planned = dict(weights)
+    for symbol in set(positions) - set(weights):
+        planned[symbol] = 0.0  # an inherited name, sold whole
+
     sells: list[PlannedOrder] = []
     buys: list[PlannedOrder] = []
     session_notional = 0.0
-    for symbol in sorted(weights):
-        weight, held = weights[symbol], positions.get(symbol, 0)
+    for symbol in sorted(planned):
+        weight, held = planned[symbol], positions.get(symbol, 0)
         if weight == 0.0 and held == 0:
             continue
         price = quote(symbol)
@@ -563,6 +571,7 @@ class PaperOrderRouter:
             clock=self._clock,
             max_order_notional_usd=self._config.max_order_notional_usd,  # type: ignore[arg-type]
             max_session_notional_usd=self._config.max_session_notional_usd,  # type: ignore[arg-type]
+            inherited=inherited_for(self._day),
         )
         self._planned = sells + buys
         # Sells first, so their proceeds are cash before the buys go out.
