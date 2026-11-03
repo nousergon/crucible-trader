@@ -16,6 +16,7 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement, BrokerStatementError
+from crucible_trader.exception_decision import SCORE_CURRENT_KEY, exception_score_key
 from crucible_trader.exception_proposal import RULESET_VERSION, exception_proposals_key
 from crucible_trader.exception_record import (
     CONTROL_ARM_VOID,
@@ -29,6 +30,7 @@ from crucible_trader.reconciliation_control import ReconciliationVoidError
 from crucible_trader.reconciliation_job import (
     EXCEPTION_PROPOSALS_METRIC,
     EXCEPTION_RECORDS_METRIC,
+    EXCEPTION_SCORE_METRIC,
     RECONCILE_JOB,
     ReconciliationDiscrepancyError,
     latest_anchor,
@@ -97,6 +99,9 @@ class TestCleanCycle:
             # Step 5d (I13128): the ledger's journal and its reconciliation view.
             journal_key("nous-ergon-paper", "2026-09-11"),
             ledger_reconciliation_key("nous-ergon-paper", "2026-09-11"),
+            # Step 5e (I13120): the back office's score, filed on a clean day too.
+            exception_score_key("2026-09-11"),
+            SCORE_CURRENT_KEY,
         ]
         document = output(store, reconciliation_key("2026-09-11"))
         assert document["void"] is False and document["control_arm"]["passed"] is True
@@ -134,12 +139,14 @@ class TestFailures:
         # Outputs are written BEFORE the raise, so the failed manifest carries them:
         # the statement, the result, the break as an exception record (I12892),
         # the shadow proposal for it (I13119), then the ledger's journal and
-        # view (step 5d, I13128).
+        # view (step 5d, I13128), then the back office's score (step 5e, I13120).
         assert [o["key"] for o in ctx.outputs][2:] == [
             exceptions_key(DAY.isoformat()),
             exception_proposals_key(DAY.isoformat()),
             journal_key("nous-ergon-paper", DAY.isoformat()),
             ledger_reconciliation_key("nous-ergon-paper", DAY.isoformat()),
+            exception_score_key(DAY.isoformat()),
+            SCORE_CURRENT_KEY,
         ]
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)
@@ -251,6 +258,8 @@ class TestTheHarnessWritesThisJobsManifest:
             reconciliation_key(DAY.isoformat()),
             journal_key("nous-ergon-paper", DAY.isoformat()),
             ledger_reconciliation_key("nous-ergon-paper", DAY.isoformat()),
+            exception_score_key(DAY.isoformat()),
+            SCORE_CURRENT_KEY,
         }
 
     def test_a_discrepancy_is_a_failed_manifest_that_still_chains(self, store):
@@ -511,13 +520,18 @@ class TestExceptionProposals:
             page = self._discrepant(failing, ctx)
 
         # The page, every output but the proposals file, and every metric but the
-        # proposer's own are byte-for-byte the baseline's.
+        # proposer's own are byte-for-byte the baseline's -- bar step 5e's score,
+        # which counts the proposals and so differs when there are none.
         assert page == base_page
         proposals_key = exception_proposals_key(DAY.isoformat())
-        assert ctx.outputs == [o for o in base_ctx.outputs if o["key"] != proposals_key]
+        derived = {proposals_key, exception_score_key(DAY.isoformat()), SCORE_CURRENT_KEY}
+        assert [o for o in ctx.outputs if o["key"] not in derived] == [
+            o for o in base_ctx.outputs if o["key"] not in derived
+        ]
         assert not failing.exists(proposals_key)
-        others = [m for m in ctx.metrics if m["name"] != EXCEPTION_PROPOSALS_METRIC]
-        assert others == [m for m in base_ctx.metrics if m["name"] != EXCEPTION_PROPOSALS_METRIC]
+        skip = {EXCEPTION_PROPOSALS_METRIC, EXCEPTION_SCORE_METRIC}
+        others = [m for m in ctx.metrics if m["name"] not in skip]
+        assert others == [m for m in base_ctx.metrics if m["name"] not in skip]
         # The failure is logged and reported, never raised.
         assert "were NOT filed" in caplog.text
         (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_PROPOSALS_METRIC]
@@ -671,3 +685,94 @@ class TestCashTiers:
             }
         ) == pytest.approx(0.53)
         assert unpaged_cash_usd({"discrepancies": "not a list"}) == 0.0
+
+
+class TestExceptionScore:
+    """Step 5e (alpha-engine-config-I13120): the back office's score and queue."""
+
+    def test_a_clean_day_files_an_empty_score(self, store):
+        put_anchor(store)
+        ctx, _ = cycle(store, FixedSource({"AAA": 12}, 800.0))
+        document = output(store, exception_score_key(DAY.isoformat()))
+        assert document["auto_apply"] is False
+        assert document["totals"]["proposals"] == 0 and document["queue"] == []
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
+        MetricRecordRow.model_validate(metric)
+        assert metric["status"] == "OK" and metric["value"] == 0.0
+
+    def test_a_break_is_queued_and_a_decision_scores_it(self, store, tmp_path):
+        from crucible_trader.exception_decision import decide, record_decision
+
+        TestExceptionRecords()._discrepant(store, ctx_for(store))
+        document = output(store, exception_score_key(DAY.isoformat()))
+        (item,) = document["queue"]
+        assert item["status"] == "undecided" and item["age_trading_days"] == 0
+        (proposal,) = output(store, exception_proposals_key(DAY.isoformat()))["proposals"]
+        record_decision(
+            store,
+            decide(
+                proposal, verdict="agree", decided_by="brian", decided_at="2026-09-11T22:00:00Z"
+            ),
+        )
+        rerun = LocalStore(tmp_path / "rerun")
+        for key in store.list_keys("trader/"):
+            if key.startswith(("trader/exception_decisions/", "trader/exception_proposals/")):
+                rerun.put_bytes(key, store.get_bytes(key))
+        ctx = ctx_for(rerun)
+        TestExceptionRecords()._discrepant(rerun, ctx)
+        document = output(rerun, exception_score_key(DAY.isoformat()))
+        assert document["queue"] == []
+        assert document["totals"]["agreement"] == 1.0
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
+        assert metric["status"] == "OK" and "agreement 1.0" in metric["status_reason"]
+
+    def test_an_overdue_item_is_watch(self, store):
+        later = dt.date(2026, 9, 18)
+        TestExceptionRecords()._discrepant(store, ctx_for(store))
+        ctx = ctx_for(store, day=later)
+        from crucible_trader.reconciliation_job import file_exception_score
+
+        file_exception_score(ctx, now="2026-09-18T21:00:00Z")
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
+        assert metric["status"] == "WATCH" and "1 overdue" in metric["status_reason"]
+        assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
+        # A re-run of an EARLIER day files its own score and leaves `current` alone.
+        earlier = ctx_for(store)
+        file_exception_score(earlier, now="2026-09-18T22:00:00Z")
+        assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
+        assert [o["key"] for o in earlier.outputs] == [exception_score_key(DAY.isoformat())]
+
+    def test_a_score_failure_leaves_the_reconcile_unchanged(self, store, monkeypatch, caplog):
+        import crucible_trader.reconciliation_job as job
+
+        def boom(*_a, **_k):
+            raise RuntimeError("scorer exploded")
+
+        monkeypatch.setattr(job, "score", boom)
+        ctx = ctx_for(store)
+        with caplog.at_level("WARNING", logger=job.__name__):
+            page = TestExceptionRecords()._discrepant(store, ctx)
+        assert "share_delta: AAA" in page
+        assert not store.exists(exception_score_key(DAY.isoformat()))
+        assert "score for 2026-09-11 was NOT filed" in caplog.text
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
+        MetricRecordRow.model_validate(metric)
+        assert metric["status"] == "FAIL" and metric["value"] is None
+
+    def test_a_failing_metric_write_is_swallowed_too(self, store, monkeypatch, caplog):
+        import crucible_trader.reconciliation_job as job
+
+        ctx = ctx_for(store)
+        record_metric = ctx.record_metric
+
+        def picky(metric):
+            if metric["name"] == EXCEPTION_SCORE_METRIC:
+                raise ValueError("metric store down")
+            record_metric(metric)
+
+        monkeypatch.setattr(ctx, "record_metric", picky)
+        with caplog.at_level("WARNING", logger=job.__name__):
+            page = TestExceptionRecords()._discrepant(store, ctx)
+        assert "share_delta: AAA" in page
+        assert store.exists(exception_score_key(DAY.isoformat()))
+        assert "score metric for 2026-09-11 was NOT recorded" in caplog.text
