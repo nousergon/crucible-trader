@@ -242,6 +242,8 @@ def fills_from_ib(
                 # A buy (sign=+1) pays notional plus commission (cash_usd < 0);
                 # a sell (sign=-1) receives notional minus commission.
                 cash_usd=-sign * notional - commission,
+                commission_usd=commission,
+                exec_id=exec_id,
             )
         )
     return tuple(fills)

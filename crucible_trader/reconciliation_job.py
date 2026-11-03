@@ -28,6 +28,10 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    back office 1b) -- same contract as 5b: any failure is logged and
    swallowed, and never changes what step 6 decides or pages (see
    :func:`file_exception_proposals`);
+5d. book the day into the v2 double-entry ledger, the book of record, and
+   reconcile the LEDGER to the broker (:func:`crucible_trader.ledger.post_daily_ledger`,
+   `alpha-engine-config-I13128`) -- never raises, and never a change to what
+   step 6 decides or pages;
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
    :func:`paging_decision`). Either makes the manifest `status: failed`, which
@@ -93,6 +97,7 @@ from crucible_trader.exception_record import (
     records_from_broker_reconciliation,
     records_from_order_intent_reconciliation,
 )
+from crucible_trader.ledger import post_daily_ledger
 from crucible_trader.order_intent_reconciliation import (
     RECONCILIATION_SCHEMA_VERSION as INTENT_RECONCILIATION_SCHEMA_VERSION,
 )
@@ -350,6 +355,18 @@ def reconcile_cycle(
         # exactly what it would have been without them.
         filed = file_exception_records(ctx, document, intent_document, now=now)
         file_exception_proposals(ctx, filed, now=now)
+        # Step 5d: the ledger is the book of record. Like 5b and 5c it never
+        # raises, so the decision and page below are exactly what they were.
+        post_daily_ledger(
+            ctx,
+            broker=broker,
+            anchor=anchor,
+            fills=inputs.fills,
+            cash_flows=inputs.cash_flows,
+            corporate_actions=corporate_actions,
+            reconciliation=document,
+            now=now,
+        )
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())
