@@ -22,7 +22,7 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    (:mod:`crucible_trader.exception_record`, `alpha-engine-config-I12892`
    phase 0) -- best effort, and never a change to what step 6 decides or pages
    (see :func:`file_exception_records`);
-5c. book the day into the v2 double-entry ledger, the book of record, and
+5d. book the day into the v2 double-entry ledger, the book of record, and
    reconcile the LEDGER to the broker (:func:`crucible_trader.ledger.post_daily_ledger`,
    `alpha-engine-config-I13128`) -- never raises, and never a change to what
    step 6 decides or pages;
@@ -338,7 +338,7 @@ def reconcile_cycle(
         # `file_exception_records` never raises, so the raise (or step 6's
         # page) is exactly what it would have been without it.
         file_exception_records(ctx, document, intent_document, now=now)
-        # Step 5c: the ledger is the book of record. Like 5b it never raises,
+        # Step 5d: the ledger is the book of record. Like 5b it never raises,
         # so the decision and page below are exactly what they were.
         post_daily_ledger(
             ctx,

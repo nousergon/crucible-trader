@@ -9,6 +9,7 @@ import json
 import pathlib
 
 import pytest
+from crucible.keys import trader_broker_statement_key
 from crucible.runner import RunContext
 from crucible.store import LocalStore
 
@@ -27,10 +28,16 @@ from crucible_trader.ledger import (
     Posting,
     book_day,
     entry_from_document,
+    journal_digest,
     journal_key,
     ledger_reconciliation_key,
+    load_journals,
     load_ledger,
+    period_lock_document,
+    period_lock_key,
     post_daily_ledger,
+    read_period_locks,
+    run_checks,
     to_cents,
 )
 from crucible_trader.reconciliation import (
@@ -338,6 +345,11 @@ def ctx_for(store, day):
 
 
 def post(store, broker, anchor, fills=()):
+    # The job writes the day's IB statement (step 5) before the ledger (5d).
+    store.put_bytes(
+        trader_broker_statement_key(broker.trading_day),
+        json.dumps(broker.to_document()).encode(),
+    )
     ctx = ctx_for(store, broker.trading_day)
     result = post_daily_ledger(
         ctx,
@@ -481,3 +493,141 @@ def test_a_metric_that_cannot_be_recorded_does_not_raise(store):
         )
         is None
     )
+
+
+# ------------------------------------------------------------ 1h checks (I13129)
+
+
+def checks_of(store, day):
+    return json.loads(store.get_bytes(ledger_reconciliation_key(T, day)))["checks"]
+
+
+class TestChecks:
+    def test_a_clean_run_rolls_forward_and_is_complete(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        ctx, _ = post(
+            store,
+            stmt(DAY, {"AAA": 12}, 799.0),
+            stmt(PREV, {"AAA": 10}, 1_000.0),
+            (buy("AAA", 2, 100.0, 1.0, "x1"),),
+        )
+        checks = checks_of(store, DAY)
+        assert checks["breaks"] == [] and [m["status"] for m in ctx.metrics] == ["OK"]
+        rolled = checks["roll_forward"]
+        assert rolled["ties"] is True and rolled["activity_lines"] == 4
+        assert rolled["cash_opening_cents"] + rolled["cash_activity_cents"] == 79_900
+        assert checks["completeness"] == {"from": PREV, "through": DAY, "missing": []}
+
+    def test_a_published_view_that_differs_from_the_journals_is_a_break(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        key = ledger_reconciliation_key(T, PREV)
+        view = json.loads(store.get_bytes(key))
+        store.put_bytes(key, json.dumps({**view, "ledger_cash_cents": 1}).encode())
+        ctx, _ = post(store, stmt(DAY, {"AAA": 10}, 1_000.0), stmt(PREV, {"AAA": 10}, 1_000.0))
+        assert [b["check"] for b in checks_of(store, DAY)["breaks"]] == ["rebuild_from_raw"]
+        assert ctx.metrics[0]["status"] == "FAIL"
+
+    def test_a_missing_day_is_a_completeness_break(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(NEXT, {"AAA": 10}, 1_000.0), stmt(PREV, {"AAA": 10}, 1_000.0))
+        checks = checks_of(store, NEXT)
+        assert checks["completeness"]["missing"] == [
+            {"day": DAY, "missing": ["journal", "view", "ib_statement"]}
+        ]
+
+    def test_an_open_gap_ages_and_is_overdue_after_three_trading_days(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        late = "2026-11-09"
+        post(store, stmt(late, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03))
+        checks = checks_of(store, late)
+        assert [(b["day"], b["age"]) for b in checks["open_breaks"]] == [(DAY, 4)]
+        assert "break_aging" in [b["check"] for b in checks["breaks"]]
+
+    def test_an_adjustment_citing_the_gap_clears_it(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        journals = load_journals(store, T, before="2026-11-10")
+        gap = journals[DAY][-1]
+        fix = Entry(
+            T,
+            "DU1",
+            NEXT,
+            "adjustment",
+            "fix/1",
+            (Posting(SUSPENSE_CASH, 3), Posting("income:declared_cash_flows", -3)),
+            {"exception_ids": gap.evidence["exception_ids"], "decision_id": "d1"},
+        )
+        checks = run_checks(
+            store,
+            T,
+            "DU1",
+            day=NEXT,
+            journals={**journals, NEXT: (fix,)},
+            locks={},
+            view={"ledger_cash_cents": 100_003, "ledger_positions": {"AAA": 10}},
+        )
+        assert checks["open_breaks"] == [] and checks["roll_forward"]["ties"] is True
+
+    def test_a_roll_forward_that_does_not_reach_the_published_closing_is_a_break(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        journals = load_journals(store, T, before=DAY)
+        checks = run_checks(
+            store,
+            T,
+            "DU1",
+            day=DAY,
+            journals={**journals, DAY: ()},
+            locks={},
+            view={"ledger_cash_cents": 5, "ledger_positions": {"AAA": 10}},
+        )
+        assert "roll_forward" in [b["check"] for b in checks["breaks"]]
+
+
+class TestPeriodLock:
+    def test_a_closed_month_refuses_new_journals_and_a_changed_one_is_a_break(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        journals = load_journals(store, T, before=DAY)
+        lock = period_lock_document(T, "2026-11", journals)
+        assert lock["journals"] == {PREV: journal_digest(T, PREV, journals[PREV])}
+        store.put_bytes(period_lock_key(T, "2026-11"), json.dumps(lock).encode())
+        assert read_period_locks(store, T) == {"2026-11": lock["journals"]}
+        ctx, refused = post(
+            store, stmt(DAY, {"AAA": 10}, 1_000.0), stmt(PREV, {"AAA": 10}, 1_000.0)
+        )
+        assert refused is None and "is closed" in ctx.metrics[0]["status_reason"]
+        checks = run_checks(
+            store,
+            T,
+            "DU1",
+            day=DAY,
+            journals={**journals, DAY: ()},
+            locks={"2026-11": {PREV: "0" * 64}},
+            view={"ledger_cash_cents": 100_000, "ledger_positions": {"AAA": 10}},
+        )
+        assert [b["check"] for b in checks["breaks"]] == ["period_lock"]
+
+    def test_a_lock_of_another_schema_is_refused(self, store):
+        store.put_bytes(period_lock_key(T, "2026-10"), json.dumps({"schema_version": "x"}).encode())
+        with pytest.raises(LedgerError, match="period lock"):
+            read_period_locks(store, T)
+
+
+def test_a_journal_without_its_view_is_counted_missing_not_rebuilt(store, tmp_path):
+    post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+    journals = load_journals(store, T, before=DAY)
+    bare = LocalStore(tmp_path / "bare")  # the journals, but no published views
+    checks = run_checks(
+        bare,
+        T,
+        "DU1",
+        day=DAY,
+        journals={**journals, DAY: ()},
+        locks={},
+        view={"ledger_cash_cents": 100_000, "ledger_positions": {"AAA": 10}},
+    )
+    assert [b["check"] for b in checks["breaks"]] == ["completeness", "completeness"]
+    assert checks["completeness"]["missing"][0] == {
+        "day": PREV,
+        "missing": ["view", "ib_statement"],
+    }

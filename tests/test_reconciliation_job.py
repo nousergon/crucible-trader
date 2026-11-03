@@ -92,7 +92,7 @@ class TestCleanCycle:
         assert [o["key"] for o in ctx.outputs] == [
             broker_statement_key("2026-09-11"),
             reconciliation_key("2026-09-11"),
-            # Step 5c (I13128): the ledger's journal and its reconciliation view.
+            # Step 5d (I13128): the ledger's journal and its reconciliation view.
             journal_key("nous-ergon-paper", "2026-09-11"),
             ledger_reconciliation_key("nous-ergon-paper", "2026-09-11"),
         ]
@@ -132,7 +132,7 @@ class TestFailures:
         # Outputs are written BEFORE the raise, so the failed manifest carries them:
         # the statement, the result, and the break as an exception record (I12892).
         assert [o["key"] for o in ctx.outputs][2] == exceptions_key(DAY.isoformat())
-        # ... then the ledger's journal and view (step 5c, I13128).
+        # ... then the ledger's journal and view (step 5d, I13128).
         assert len(ctx.outputs) == 5
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)

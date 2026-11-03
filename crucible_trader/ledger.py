@@ -70,9 +70,10 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, cast
 
 from crucible.calendar import is_trading_day  # pyright: ignore[reportMissingTypeStubs]
+from crucible.keys import trader_broker_statement_key  # pyright: ignore[reportMissingTypeStubs]
 from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
     ETAG_ABSENT,
     PointerConflictError,
@@ -622,22 +623,35 @@ def journal_document(tenant: str, trading_day: str, entries: Sequence[Entry]) ->
     return json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
 
 
-def load_ledger(store: Store, tenant: str, *, before: str) -> Ledger:
-    """Replay every stored journal of ``tenant`` dated before ``before``."""
-    ledger = Ledger()
+def load_journals(store: Store, tenant: str, *, before: str) -> dict[str, tuple[Entry, ...]]:
+    """Every stored journal of ``tenant`` dated before ``before``, by day."""
     prefix = f"{LEDGER_JOURNAL_PREFIX}{tenant}/"
     days = sorted(
         k[len(prefix) : -len(".json")]
         for k in store.list_keys(prefix)
         if k.endswith(".json") and k[len(prefix) : -len(".json")] < before
     )
+    journals: dict[str, tuple[Entry, ...]] = {}
     for day in days:
         document = json.loads(store.get_bytes(journal_key(tenant, day)).decode("utf-8"))
         if document.get("schema_version") != LEDGER_SCHEMA_VERSION:
             raise LedgerError(f"journal {day} is {document.get('schema_version')!r}")
-        for raw in document["entries"]:
-            ledger.append(entry_from_document(raw))
+        journals[day] = tuple(entry_from_document(raw) for raw in document["entries"])
+    return journals
+
+
+def ledger_from(journals: Mapping[str, Sequence[Entry]]) -> Ledger:
+    """Replay ``journals`` in day order into a new ledger."""
+    ledger = Ledger()
+    for day in sorted(journals):
+        for entry in journals[day]:
+            ledger.append(entry)
     return ledger
+
+
+def load_ledger(store: Store, tenant: str, *, before: str) -> Ledger:
+    """Replay every stored journal of ``tenant`` dated before ``before``."""
+    return ledger_from(load_journals(store, tenant, before=before))
 
 
 def post_daily_ledger(
@@ -652,14 +666,21 @@ def post_daily_ledger(
     now: str,
     tenant: str = DEFAULT_TENANT,
 ) -> DayPosting | None:
-    """Step 5c of `trader.reconcile`: book the day, reconcile the LEDGER to the
+    """Step 5d of `trader.reconcile`: book the day, reconcile the LEDGER to the
     broker, write the journal (create-only) and the reconciliation view, and
     record one MetricRecord. NEVER raises; returns ``None`` on failure."""
     day = broker.trading_day
     key = None
     try:
         key = journal_key(tenant, day)
-        ledger = load_ledger(ctx.store, tenant, before=day)
+        locks = read_period_locks(ctx.store, tenant)
+        if day[:7] in locks:
+            raise LedgerError(
+                f"{day[:7]} is closed; a late fix is a prior-period adjustment dated in the "
+                "open month"
+            )
+        journals = load_journals(ctx.store, tenant, before=day)
+        ledger = ledger_from(journals)
         posting = book_day(
             ledger,
             DayInputs(
@@ -672,6 +693,16 @@ def post_daily_ledger(
                 reconciliation,
             ),
         )
+        checks = run_checks(
+            ctx.store,
+            tenant,
+            broker.account,
+            day=day,
+            journals={**journals, day: posting.entries},
+            locks=locks,
+            view=posting.document,
+        )
+        posting.document["checks"] = checks
         payload = journal_document(tenant, day, posting.entries)
         try:
             ctx.record_output_cas(key, ETAG_ABSENT, payload, LEDGER_SCHEMA_VERSION)
@@ -698,7 +729,18 @@ def post_daily_ledger(
         )
         return None
     n = len(posting.breaks)
-    if posting.document["clean"]:
+    failed = cast("list[dict[str, object]]", posting.document["checks"]["breaks"])
+    if failed:
+        _metric(
+            ctx,
+            now,
+            view_key,
+            "FAIL",
+            float(len(failed)),
+            f"ledger checks failed on {day}: "
+            + "; ".join(f"{b['check']} {b['detail']}" for b in failed)[:360],
+        )
+    elif posting.document["clean"]:
         _metric(
             ctx, now, view_key, "OK", 0.0, f"ledger ties to the broker on {day}; trial balance 0"
         )
@@ -742,3 +784,200 @@ def _metric(
         )
     except Exception:  # noqa: BLE001, S110 - a metric must not raise into the trader either
         pass
+
+
+# ------------------------------------------------------------ checks (1h)
+# alpha-engine-config-I13129: roll-forward, completeness, rebuild-from-raw,
+# break aging and period lock over the ledger. Each failure is a BREAK in the
+# day's view and turns the ledger metric FAIL; none of them raises.
+
+LEDGER_PERIODS_PREFIX = "trader/ledger/periods/"
+PERIOD_LOCK_SCHEMA_VERSION = "ledger_period_lock.v1"
+
+
+def period_lock_key(tenant: str, month: str) -> str:
+    _require(tenant, f"{month}-01")
+    return f"{LEDGER_PERIODS_PREFIX}{tenant}/{month}.json"
+
+
+def journal_digest(tenant: str, day: str, entries: Sequence[Entry]) -> str:
+    return hashlib.sha256(journal_document(tenant, day, entries)).hexdigest()
+
+
+def period_lock_document(
+    tenant: str, month: str, journals: Mapping[str, Sequence[Entry]]
+) -> dict[str, object]:
+    """What the month-end close (1e) writes to lock ``month``: the digest of
+    every journal in it. A closed month never changes."""
+    return {
+        "schema_version": PERIOD_LOCK_SCHEMA_VERSION,
+        "tenant": tenant,
+        "month": month,
+        "journals": {
+            d: journal_digest(tenant, d, journals[d]) for d in sorted(journals) if d[:7] == month
+        },
+    }
+
+
+def read_period_locks(store: Store, tenant: str) -> dict[str, dict[str, str]]:
+    """Every locked month of ``tenant`` -> its journal digests."""
+    prefix = f"{LEDGER_PERIODS_PREFIX}{tenant}/"
+    locks: dict[str, dict[str, str]] = {}
+    for key in sorted(store.list_keys(prefix)):
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        if document.get("schema_version") != PERIOD_LOCK_SCHEMA_VERSION:
+            raise LedgerError(f"period lock {key} is {document.get('schema_version')!r}")
+        locks[str(document["month"])] = dict(document["journals"])
+    return locks
+
+
+def trading_days_between(first: str, last: str) -> list[str]:
+    """Trading days from ``first`` to ``last``, both included."""
+    days: list[str] = []
+    current, end = dt.date.fromisoformat(first), dt.date.fromisoformat(last)
+    while current <= end:
+        if is_trading_day(current):
+            days.append(current.isoformat())
+        current += dt.timedelta(days=1)
+    return days
+
+
+def roll_forward(
+    opening: Ledger,
+    entries: Sequence[Entry],
+    tenant: str,
+    account: str,
+    *,
+    closing_cash_cents: object,
+    closing_positions: object,
+) -> dict[str, object]:
+    """Opening + activity = the PUBLISHED closing, for cash and per position,
+    with every activity line traced to its entry id."""
+    lines = [
+        (e.entry_id, p)
+        for e in entries
+        if e.tenant == tenant and e.account == account
+        for p in e.postings
+    ]
+    cash_open = opening.cents(tenant, account, CASH)
+    cash_activity = sum(p.amount_cents for _, p in lines if p.account == CASH)
+    shares = dict(opening.positions(tenant, account))
+    for _, p in lines:
+        if p.account.startswith(SECURITIES) and p.quantity is not None:
+            ticker = p.account[len(SECURITIES) :]
+            shares[ticker] = shares.get(ticker, 0) + p.quantity
+    rolled = {t: q for t, q in sorted(shares.items()) if q}
+    return {
+        "cash_opening_cents": cash_open,
+        "cash_activity_cents": cash_activity,
+        "cash_closing_cents": closing_cash_cents,
+        "activity_lines": len(lines),
+        "traced_entries": sorted({entry_id for entry_id, _ in lines}),
+        "ties": cash_open + cash_activity == closing_cash_cents and rolled == closing_positions,
+    }
+
+
+def run_checks(
+    store: Store,
+    tenant: str,
+    account: str,
+    *,
+    day: str,
+    journals: Mapping[str, Sequence[Entry]],
+    locks: Mapping[str, Mapping[str, str]],
+    view: Mapping[str, object],
+) -> dict[str, object]:
+    """The 1h checks for ``day`` (whose entries are already in ``journals``)."""
+    breaks: list[dict[str, object]] = []
+    days = sorted(journals)
+    month_start = f"{day[:7]}-01"
+
+    # Roll-forward, today, and rebuild-from-raw: each earlier day of the open
+    # month rebuilt from its journals must equal the view published for it.
+    replay = Ledger()
+    rolled: dict[str, object] = {}
+    for d in days:
+        if d == day:
+            rolled = roll_forward(
+                replay,
+                journals[d],
+                tenant,
+                account,
+                closing_cash_cents=view.get("ledger_cash_cents"),
+                closing_positions=view.get("ledger_positions"),
+            )
+            if not rolled["ties"]:
+                breaks.append({"check": "roll_forward", "day": d, "detail": "does not tie"})
+        for entry in journals[d]:
+            replay.append(entry)
+        if month_start <= d < day:
+            key = ledger_reconciliation_key(tenant, d)
+            if not store.exists(key):
+                continue  # a missing view is counted by completeness below
+            stored = json.loads(store.get_bytes(key).decode("utf-8"))
+            rebuilt = {
+                "ledger_cash_cents": replay.cents(tenant, account, CASH),
+                "ledger_positions": dict(sorted(replay.positions(tenant, account).items())),
+                "trial_balance_cents": replay.trial_balance(),
+            }
+            published = {k: stored.get(k) for k in rebuilt}
+            if stored.get("account") == account and published != rebuilt:
+                breaks.append(
+                    {"check": "rebuild_from_raw", "day": d, "detail": "view differs from journals"}
+                )
+
+    # Completeness: from the open month's start (or the first journal), every
+    # trading day has a journal, a published view and an IB statement.
+    first = max(month_start, days[0]) if days else day
+    missing: list[dict[str, object]] = []
+    for d in trading_days_between(first, day):
+        lacking = [
+            name
+            for name, present in (
+                ("journal", d in journals),
+                ("view", d == day or store.exists(ledger_reconciliation_key(tenant, d))),
+                ("ib_statement", store.exists(trader_broker_statement_key(d))),
+            )
+            if not present
+        ]
+        if lacking:
+            missing.append({"day": d, "missing": lacking})
+            breaks.append({"check": "completeness", "day": d, "detail": f"missing {lacking}"})
+
+    # Break aging: every gap not cleared by an adjustment citing it, oldest
+    # first; older than GAP_EXPIRY_TRADING_DAYS trading days is overdue.
+    cleared = {
+        str(i)
+        for d in days
+        for e in journals[d]
+        if e.kind == "adjustment"
+        for i in cast("list[object]", e.evidence.get("exception_ids") or [])
+    }
+    open_breaks: list[dict[str, object]] = []
+    for d in days:
+        for e in journals[d]:
+            if e.kind not in ("cash_gap", "position_gap") or e.account != account:
+                continue
+            ids = [str(i) for i in cast("list[object]", e.evidence.get("exception_ids") or [])]
+            if cleared.intersection(ids):
+                continue
+            age = len(trading_days_between(d, day)) - 1
+            open_breaks.append({"day": d, "entry_id": e.entry_id, "kind": e.kind, "age": age})
+            if age > GAP_EXPIRY_TRADING_DAYS:
+                breaks.append(
+                    {"check": "break_aging", "day": d, "detail": f"{e.kind} open {age} days"}
+                )
+
+    # Period lock: a closed month's journals still hash to what was locked.
+    for month, digests in sorted(locks.items()):
+        current = {d: journal_digest(tenant, d, journals[d]) for d in days if d[:7] == month}
+        if current != dict(digests):
+            breaks.append({"check": "period_lock", "day": month, "detail": "closed month changed"})
+
+    return {
+        "roll_forward": rolled,
+        "completeness": {"from": first, "through": day, "missing": missing},
+        "open_breaks": sorted(open_breaks, key=lambda b: (b["day"], b["entry_id"])),
+        "locked_months": sorted(locks),
+        "breaks": breaks,
+    }
