@@ -182,7 +182,12 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
         expected: float | None = None,
         actual: float | None = None,
         document_key: str = view_key,
+        ref: str | None = None,
     ) -> None:
+        # ``ref`` tells apart lines that share a class and instrument -- two
+        # failed checks of one name on different days, or the three missing
+        # inputs -- which would otherwise share one exception id, and so one
+        # proposal and one decision (alpha-engine-config-I13121).
         records.append(
             ExceptionRecord(
                 source=SOURCE_MONTH_END_CLOSE,
@@ -200,7 +205,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                 document_key=document_key,
                 void=False,
                 detected_at=inputs.detected_at,
-                identity=(account, month, instrument),
+                identity=(account, month, instrument, *((ref,) if ref is not None else ())),
                 tenant=tenant,
             )
         )
@@ -268,6 +273,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             "close_input_missing",
             None,
             f"no ledger journal for {missing_days}",
+            ref="journals",
         )
     statement = inputs.statement
     if statement is None or statement.account != account:
@@ -276,10 +282,11 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             None,
             f"no IB statement for {account} on {last_day}",
             document_key=statement_key,
+            ref="statement",
         )
         statement = None
     if inputs.view is None:
-        unexplained("close_input_missing", None, f"no ledger view for {last_day}")
+        unexplained("close_input_missing", None, f"no ledger view for {last_day}", ref="view")
     else:
         for b in _breaks(inputs.view):
             if b.get("check") == "break_aging":
@@ -293,6 +300,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                 klass,
                 str(b.get("check")),
                 f"ledger check {b.get('check')} on {b.get('day')}: {b.get('detail')}",
+                ref=str(b.get("day")),
             )
 
     # ---- walk the month: average cost, realised P&L, income and expense.

@@ -322,6 +322,9 @@ class TestClose:
         assert any("no ledger journal" in d for d in details)
         assert any("no IB statement" in d for d in details)
         assert any("no ledger view" in d for d in details)
+        # Each line is its own record: one id, one proposal, one decision (I13121).
+        ids = [e["exception_id"] for e in document["exceptions"]]
+        assert len(set(ids)) == len(ids)
 
     def test_a_failed_ledger_check_on_the_last_day_refuses_the_close(self, store):
         november(store)
@@ -329,6 +332,7 @@ class TestClose:
             "checks": {
                 "breaks": [
                     {"check": "completeness", "day": "2026-11-26", "detail": "x"},
+                    {"check": "completeness", "day": "2026-11-27", "detail": "x"},
                     {"check": "roll_forward", "day": "2026-11-30", "detail": "y"},
                     {"check": "break_aging", "day": "2026-11-20", "detail": "z"},
                 ]
@@ -351,7 +355,11 @@ class TestClose:
         assert sorted(str(e["class"]) for e in document["exceptions"]) == [
             "close_checks_failed",
             "close_input_missing",
+            "close_input_missing",
         ]
+        # One check failing on two days is two lines with two ids (I13121).
+        ids = [e["exception_id"] for e in document["exceptions"]]
+        assert len(set(ids)) == len(ids)
 
     def test_income_suspense_shares_and_an_unattributed_flow_are_each_explained_or_refused(
         self, store
