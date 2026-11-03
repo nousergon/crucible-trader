@@ -9,7 +9,7 @@ import pathlib
 from decimal import Decimal
 
 import pytest
-from crucible.keys import data_panel_key, trader_broker_statement_key
+from crucible.keys import data_panel_key, trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext
 from crucible.store import LocalStore
 
@@ -52,6 +52,7 @@ from crucible_trader.month_end_close import (
     panel_close_source,
     previous_month,
 )
+from crucible_trader.month_rebuild import REBUILD_METRIC, rebuild_key, verify_month_rebuild
 from crucible_trader.performance_statement import (
     StatementError,
     benchmark_returns,
@@ -113,6 +114,7 @@ def post(store, broker, anchor, fills=()):
         )
     )
     document = {**result.to_document(), "control_arm": {"passed": True, "missed": []}}
+    store.put_bytes(trader_reconciliation_key(broker.trading_day), json.dumps(document).encode())
     posting = post_daily_ledger(
         ctx_for(store, broker.trading_day),
         broker=broker,
@@ -632,3 +634,133 @@ class TestStatement:
 
 def test_cash_account_name_is_the_ledgers():
     assert CASH == "assets:cash:USD"
+
+
+class TestRebuildFromRaw:
+    """1h's monthly check (`alpha-engine-config-I13129`): the close, the
+    statement and the fee bill, rebuilt from stored inputs, match what was
+    published; any difference is a break and a FAIL metric; it never raises."""
+
+    def _closed(self, store):
+        november(store)
+        _, close = run(store)
+        assert close is not None and close["status"] == "closed"
+
+    def _verify(self, store, day="2026-12-02"):
+        ctx = ctx_for(store, day)
+        return ctx, verify_month_rebuild(ctx, day=day, account="DU1", now=NOW, closes=closes)
+
+    def _rewrite(self, store, key, edit):
+        document = json.loads(store.get_bytes(key))
+        edit(document)
+        store.put_bytes(key, json.dumps(document).encode())
+
+    def test_a_published_month_rebuilds_exactly_and_only_once(self, store):
+        self._closed(store)
+        ctx, rebuilt = self._verify(store)
+        assert rebuilt is not None and rebuilt["matches"] is True and rebuilt["breaks"] == []
+        assert {n: d["matches"] for n, d in rebuilt["documents"].items()} == {
+            "close": True,
+            "statement": True,
+            "fee_bill": True,
+        }
+        assert json.loads(store.get_bytes(rebuild_key(T, "2026-11")))["rebuilt_on"] == "2026-12-02"
+        (metric,) = ctx.metrics
+        assert (metric["name"], metric["status"], metric["value"]) == (REBUILD_METRIC, "OK", 0.0)
+        again, none = self._verify(store, "2026-12-03")
+        assert none is None and again.metrics == []
+
+    def test_nothing_is_rebuilt_before_the_close_and_statement_are_published(self, store):
+        november(store)
+        ctx, rebuilt = self._verify(store, "2026-12-01")
+        assert rebuilt is None and ctx.metrics == []
+        assert not store.exists(rebuild_key(T, "2026-11"))
+
+    def test_a_changed_fee_bill_is_a_break(self, store):
+        self._closed(store)
+
+        def bump(doc):
+            doc["simulated_fee_bill"]["adviser_fee_cents"] += 1
+
+        self._rewrite(store, statement_key(T, "2026-11"), bump)
+        ctx, rebuilt = self._verify(store)
+        assert rebuilt is not None and rebuilt["matches"] is False
+        assert [(b["check"], b["document"]) for b in rebuilt["breaks"]] == [
+            ("rebuild_from_raw", "fee_bill")
+        ]
+        assert rebuilt["documents"]["fee_bill"]["differs"] == ["adviser_fee_cents"]
+        assert ctx.metrics[0]["status"] == "FAIL" and ctx.metrics[0]["value"] == 1.0
+
+    def test_a_changed_close_is_a_break_and_the_statement_rebuilds_from_raw(self, store):
+        self._closed(store)
+
+        def bump(doc):
+            doc["nav_end_cents"] += 100
+
+        self._rewrite(store, close_key(T, "2026-11"), bump)
+        _, rebuilt = self._verify(store)
+        assert rebuilt is not None
+        assert [b["document"] for b in rebuilt["breaks"]] == ["close"]
+        assert rebuilt["documents"]["close"]["differs"] == ["nav_end_cents"]
+
+    def test_raw_inputs_that_no_longer_close_break_all_three(self, store):
+        self._closed(store)
+
+        def drift(doc):
+            doc["cash_usd"] = 940.0
+
+        self._rewrite(store, trader_broker_statement_key("2026-11-30"), drift)
+        _, rebuilt = self._verify(store)
+        assert rebuilt is not None
+        assert [b["document"] for b in rebuilt["breaks"]] == ["close", "statement", "fee_bill"]
+        assert "does not rebuild" in rebuilt["documents"]["statement"]["differs"][0]
+
+    def test_a_concurrent_rebuild_is_not_rewritten(self, store):
+        self._closed(store)
+
+        class Racing:
+            def __init__(self):
+                self.store = store
+                self.metrics: list[object] = []
+
+            def record_output_cas(self, *_):
+                from crucible.store import PointerConflictError
+
+                raise PointerConflictError("raced")
+
+            def record_metric(self, m):
+                self.metrics.append(m)
+
+        ctx = Racing()
+        assert verify_month_rebuild(ctx, day="2026-12-02", account="DU1", now=NOW) is None
+        assert ctx.metrics == []
+
+    def test_a_failure_is_a_fail_metric_and_never_raises_even_when_the_metric_fails(self, store):
+        class Broken:
+            metrics: list[object] = []
+
+            @property
+            def store(self):
+                raise OSError("store down")
+
+            def record_metric(self, m):
+                raise RuntimeError("metric sink down")
+
+        assert verify_month_rebuild(Broken(), day="2026-12-02", account="DU1", now=NOW) is None
+
+        class Exploding:
+            def exists(self, key):
+                raise OSError("exists down")
+
+        class Down:
+            def __init__(self):
+                self.store = Exploding()
+                self.metrics: list[dict[str, object]] = []
+
+            def record_metric(self, m):
+                self.metrics.append(m)
+
+        ctx = Down()
+        assert verify_month_rebuild(ctx, day="2026-12-02", account="DU1", now=NOW) is None
+        assert ctx.metrics[0]["status"] == "FAIL"
+        assert "rebuild NOT run" in ctx.metrics[0]["status_reason"]

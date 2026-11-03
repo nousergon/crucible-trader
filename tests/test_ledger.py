@@ -9,7 +9,7 @@ import json
 import pathlib
 
 import pytest
-from crucible.keys import trader_broker_statement_key
+from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext
 from crucible.store import LocalStore
 
@@ -344,10 +344,15 @@ def ctx_for(store, day):
 
 
 def post(store, broker, anchor, fills=()):
-    # The job writes the day's IB statement (step 5) before the ledger (5d).
+    # The job writes the day's IB statement and reconciliation (step 5)
+    # before the ledger (5d).
     store.put_bytes(
         trader_broker_statement_key(broker.trading_day),
         json.dumps(broker.to_document()).encode(),
+    )
+    reconciliation = recon_doc(broker, anchor, fills)
+    store.put_bytes(
+        trader_reconciliation_key(broker.trading_day), json.dumps(reconciliation).encode()
     )
     ctx = ctx_for(store, broker.trading_day)
     result = post_daily_ledger(
@@ -357,7 +362,7 @@ def post(store, broker, anchor, fills=()):
         fills=fills,
         cash_flows=(),
         corporate_actions=NONE,
-        reconciliation=recon_doc(broker, anchor, fills),
+        reconciliation=reconciliation,
         now="2026-11-03T21:00:00Z",
     )
     return ctx, result
@@ -531,7 +536,7 @@ class TestChecks:
         post(store, stmt(NEXT, {"AAA": 10}, 1_000.0), stmt(PREV, {"AAA": 10}, 1_000.0))
         checks = checks_of(store, NEXT)
         assert checks["completeness"]["missing"] == [
-            {"day": DAY, "missing": ["journal", "view", "ib_statement"]}
+            {"day": DAY, "missing": ["journal", "view", "ib_statement", "reconciliation"]}
         ]
 
     def test_an_open_gap_ages_and_is_overdue_after_three_trading_days(self, store):
@@ -628,5 +633,5 @@ def test_a_journal_without_its_view_is_counted_missing_not_rebuilt(store, tmp_pa
     assert [b["check"] for b in checks["breaks"]] == ["completeness", "completeness"]
     assert checks["completeness"]["missing"][0] == {
         "day": PREV,
-        "missing": ["view", "ib_statement"],
+        "missing": ["view", "ib_statement", "reconciliation"],
     }
