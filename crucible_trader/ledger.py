@@ -34,6 +34,20 @@ until a 1c decision posts the clearing adjustment) and an ``expires`` day. The
 suspense balances are reported every day and the ledger is not ``clean`` while
 any is non-zero: a gap is booked, never absorbed (Rule 8).
 
+**Clearing a decided break** (`alpha-engine-config-I13160`). A gap leaves
+suspense only by an ``adjustment`` entry, and only on a reviewer's
+``exception_decision.v1`` record (1c): when the standing decision on an
+exception the gap cites is ``agree`` or ``correct``, the day's posting books ONE
+adjustment per gap that reverses its suspense posting against
+:data:`RECONCILIATION_ADJUSTMENTS` (cash, whole cents) or
+``equity:share_adjustments:<T>`` (shares), citing the gap's exception ids, the
+decision id and who decided. A ``defer``, a superseded or a conflicted decision
+clears nothing. The trader makes no call here: the approver is the reviewer
+whose decision is cited (maker-checker), and a decision takes effect on the
+first trading day AFTER the day it was made, so a re-run of any day books the
+same bytes. A gap is cleared once: any adjustment already citing one of its ids
+settles it, exactly as the 1h aging check and the close (1e) read it.
+
 **Append-only** (Rule 3). A day's journal is written once, create-if-absent
 (:func:`post_daily_ledger`); a re-run that produces the same bytes is a no-op
 and one that produces different bytes is refused and reported. A correction is
@@ -84,6 +98,7 @@ from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
 )
 
 from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.exception_decision import effective_decisions, load_decisions
 from crucible_trader.exception_record import (
     PAPER_FUND_TENANT,
     exception_id,
@@ -110,10 +125,23 @@ SECURITIES = "assets:securities:"
 RECEIVABLE = "assets:dividends_receivable:"
 DIVIDEND_INCOME = "income:dividends:"
 SUSPENSE_POSITION = "suspense:position_gap:"
-_FIXED_ACCOUNTS = frozenset({CASH, COMMISSIONS, DECLARED_FLOWS, OPENING, SUSPENSE_CASH})
-_PER_INSTRUMENT = (SECURITIES, RECEIVABLE, DIVIDEND_INCOME, SUSPENSE_POSITION)
+#: Where a decided cash gap's suspense goes (alpha-engine-config-I13160): the
+#: broker's cash is ground truth, so a cleared difference is P&L, its own line
+#: in the close's attribution, never folded into another account.
+RECONCILIATION_ADJUSTMENTS = "income:reconciliation_adjustments"
+#: Where a decided share gap's suspense goes: the securities account already
+#: holds IB's count, so the offsetting shares leave suspense to here.
+SHARE_ADJUSTMENTS = "equity:share_adjustments:"
+_FIXED_ACCOUNTS = frozenset(
+    {CASH, COMMISSIONS, DECLARED_FLOWS, OPENING, SUSPENSE_CASH, RECONCILIATION_ADJUSTMENTS}
+)
+_PER_INSTRUMENT = (SECURITIES, RECEIVABLE, DIVIDEND_INCOME, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
 #: Only these accounts hold shares.
-_QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION)
+_QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
+
+#: The verdicts that settle a break; ``defer`` leaves it in suspense.
+CLEARING_VERDICTS = frozenset({"agree", "correct"})
+_GAP_KINDS = ("cash_gap", "position_gap")
 
 ENTRY_KINDS = frozenset(
     {
@@ -343,6 +371,9 @@ class DayInputs:
     cash_flows: tuple[CashFlow, ...]
     corporate_actions: CorporateActionSet
     reconciliation: Mapping[str, object]
+    #: Every stored ``exception_decision.v1`` record (validated); the ones that
+    #: clear a gap are chosen by :func:`clearing_decisions`.
+    decisions: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -494,6 +525,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         )
 
     breaks = _book_gaps(ledger, inputs, book)
+    cleared = _book_clearances(ledger, inputs, book)
     after = ledger.positions(tenant, account)
     suspense = ledger.suspense(tenant, account)
     clean = not breaks and suspense["cash_cents"] == 0 and not suspense["shares"]
@@ -512,6 +544,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         "breaks": list(breaks),
         "suspense": suspense,
         "dividends_receivable_cents": ledger.balances(tenant, account, RECEIVABLE),
+        "cleared_today": cleared,
         "clean": clean,
         "known_deltas": [
             "dividend receivable recognised on the pay date, not the ex-date",
@@ -598,6 +631,85 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
             expires=expires,
         )
     return breaks
+
+
+def clearing_decisions(
+    decisions: Iterable[Mapping[str, object]], tenant: str, *, before: str
+) -> dict[str, Mapping[str, object]]:
+    """Exception id -> the standing ``agree``/``correct`` decision on it, for
+    ``tenant``, among decisions made before the day ``before``. A superseded,
+    conflicted or deferred decision clears nothing."""
+    made = [
+        d
+        for d in decisions
+        if d.get("tenant") == tenant and str(d.get("decided_at", ""))[:10] < before
+    ]
+    out: dict[str, Mapping[str, object]] = {}
+    standing = effective_decisions(made).values()
+    for decision in sorted(
+        (d for state, d in standing if state == "decided" and d is not None),
+        key=lambda d: (str(d["decided_at"]), str(d["decision_id"])),
+    ):
+        if decision["verdict"] in CLEARING_VERDICTS:
+            out.setdefault(str(decision["exception_id"]), decision)
+    return out
+
+
+def _book_clearances(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, object]]:  # pyright: ignore[reportExplicitAny]
+    """Book one ``adjustment`` per open gap a reviewer has decided, moving its
+    suspense to :data:`RECONCILIATION_ADJUSTMENTS` / :data:`SHARE_ADJUSTMENTS`.
+    Returns what was cleared today."""
+    tenant, account, day = inputs.tenant, inputs.broker.account, inputs.broker.trading_day
+    decided = clearing_decisions(inputs.decisions, tenant, before=day)
+    if not decided:
+        return []
+    mine = [e for e in ledger.entries if e.tenant == tenant and e.account == account]
+    settled = {str(i) for e in mine if e.kind == "adjustment" for i in _cited(e)}
+    out: list[dict[str, object]] = []
+    for gap in mine:
+        ids = _cited(gap)
+        if gap.kind not in _GAP_KINDS or settled.intersection(ids):
+            continue
+        decision = next((decided[i] for i in ids if i in decided), None)
+        if decision is None:
+            continue
+        postings: list[Posting] = []
+        for p in gap.postings:
+            if p.account == SUSPENSE_CASH and p.amount_cents:
+                postings += [
+                    Posting(SUSPENSE_CASH, -p.amount_cents),
+                    Posting(RECONCILIATION_ADJUSTMENTS, p.amount_cents),
+                ]
+            elif p.account.startswith(SUSPENSE_POSITION) and p.quantity:
+                ticker = p.account[len(SUSPENSE_POSITION) :]
+                postings += [
+                    Posting(p.account, 0, -p.quantity),
+                    Posting(SHARE_ADJUSTMENTS + ticker, 0, p.quantity),
+                ]
+        decision_id = str(decision["decision_id"])
+        book(
+            "adjustment",
+            f"clear/{gap.entry_id}",
+            postings,
+            source="exception_decision",
+            reason=f"clears {gap.kind} {gap.entry_id} booked {gap.trading_day} on a decision",
+            exception_ids=ids,
+            decision_id=decision_id,
+            decided_exception_id=decision["exception_id"],
+            verdict=decision["verdict"],
+            decided=decision["decided"],
+            decided_by=decision["decided_by"],
+            gap_entry_id=gap.entry_id,
+        )
+        settled.update(ids)
+        out.append(
+            {"gap_entry_id": gap.entry_id, "gap_day": gap.trading_day, "decision_id": decision_id}
+        )
+    return out
+
+
+def _cited(entry: Entry) -> list[str]:
+    return [str(i) for i in cast("list[object]", entry.evidence.get("exception_ids") or [])]
 
 
 # --------------------------------------------------------------------------- I/O
@@ -687,6 +799,7 @@ def post_daily_ledger(
             )
         journals = load_journals(ctx.store, tenant, before=day)
         ledger = ledger_from(journals)
+        decisions, unreadable = _read_decisions(ctx.store)
         posting = book_day(
             ledger,
             DayInputs(
@@ -697,8 +810,11 @@ def post_daily_ledger(
                 tuple(cash_flows),
                 corporate_actions,
                 reconciliation,
+                decisions,
             ),
         )
+        if unreadable is not None:
+            posting.document["decisions_unreadable"] = unreadable
         checks = run_checks(
             ctx.store,
             tenant,
@@ -760,9 +876,24 @@ def post_daily_ledger(
             (
                 f"{n} ledger break(s) on {day} booked to suspense; "
                 f"suspense {posting.document['suspense']}"
+                + (
+                    f"; decisions unreadable, nothing cleared: {unreadable}"
+                    if unreadable is not None
+                    else ""
+                )
             )[:400],
         )
     return posting
+
+
+def _read_decisions(store: Store) -> tuple[tuple[Mapping[str, object], ...], str | None]:
+    """Every stored decision, or none and why: an unreadable decision store
+    means no break is cleared today (it stays in suspense and ages), never a
+    day the ledger fails to post."""
+    try:
+        return tuple(load_decisions(store)), None
+    except Exception as exc:  # noqa: BLE001 - clearing waits; the day still posts
+        return (), f"{type(exc).__name__}: {exc}"[:300]
 
 
 def _metric(

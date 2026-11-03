@@ -14,18 +14,24 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.exception_decision import decide, decision_key, record_decision
+from crucible_trader.exception_proposal import PROPOSAL_SCHEMA_VERSION
 from crucible_trader.exception_record import PAPER_FUND_TENANT, exception_id
 from crucible_trader.ledger import (
     CASH,
     COMMISSIONS,
+    RECONCILIATION_ADJUSTMENTS,
     SECURITIES,
+    SHARE_ADJUSTMENTS,
     SUSPENSE_CASH,
+    SUSPENSE_POSITION,
     DayInputs,
     Entry,
     Ledger,
     LedgerError,
     Posting,
     book_day,
+    clearing_decisions,
     entry_from_document,
     journal_digest,
     journal_key,
@@ -635,3 +641,163 @@ def test_a_journal_without_its_view_is_counted_missing_not_rebuilt(store, tmp_pa
         "day": PREV,
         "missing": ["view", "ib_statement", "reconciliation"],
     }
+
+
+# ------------------------------------------------- clearing a decided break
+# alpha-engine-config-I13160: a reviewer's agree/correct posts the adjustment.
+
+LATER = "2026-11-05"
+
+
+def decision_on(exception, verdict="agree", *, at="2026-11-03T22:00:00Z", tenant=T, **kwargs):
+    proposal = {
+        "schema_version": PROPOSAL_SCHEMA_VERSION,
+        "proposal_id": "p" + exception[:31],
+        "exception_id": exception,
+        "tenant": tenant,
+        "trading_day": DAY,
+        "source": "reconciler",
+        "class": "cash_delta",
+        "ruleset_version": "1",
+        "rule_id": "r",
+        "nature": "defect",
+        "action": "investigate_cash",
+    }
+    return decide(proposal, verdict=verdict, decided_by="reviewer", decided_at=at, **kwargs)
+
+
+def gapped_ledger(broker_day, *, positions=None, cash=1_000.03):
+    """PREV opens 10 AAA and $1,000; DAY's IB differs (3 cents, or shares)."""
+    ledger = Ledger()
+    book_day(ledger, day_inputs(stmt(PREV, {"AAA": 10}, 1_000.0), None))
+    posting = book_day(
+        ledger,
+        day_inputs(stmt(DAY, positions or {"AAA": 10}, cash), stmt(PREV, {"AAA": 10}, 1_000.0)),
+    )
+    return ledger, posting.entries[-1]
+
+
+def next_day(ledger, decisions, day=NEXT, prev=DAY, *, positions=None, cash=1_000.03):
+    inputs = day_inputs(stmt(day, positions or {"AAA": 10}, cash), stmt(prev, {"AAA": 10}, cash))
+    return book_day(
+        ledger,
+        DayInputs(
+            *(
+                getattr(inputs, f)
+                for f in (
+                    "tenant",
+                    "broker",
+                    "anchor",
+                    "fills",
+                    "cash_flows",
+                    "corporate_actions",
+                    "reconciliation",
+                )
+            ),
+            tuple(decisions),
+        ),
+    )
+
+
+class TestClearingADecidedBreak:
+    def test_an_agreed_cash_gap_is_cleared_by_its_own_adjustment_entry(self):
+        ledger, gap = gapped_ledger(DAY)
+        decision = decision_on(gap.evidence["exception_ids"][0])
+        posting = next_day(ledger, [decision])
+        (adjustment,) = posting.entries
+        assert adjustment.kind == "adjustment" and adjustment.trading_day == NEXT
+        assert adjustment.postings == (
+            Posting(SUSPENSE_CASH, 3),
+            Posting(RECONCILIATION_ADJUSTMENTS, -3),
+        )
+        assert adjustment.evidence["exception_ids"] == gap.evidence["exception_ids"]
+        assert adjustment.evidence["decision_id"] == decision["decision_id"]
+        assert adjustment.evidence["decided_by"] == "reviewer"
+        assert adjustment.evidence["gap_entry_id"] == gap.entry_id
+        assert ledger.trial_balance() == 0
+        assert ledger.cents(T, "DU1", CASH) == 100_003  # cash is untouched: IB stands
+        assert posting.document["suspense"] == {"cash_cents": 0, "shares": {}}
+        assert posting.document["clean"] is True
+        assert posting.document["cleared_today"] == [
+            {"gap_entry_id": gap.entry_id, "gap_day": DAY, "decision_id": decision["decision_id"]}
+        ]
+        # Cleared once: the same decision books nothing the next day.
+        again = next_day(ledger, [decision], LATER, NEXT)
+        assert again.entries == () and again.document["cleared_today"] == []
+
+    def test_a_corrected_share_gap_moves_its_shares_out_of_suspense(self):
+        ledger, gap = gapped_ledger(DAY, positions={"AAA": 9}, cash=1_000.0)
+        decision = decision_on(
+            gap.evidence["exception_ids"][0],
+            "correct",
+            nature="event",
+            action="book_corporate_action_manually",
+            note="a spin-off IB booked first",
+        )
+        posting = next_day(ledger, [decision], positions={"AAA": 9}, cash=1_000.0)
+        (adjustment,) = posting.entries
+        assert adjustment.postings == (
+            Posting(SUSPENSE_POSITION + "AAA", 0, -1),
+            Posting(SHARE_ADJUSTMENTS + "AAA", 0, 1),
+        )
+        assert adjustment.evidence["decided"] == {
+            "nature": "event",
+            "action": "book_corporate_action_manually",
+        }
+        assert ledger.positions(T, "DU1") == {"AAA": 9}
+        assert posting.document["suspense"]["shares"] == {}
+
+    def test_defer_superseded_conflicted_other_tenant_and_same_day_clear_nothing(self):
+        ledger, gap = gapped_ledger(DAY)
+        exception = gap.evidence["exception_ids"][0]
+        deferred = decision_on(exception, "defer", note="waiting for IB's statement")
+        agreed = decision_on(exception)
+        overruled = decision_on(
+            exception, "defer", note="reopened", supersedes=agreed["decision_id"]
+        )
+        other = decision_on(
+            exception, "agree", at="2026-11-03T21:00:00Z", supersedes=deferred["decision_id"]
+        )
+        for decisions in (
+            [deferred],
+            [agreed, overruled],
+            [deferred, agreed],  # two standing side by side: conflicted
+            [decision_on(exception, tenant="other-fund")],
+            [decision_on(exception, at=f"{NEXT}T01:00:00Z")],  # takes effect the day after
+        ):
+            assert clearing_decisions(decisions, T, before=NEXT) == {}
+        # A decision on some other exception settles nothing here either.
+        assert next_day(ledger, [deferred, decision_on("f" * 32)]).entries == ()
+        assert ledger.suspense(T, "DU1")["cash_cents"] == -3
+        # An agree that supersedes the deferral clears it.
+        assert list(clearing_decisions([deferred, other], T, before=NEXT)) == [exception]
+
+
+class TestClearingThroughThePostingStep:
+    def test_a_recorded_decision_clears_the_gap_on_the_next_posting(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        (gap,) = [e for e in load_journals(store, T, before=NEXT)[DAY] if e.kind == "cash_gap"]
+        record_decision(store, decision_on(gap.evidence["exception_ids"][0]))
+        ctx, posting = post(
+            store, stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03)
+        )
+        assert posting is not None and ctx.metrics[0]["status"] == "OK"
+        assert [e.kind for e in load_journals(store, T, before=LATER)[NEXT]] == ["adjustment"]
+        view = json.loads(store.get_bytes(ledger_reconciliation_key(T, NEXT)))
+        assert view["checks"]["open_breaks"] == [] and view["checks"]["breaks"] == []
+        # Idempotent: a re-run books the same bytes and changes nothing.
+        _, rerun = post(store, stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03))
+        assert rerun is not None and rerun.entries == posting.entries
+
+    def test_an_unreadable_decision_store_leaves_the_gap_in_suspense_and_still_posts(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        store.put_bytes(decision_key(DAY, "0" * 32), b'{"schema_version": "nope"}')
+        ctx, posting = post(
+            store, stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03)
+        )
+        assert posting is not None and posting.entries == ()
+        assert "DecisionError" in str(posting.document["decisions_unreadable"])
+        assert ctx.metrics[0]["status"] == "WATCH"
+        assert "decisions unreadable, nothing cleared" in ctx.metrics[0]["status_reason"]
