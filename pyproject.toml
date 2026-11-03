@@ -64,6 +64,13 @@ dependencies = [
 # installs it from the lock, never by a floating name.
 ib = ["ib-async==2.1.0"]
 
+[project.scripts]
+# What a DISPATCHED `trader.*` box runs (`crucible_trader.dispatch_entry`,
+# alpha-engine-config-I13159): the Dispatcher installs this package's
+# content-hashed wheel (CI job `wheel`) on top of the release venv and calls
+# `crucible-trader-dispatch <job>` where a harness box calls `crucible <job>`.
+crucible-trader-dispatch = "crucible_trader.dispatch_entry:main"
+
 [project.urls]
 Homepage = "https://github.com/nousergon/crucible-trader"
 
