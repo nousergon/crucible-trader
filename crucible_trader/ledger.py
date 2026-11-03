@@ -73,7 +73,10 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 
 from crucible.calendar import is_trading_day  # pyright: ignore[reportMissingTypeStubs]
-from crucible.keys import trader_broker_statement_key  # pyright: ignore[reportMissingTypeStubs]
+from crucible.keys import (  # pyright: ignore[reportMissingTypeStubs]
+    trader_broker_statement_key,
+    trader_reconciliation_key,
+)
 from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
     ETAG_ABSENT,
     PointerConflictError,
@@ -940,6 +943,7 @@ def run_checks(
                 ("journal", d in journals),
                 ("view", d == day or store.exists(ledger_reconciliation_key(tenant, d))),
                 ("ib_statement", store.exists(trader_broker_statement_key(d))),
+                ("reconciliation", d == day or store.exists(trader_reconciliation_key(d))),
             )
             if not present
         ]

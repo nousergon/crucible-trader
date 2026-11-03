@@ -50,6 +50,12 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    (:func:`crucible_trader.performance_statement.file_statement`, 1f,
    `alpha-engine-config-I13123`). Never raises; a no-op once the month is closed
    and its statement filed;
+5g. once that close and statement are published, rebuild the close, the
+   statement and the fee bill from stored inputs and compare each to what was
+   published, once per month
+   (:func:`crucible_trader.month_rebuild.verify_month_rebuild`, back office 1h,
+   `alpha-engine-config-I13129`). A difference is a break and a FAIL metric;
+   it never raises;
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
    :func:`paging_decision`). Either makes the manifest `status: failed`, which
@@ -126,6 +132,7 @@ from crucible_trader.exception_record import (
 )
 from crucible_trader.ledger import post_daily_ledger
 from crucible_trader.month_end_close import close_prior_month
+from crucible_trader.month_rebuild import verify_month_rebuild
 from crucible_trader.order_intent_reconciliation import (
     RECONCILIATION_SCHEMA_VERSION as INTENT_RECONCILIATION_SCHEMA_VERSION,
 )
@@ -404,6 +411,9 @@ def reconcile_cycle(
             now=now,
             after_close=lambda close: file_statement(ctx, close, now=now),
         )
+        # Step 5g: once a month's close and statement are published, rebuild
+        # them and the fee bill from stored inputs (1h). Never raises.
+        verify_month_rebuild(ctx, day=day, account=broker.account, now=now)
         # Step 5e runs LAST: after 5c and 5f, so today's proposals and a
         # refused close's proposals are both in the queue it files.
         file_exception_score(ctx, now=now)
