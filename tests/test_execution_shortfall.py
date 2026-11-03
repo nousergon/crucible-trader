@@ -289,3 +289,43 @@ class TestThePhase4GateGradesThisShortfall:
         clause = phase4_clause(self._store_with(tmp_path, broken), self.CLAUSE, self.WEEK[-1])
         assert not clause.met
         assert "shortfall NOT computed" in clause.detail
+
+
+class TestASimulatedWeekIsNeverAMeasuredShortfall:
+    """`alpha-engine-config-I12685`: a `computed` document carrying
+    `fill_source: simulated_close` is the plan restated at the close, never an
+    execution measured. The pinned harness names it and grades nothing from it,
+    in staging and in prod alike."""
+
+    CLAUSE = TestThePhase4GateGradesThisShortfall.CLAUSE
+    WEEK = TestTheHarnessReadsWhatTheTraderWrote.WEEK
+    _store_with = TestTheHarnessReadsWhatTheTraderWrote._store_with
+
+    @staticmethod
+    def _simulated(day: str) -> dict:
+        fills = [_fill(f"{day}-{i}", fill=100.0) for i in range(5)]
+        return build_shortfall_document(
+            trading_day=day, champion=CHAMPION, fills=fills, now=NOW, fill_source="simulated_close"
+        )
+
+    def test_a_broker_document_carries_no_fill_source(self) -> None:
+        document = build_shortfall_document(
+            trading_day=self.WEEK[0], champion=CHAMPION, fills=[_fill("a", fill=100.02)], now=NOW
+        )
+        assert "fill_source" not in document
+
+    @pytest.mark.parametrize("environment", [None, "prod", "staging"])
+    def test_a_simulated_week_never_meets_the_row_clause(
+        self, tmp_path, phase4_clause, monkeypatch, environment
+    ) -> None:
+        if environment is None:
+            monkeypatch.delenv("NE_ENV", raising=False)
+        else:
+            monkeypatch.setenv("NE_ENV", environment)
+
+        clause = phase4_clause(
+            self._store_with(tmp_path, self._simulated), self.CLAUSE, self.WEEK[-1]
+        )
+
+        assert not clause.met
+        assert "simulated router at the close" in clause.detail

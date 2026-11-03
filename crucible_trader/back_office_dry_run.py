@@ -59,13 +59,13 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
-from crucible.calendar import is_trading_day  # pyright: ignore[reportMissingTypeStubs]
-from crucible.keys import (  # pyright: ignore[reportMissingTypeStubs]
+from crucible.calendar import is_trading_day
+from crucible.keys import (
     trader_broker_statement_key,
     trader_reconciliation_key,
 )
-from crucible.runner import RunContext  # pyright: ignore[reportMissingTypeStubs]
-from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
+from crucible.runner import RunContext
+from crucible.store import (
     Store,
     capture_ledger_of,
     open_store,

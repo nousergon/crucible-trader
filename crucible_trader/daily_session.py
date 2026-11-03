@@ -18,10 +18,12 @@ then files the two artifacts the phase-4 gate reads, both as OUTPUTS of the
 `trader.session` run manifest:
 
 * `trader/evidence.json` -- the served day, with its SESSION MODE: `shadow`
-  when routing is off (the router yields no batch), `live` when it is on;
+  when routing is off (the router yields no batch), `live` when it is on,
+  `simulated` for the staging simulated router (staging only,
+  `alpha-engine-config-I12685`);
 * `trader/execution_shortfall/{day}.json` -- the router's own
   `shortfall_document()`: `no_orders` for a shadow session, measured fills
-  for a routed one.
+  for a routed one, ``fill_source: simulated_close`` fills for a simulated one.
 
 **Routing is decided by the environment and nothing here sets it.** Unset or
 `off` is shadow; the box's env file leaves it unset. Flipping it is an
@@ -185,13 +187,21 @@ def daily_session_cycle(
     clock: Callable[[], dt.datetime] = utcnow,
     contract_resolver: Callable[[Store, str], ResolvedContract] = resolve,
     construct: Callable[..., TargetBook] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The job body. Returns the session document; raises on every refusal.
 
     ``construct`` defaults to `construct_target_book`, resolved at call time.
+    ``environ`` (default `os.environ`) is what `record_session` checks a
+    `simulated` day against: only staging may file one.
     """
     day = ctx.trading_day.isoformat()
-    mode = "live" if router.enabled else "shadow"
+    # `simulated` is a class attribute of the staging simulated router alone;
+    # every prod router lacks it, so prod reads exactly `live` or `shadow`.
+    if getattr(router, "simulated", False) is True:
+        mode = "simulated"
+    else:
+        mode = "live" if router.enabled else "shadow"
     resolved: list[ResolvedContract] = []
 
     def capture(store: Store, trading_day: str) -> ResolvedContract:
@@ -242,6 +252,7 @@ def daily_session_cycle(
         calendar_date=ctx.calendar_date.isoformat(),
         put=lambda key, payload: ctx.record_output(key, payload, EVIDENCE_SCHEMA_VERSION),
         alpha_bench=alpha_bench,
+        environ=environ,
     )
     shortfall = _file_shortfall(ctx, router, champion=contract.arm_id, clock=clock)
     shadow_days = len(evidence.shadow_days())
@@ -329,6 +340,7 @@ def run_staging_session(
     installed_version: str,
     clock: Callable[[], dt.datetime] = utcnow,
     run_mode: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> RunContext:
     """Run one STAGING session as `trader.session`: no broker, no SDK, no connection.
 
@@ -352,6 +364,7 @@ def run_staging_session(
             router=router,
             installed_version=installed_version,
             clock=clock,
+            environ=environ,
         )
         if not isinstance(router, SimulatedFillRouter) or result["outcome"] != "served":
             return result
@@ -363,9 +376,9 @@ def run_staging_session(
             ),
             SIMULATED_FILLS_SCHEMA_VERSION,
         )
-        # The run manifest says what the session was: the evidence records the
-        # day as `shadow` (no order left the trader), this metric that its plan
-        # was filled by simulation.
+        # The evidence records the day as `simulated` and the shortfall carries
+        # `fill_source: simulated_close`; this metric counts the fills, and the
+        # side file above is their debug copy (`alpha-engine-config-I12685`).
         ctx.record_metric(
             {
                 "name": "trader_session_simulated_fills",
@@ -383,7 +396,7 @@ def run_staging_session(
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
-        return {**result, "session_mode": "simulated", "simulated_fills_key": key}
+        return {**result, "simulated_fills_key": key}
 
     return run_job(
         SESSION_JOB,
@@ -424,6 +437,7 @@ def main(
             installed_version=version_reader(),
             clock=clock,
             run_mode=args.run_mode,
+            environ=source,
         )
         mode = "simulated" if staging.simulated else "shadow"
         printer(

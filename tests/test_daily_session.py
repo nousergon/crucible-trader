@@ -31,6 +31,7 @@ from test_session import SHA, VERSION, _halt, _pin_document
 from test_simulated_broker import write_panel
 
 from crucible_trader import daily_session as module
+from crucible_trader import simulated_broker as simulated_broker_module
 from crucible_trader.broker_session import OrderRefusedError
 from crucible_trader.contract import ContractRefusal, ContractUnavailable
 from crucible_trader.daily_session import (
@@ -439,10 +440,10 @@ class TestAStagingSession:
         assert TRADER_EVIDENCE_KEY in outputs
 
         evidence = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))
-        assert evidence["session_modes"] == {BOUND: "shadow"}
+        assert evidence["session_modes"] == {BOUND: "simulated"}
         shortfall = json.loads(store.get_bytes(execution_shortfall_key(BOUND)))
-        assert shortfall["outcome"] == "no_orders"
-        assert "filled by simulation" in shortfall["outcome_reason"]
+        assert shortfall["outcome"] == "computed"
+        assert shortfall["fill_source"] == "simulated_close"
         fills = json.loads(store.get_bytes(simulated_fills_key(BOUND)))
         assert [(o["symbol"], o["filled_quantity"], o["fill_price"]) for o in fills["orders"]] == [
             ("AAA", 300.0, 100.0),
@@ -466,13 +467,19 @@ class TestAStagingSession:
             return result
 
         monkeypatch.setattr(module, "daily_session_cycle", spy)
-        config = StagingSessionConfig.from_env(_staging_env(store))
+        env = _staging_env(store)
+        config = StagingSessionConfig.from_env(env)
         assert config is not None
         run_staging_session(
-            store, config=config, installed_version=VERSION, clock=lambda: NOW, run_mode="live"
+            store,
+            config=config,
+            installed_version=VERSION,
+            clock=lambda: NOW,
+            run_mode="live",
+            environ=env,
         )
 
-        assert captured[0]["session_mode"] == "shadow"
+        assert captured[0]["session_mode"] == "simulated"
         # An all-cash simulated book has no sells: one batch, the buys.
         assert captured[0]["batches_sent"] == 1
 
@@ -588,3 +595,20 @@ class TestTheProdPathIsUnchanged:
         assert baseline[3] == "shadow session filed"
         for run in runs[1:]:
             assert run == baseline
+
+    def test_prod_files_no_simulated_mode_and_no_fill_source(self, tmp_path, monkeypatch) -> None:
+        """`alpha-engine-config-I12685`: the staging mode and the shortfall's
+        `fill_source` never reach a prod artifact, and the prod session never
+        reads the fleet registry."""
+        monkeypatch.setattr(
+            simulated_broker_module,
+            "assert_registry_forbids_routing",
+            lambda: pytest.fail("the prod path read the registry"),
+        )
+        for name, extra in (("unset", {}), ("prod", {"NE_ENV": "prod"})):
+            *_, artifacts = self._run(tmp_path, name, extra, monkeypatch)
+            evidence = json.loads(artifacts[TRADER_EVIDENCE_KEY])
+            shortfall = json.loads(artifacts[execution_shortfall_key(BOUND)])
+            assert evidence["session_modes"] == {BOUND: "shadow"}
+            assert "fill_source" not in shortfall
+            assert b"simulated" not in artifacts[TRADER_EVIDENCE_KEY]

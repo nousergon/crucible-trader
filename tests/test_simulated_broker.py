@@ -17,11 +17,16 @@ import dataclasses
 import datetime as dt
 import inspect
 import json
+import pathlib
 
 import pandas as pd
 import pytest
-from crucible.execution import validate_execution_shortfall
-from crucible.keys import data_panel_key
+from crucible.execution import (
+    FILL_SOURCE_SIMULATED_CLOSE,
+    reduce_execution_window,
+    validate_execution_shortfall,
+)
+from crucible.keys import data_panel_key, execution_shortfall_key
 from crucible.store import LocalStore
 from test_order_router import _book, _halt
 
@@ -49,6 +54,7 @@ from crucible_trader.simulated_broker import (
     SimulatedFillsRefusedError,
     StagingHoldControl,
     StagingSessionConfig,
+    assert_registry_forbids_routing,
     simulated_fills_key,
 )
 
@@ -152,6 +158,41 @@ class TestStagingNeverRoutes:
         assert not is_staging({})
         assert is_staging({"NE_ENV": "STAGING"})
 
+    def test_the_fleet_registry_denies_staging_every_route(self) -> None:
+        """nousergon-lib#499: `environments.staging.trader.routing_allowed` is []."""
+        assert_registry_forbids_routing()
+
+    def test_a_registry_that_would_let_staging_route_is_refused(self) -> None:
+        class Allows:
+            def assert_routing_allowed(self, route: str) -> None:
+                return None
+
+        names: list[str] = []
+
+        def resolve(name: str) -> Allows:
+            names.append(name)
+            return Allows()
+
+        with pytest.raises(StagingRoutingRefusedError, match="allows staging to route"):
+            assert_registry_forbids_routing(resolve)
+        assert names == ["staging"]
+
+    def test_every_staging_session_asks_the_registry(self, monkeypatch) -> None:
+        asked: list[None] = []
+        monkeypatch.setattr(module, "assert_registry_forbids_routing", lambda: asked.append(None))
+        for flag in ("on", "off"):
+            StagingSessionConfig.from_env(_staging(**{SIMULATED_FILLS_VAR: flag}))
+        assert len(asked) == 2
+
+    def test_outside_staging_the_registry_is_never_read(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            module,
+            "assert_registry_forbids_routing",
+            lambda: pytest.fail("the prod path read the registry"),
+        )
+        for env in ({}, {"NE_ENV": "prod"}, {"NE_ENV": "prod", SIMULATED_FILLS_VAR: "off"}):
+            assert StagingSessionConfig.from_env(env) is None
+
     def test_a_staging_session_without_the_switch_is_shadow(self) -> None:
         config = StagingSessionConfig.from_env({"NE_ENV": "staging"})
         assert config == StagingSessionConfig(simulated=False)
@@ -195,14 +236,38 @@ class TestSimulatedFills:
             _run(router, _book())
         assert [r.to_document() for r in first.records] == [r.to_document() for r in second.records]
 
-    def test_nothing_simulated_is_filed_as_an_execution_measurement(self, store) -> None:
+    def test_the_shortfall_is_computed_and_says_its_fills_were_simulated(self, store) -> None:
+        """`alpha-engine-config-I12685` option (a): a first-class harness record."""
         router = _router(store)
         _run(router, _book())
 
         shortfall = router.shortfall_document(champion="m:arm:abc", trading_day=DAY, now=NOW)
         validate_execution_shortfall(shortfall)
+        assert shortfall["outcome"] == "computed"
+        assert shortfall["fill_source"] == FILL_SOURCE == FILL_SOURCE_SIMULATED_CLOSE
+        assert [o["shortfall_bps"] for o in shortfall["orders"]] == [0.0, 0.0]  # type: ignore[union-attr]
+
+    def test_nothing_simulated_is_ever_pooled_as_a_measured_shortfall(self, store) -> None:
+        """The harness's own reducer names the session and pools none of its orders."""
+        router = _router(store)
+        _run(router, _book())
+        shortfall = router.shortfall_document(champion="m:arm:abc", trading_day=DAY, now=NOW)
+        store.put_bytes(execution_shortfall_key(DAY), json.dumps(shortfall).encode("utf-8"))
+
+        window = reduce_execution_window(store, [DAY])
+
+        assert window.simulated == (DAY,)
+        assert window.n_filled == 0
+        assert window.weighted_bps is None
+
+    def test_a_session_that_filled_nothing_is_no_orders(self, store) -> None:
+        router = _router(store)
+        assert router.batches(_book({"AAA": 0.0})) == []
+
+        shortfall = router.shortfall_document(champion="m:arm:abc", trading_day=DAY, now=NOW)
+        validate_execution_shortfall(shortfall)
         assert shortfall["outcome"] == "no_orders"
-        assert "2 of 2 planned order(s) filled by simulation" in str(shortfall["outcome_reason"])
+        assert "fill_source" not in shortfall
         assert "no order reached a broker" in str(shortfall["outcome_reason"])
 
     def test_the_simulated_fills_document_labels_every_fill(self, store) -> None:
@@ -286,6 +351,37 @@ class TestSimulatedFills:
                 roots.update(alias.name.split(".")[0] for alias in node.names)
         assert not {"load_sdk", "connect", "open_paper_router", "build_router"} & imported
         assert not {"ib_async", "ib_insync"} & roots
+
+
+class TestTheProdPathImportsNothingTheRunningReleaseLacks:
+    """The box runs the release wheel `trader/release_pin` names, which may
+    predate `simulated` and `fill_source` (crucible#445) and the registry's
+    `trader.routing_allowed` (nousergon-lib#499). So no module the prod session
+    imports may import those at module level; they are reached on the staging
+    path only (`alpha-engine-config-I12685`)."""
+
+    STAGING_ONLY = frozenset(
+        {
+            "FILL_SOURCE_SIMULATED_CLOSE",
+            "FILL_SOURCE_BROKER",
+            "STAGING_SERVED_SESSION_MODES",
+            "served_session_modes",
+            "RoutingNotAllowedError",
+        }
+    )
+
+    def test_no_module_imports_a_staging_only_name_at_module_level(self) -> None:
+        package = pathlib.Path(module.__file__).parent
+        for path in sorted(package.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom):
+                    names = {alias.name for alias in node.names}
+                    assert not names & self.STAGING_ONLY, (path.name, names)
+                    assert node.module != "nousergon_lib.env", path.name
+                    assert not (node.module == "nousergon_lib" and "env" in names), path.name
+                elif isinstance(node, ast.Import):
+                    assert "nousergon_lib.env" not in {a.name for a in node.names}, path.name
 
 
 class TestTheStagingHoldControl:

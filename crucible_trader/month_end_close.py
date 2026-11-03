@@ -58,8 +58,8 @@ from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from typing import Any, cast
 
-from crucible.keys import trader_broker_statement_key  # pyright: ignore[reportMissingTypeStubs]
-from crucible.store import ETAG_ABSENT, PointerConflictError, Store  # pyright: ignore[reportMissingTypeStubs]
+from crucible.keys import trader_broker_statement_key
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
 from crucible_trader.broker_statement import BrokerStatement, statement_from_document
 from crucible_trader.exception_proposal import (

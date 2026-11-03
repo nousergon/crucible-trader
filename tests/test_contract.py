@@ -453,6 +453,109 @@ class TestThePhase4GateGradesThisEvidence:
         assert "2 trading day(s)" in clause.detail
 
 
+STAGING = {"NE_ENV": "staging"}
+
+
+class TestASimulatedDayIsStagingsAlone:
+    """`alpha-engine-config-I12685` option (a): the staging simulated router
+    files mode `simulated`. The producer refuses it outside staging, and the
+    published gate counts it only under ``NE_ENV=staging`` and never as `live`,
+    so no simulated day can satisfy a prod gate."""
+
+    WEEK = TestThePhase4GateGradesThisEvidence.WEEK
+    CLAUSE = TestThePhase4GateGradesThisEvidence.CLAUSE
+
+    @pytest.mark.parametrize("environ", [{}, {"NE_ENV": "prod"}, {"NE_ENV": "stagingx"}])
+    def test_simulated_is_refused_outside_staging_before_anything_is_written(
+        self, store: LocalStore, environ: dict[str, str]
+    ) -> None:
+        _serveable(store)
+        with pytest.raises(ValueError, match="outside NE_ENV=staging"):
+            record_session(store, resolve(store, DAY), mode="simulated", environ=environ)
+        assert not store.exists(TRADER_EVIDENCE_KEY)
+
+    def test_the_process_environment_is_read_when_none_is_given(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _serveable(store)
+        monkeypatch.delenv("NE_ENV", raising=False)
+        with pytest.raises(ValueError, match="outside NE_ENV=staging"):
+            record_session(store, resolve(store, DAY), mode="simulated")
+        monkeypatch.setenv("NE_ENV", "staging")
+        document = record_session(store, resolve(store, DAY), mode="simulated")
+        assert document.session_modes == {DAY: "simulated"}
+
+    def test_a_simulated_day_is_recorded_as_simulated_in_staging(self, store: LocalStore) -> None:
+        _serveable(store)
+        document = record_session(store, resolve(store, DAY), mode="simulated", environ=STAGING)
+
+        assert document.session_modes == {DAY: "simulated"}
+        assert document.simulated_days() == [DAY]
+        assert document.shadow_days() == []
+
+    def test_shadow_then_simulated_is_simulated_and_never_downgraded(
+        self, store: LocalStore
+    ) -> None:
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="shadow", environ=STAGING)
+        record_session(store, resolve(store, DAY), mode="simulated", environ=STAGING)
+        document = record_session(store, resolve(store, DAY), mode="shadow", environ=STAGING)
+
+        assert document.session_modes == {DAY: "simulated"}
+        assert document.trading_days == 1
+
+    def test_a_record_holding_live_and_simulated_days_is_refused_unwritten(
+        self, store: LocalStore
+    ) -> None:
+        _serveable(store)
+        record_session(store, resolve(store, DAY), mode="live")
+        before = store.get_bytes(TRADER_EVIDENCE_KEY)
+        _serveable(store, trading_day=NEXT_DAY)
+        with pytest.raises(ValidationError, match="both `live` and `simulated`"):
+            record_session(store, resolve(store, NEXT_DAY), mode="simulated", environ=STAGING)
+        assert store.get_bytes(TRADER_EVIDENCE_KEY) == before
+
+    def _simulate_week(self, store: LocalStore) -> None:
+        for day in self.WEEK:
+            _serveable(store, trading_day=day)
+            record_session(
+                store, resolve(store, day), mode="simulated", calendar_date=day, environ=STAGING
+            )
+
+    def test_a_simulated_week_meets_the_clause_in_staging_only(
+        self, store: LocalStore, phase4_clause, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._simulate_week(store)
+        monkeypatch.setenv("NE_ENV", "staging")
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert clause.met, clause.detail
+        assert "0 shadow, 5 simulated" in clause.detail
+        assert "live" not in clause.requirement
+
+    @pytest.mark.parametrize("environment", [None, "prod", "PROD", "stagingx", ""])
+    def test_a_simulated_week_never_satisfies_the_clause_outside_staging(
+        self,
+        store: LocalStore,
+        phase4_clause,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str | None,
+    ) -> None:
+        self._simulate_week(store)
+        if environment is None:
+            monkeypatch.delenv("NE_ENV", raising=False)
+        else:
+            monkeypatch.setenv("NE_ENV", environment)
+
+        clause = phase4_clause(store, self.CLAUSE, self.WEEK[-1])
+
+        assert not clause.met and not clause.unmeasurable
+        assert "0 trading day(s) served" in clause.detail
+        assert "0 shadow, 0 live" in clause.detail
+        assert "5 day(s) NOT counted outside staging" in clause.detail
+
+
 #: The ruling's tracker, as a plain `int` (no hardcoded tracker literal).
 BENCH_TRACKER_ISSUE = 12024
 

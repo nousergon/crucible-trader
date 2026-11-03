@@ -54,7 +54,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from crucible.store import Store  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs; same import is baselined in every other module
+from crucible.store import Store
 
 from crucible_trader.order_intent import (
     ORDER_INTENTS_PREFIX,

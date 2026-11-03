@@ -34,7 +34,8 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 from crucible.champion import ChampionPointer, ChampionUnusableError, read_champion
@@ -50,10 +51,16 @@ from crucible.store import Store
 EVIDENCE_SCHEMA_VERSION = "trader_evidence.v2"
 
 #: How a session served its day (`crucible.models.SessionModeLiteral`).
-#: `shadow`: champion resolved, book built, day recorded, NO order sent -- the
-#: only mode this package can run until an order router exists. `live`: the
-#: same, with the book's orders routed to the paper broker.
-SessionMode = Literal["shadow", "live"]
+#: `shadow`: champion resolved, book built, day recorded, NO order sent. `live`:
+#: the same, with the book's orders routed to the paper broker (prod only).
+#: `simulated`: the same, with the book filled by the staging simulated router at
+#: the session close and no broker reached (staging only,
+#: `alpha-engine-config-I12685`). The harness counts `simulated` as served only
+#: under ``NE_ENV=staging`` and never beside a `live` day.
+SessionMode = Literal["shadow", "live", "simulated"]
+SESSION_MODES: tuple[str, ...] = ("shadow", "live", "simulated")
+#: The mode only staging may file (`crucible.models.STAGING_SERVED_SESSION_MODES`).
+SIMULATED_MODE = "simulated"
 
 
 class ContractUnavailable(RuntimeError):
@@ -198,6 +205,7 @@ def record_session(
     calendar_date: str | None = None,
     put: Callable[[str, bytes], object] | None = None,
     alpha_bench: TraderEvidenceBench | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> TraderEvidenceDocument:
     """Add ``contract``'s trading day, and how it was served, to the consumer evidence.
 
@@ -229,17 +237,39 @@ def record_session(
     restarts the count exactly as a promotion does. The field is written only
     when set: a document served on the forecast is byte-for-byte what it was.
 
+    **``simulated`` is staging's alone** (`alpha-engine-config-I12685`). It is
+    refused unless ``environ`` (default `os.environ`) names staging, the same
+    test the simulated router's own switch applies, so a simulated day can never
+    be written into a prod record whatever the caller passed. The harness then
+    refuses a record holding both `live` and `simulated` days.
+
     Idempotent within a day: recording the same trading day twice leaves the
     count unchanged, so a retried session does not inflate it. A day recorded
-    `shadow` and later served `live` becomes `live` (orders did leave the trader
-    that day); a day already `live` is never downgraded to `shadow`.
+    `shadow` and later served `live` (or `simulated`) takes the later mode
+    (orders did leave the trader's plan that day); a day already `live` or
+    `simulated` is never downgraded to `shadow`.
 
     ``put`` is the write (default `store.put_bytes`); the session job passes
     its run context's `record_output` so the document enters the manifest's
     `outputs[]`.
     """
-    if mode not in ("shadow", "live"):
-        raise ValueError(f"session mode {mode!r} is not 'shadow' or 'live'")
+    if mode not in SESSION_MODES:
+        raise ValueError(f"session mode {mode!r} is not one of {', '.join(SESSION_MODES)}")
+    if mode == SIMULATED_MODE:
+        # Imported here: `order_router` imports `construction`, which imports
+        # this module, so a top-level import would be circular.
+        from crucible_trader.order_router import (  # noqa: PLC0415
+            ENVIRONMENT_VAR,
+            STAGING_ENVIRONMENT,
+            is_staging,
+        )
+
+        if not is_staging(os.environ if environ is None else environ):
+            raise ValueError(
+                f"session mode {mode!r} outside {ENVIRONMENT_VAR}={STAGING_ENVIRONMENT}. A "
+                "simulated fill is never a prod served day, so it is never written into a "
+                "prod record (alpha-engine-config-I12685)."
+            )
     day = contract.trading_day
     previous = _read_evidence(store)
 
@@ -256,7 +286,7 @@ def record_session(
     else:
         days = [day]
         modes = {}
-    if modes.get(day) != "live":
+    if mode != "shadow" or modes.get(day) in (None, "shadow"):
         modes[day] = mode
 
     document = TraderEvidenceDocument(

@@ -273,8 +273,16 @@ def build_shortfall_document(
     fills: Sequence[Fill],
     now: dt.datetime,
     band: ShortfallBand = SHORTFALL_BAND,
+    fill_source: str | None = None,
 ) -> dict[str, object]:
-    """The `computed` document for a session in which orders were placed."""
+    """The `computed` document for a session in which orders were placed.
+
+    ``fill_source`` is written only when given (`alpha-engine-config-I12685`):
+    the staging simulated router passes ``simulated_close``, which the harness
+    names and never pools as a measured shortfall. A broker session passes
+    nothing, so its document is byte-for-byte what it was (absent reads as
+    ``broker``).
+    """
     if not fills:
         raise ValueError(
             f"{trading_day}: no fills to measure. A session with no orders is "
@@ -305,6 +313,8 @@ def build_shortfall_document(
             _metric(trading_day=trading_day, value=weighted, n_filled=n_filled, band=band, now=now)
         ],
     }
+    if fill_source is not None:
+        document["fill_source"] = fill_source
     return validate_execution_shortfall(document, origin=execution_shortfall_key(trading_day))
 
 
