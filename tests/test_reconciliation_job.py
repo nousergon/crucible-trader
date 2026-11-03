@@ -480,6 +480,10 @@ class TestExceptionProposals:
     ):
         import crucible_trader.reconciliation_job as job
 
+        # The job stamps `detected_at` and every metric from the wall clock, so
+        # the two runs compared below must see the same clock.
+        monkeypatch.setattr(job, "dt", _FrozenClock())
+
         # The baseline: the same day with the proposer working.
         base_ctx = ctx_for(store)
         base_page = self._discrepant(store, base_ctx)
@@ -539,6 +543,18 @@ class TestExceptionProposals:
             )
         manifest = read_manifest(store, RECONCILE_JOB, DAY.isoformat())  # validates on read
         assert exception_proposals_key(DAY.isoformat()) in {o["key"] for o in manifest["outputs"]}
+
+
+class _FrozenClock:
+    """`datetime` as the job module sees it, with `datetime.now` fixed."""
+
+    class datetime(dt.datetime):  # noqa: N801 - stands in for `dt.datetime`
+        @classmethod
+        def now(cls, tz=None):  # pyright: ignore[reportImplicitOverride]
+            return dt.datetime(2026, 9, 11, 21, 0, 5, tzinfo=tz)
+
+    def __getattr__(self, name):
+        return getattr(dt, name)
 
 
 class _NoProposalWrites:
