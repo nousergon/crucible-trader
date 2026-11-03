@@ -48,6 +48,14 @@ first trading day AFTER the day it was made, so a re-run of any day books the
 same bytes. A gap is cleared once: any adjustment already citing one of its ids
 settles it, exactly as the 1h aging check and the close (1e) read it.
 
+A decision on the month-end close's own line for a gap still in suspense
+(``close_suspense_cash`` / ``close_suspense_shares``) clears that gap the same
+way: :func:`close_suspense_line_ids` derives the ids the close gives a gap's
+lines, so a close-line decision resolves to exactly the gaps that line
+summarises. The adjustment still cites the GAP's exception ids (so it settles
+the gap once, whichever line was decided) and names the decided close line in
+``decided_exception_id``.
+
 **Append-only** (Rule 3). A day's journal is written once, create-if-absent
 (:func:`post_daily_ledger`); a re-run that produces the same bytes is a no-op
 and one that produces different bytes is refused and reported. A correction is
@@ -101,6 +109,7 @@ from crucible_trader.broker_statement import BrokerStatement
 from crucible_trader.exception_decision import effective_decisions, load_decisions
 from crucible_trader.exception_record import (
     PAPER_FUND_TENANT,
+    SOURCE_MONTH_END_CLOSE,
     exception_id,
     records_from_broker_reconciliation,
 )
@@ -142,6 +151,9 @@ _QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
 #: The verdicts that settle a break; ``defer`` leaves it in suspense.
 CLEARING_VERDICTS = frozenset({"agree", "correct"})
 _GAP_KINDS = ("cash_gap", "position_gap")
+#: The month-end close's classes for a gap still in suspense at the close.
+CLOSE_SUSPENSE_CASH = "close_suspense_cash"
+CLOSE_SUSPENSE_SHARES = "close_suspense_shares"
 
 ENTRY_KINDS = frozenset(
     {
@@ -663,6 +675,13 @@ def _book_clearances(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[
     decided = clearing_decisions(inputs.decisions, tenant, before=day)
     if not decided:
         return []
+    close_days = sorted(
+        {
+            str(d["trading_day"])
+            for d in decided.values()
+            if d.get("source") == SOURCE_MONTH_END_CLOSE
+        }
+    )
     mine = [e for e in ledger.entries if e.tenant == tenant and e.account == account]
     settled = {str(i) for e in mine if e.kind == "adjustment" for i in _cited(e)}
     out: list[dict[str, object]] = []
@@ -670,7 +689,15 @@ def _book_clearances(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[
         ids = _cited(gap)
         if gap.kind not in _GAP_KINDS or settled.intersection(ids):
             continue
-        decision = next((decided[i] for i in ids if i in decided), None)
+        # The gap's own exceptions first, then any month-end close line that
+        # reported it still in suspense (a close covers gaps booked by its day).
+        lines = [
+            i
+            for close_day in close_days
+            if gap.trading_day <= close_day
+            for i in close_suspense_line_ids(gap, close_day)
+        ]
+        decision = next((decided[i] for i in (*ids, *lines) if i in decided), None)
         if decision is None:
             continue
         postings: list[Posting] = []
@@ -705,6 +732,24 @@ def _book_clearances(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[
         out.append(
             {"gap_entry_id": gap.entry_id, "gap_day": gap.trading_day, "decision_id": decision_id}
         )
+    return out
+
+
+def close_suspense_line_ids(gap: Entry, close_day: str) -> list[str]:
+    """The exception ids the month-end close whose last trading day is
+    ``close_day`` gives ``gap``'s suspense postings while the gap is open: one
+    per posting, exactly as :func:`crucible_trader.month_end_close.close_month`
+    files them (class, then account, month and ``<instrument>@<gap day>``)."""
+    out: list[str] = []
+    for p in gap.postings:
+        if p.account == SUSPENSE_CASH:
+            klass, instrument = CLOSE_SUSPENSE_CASH, "USD"
+        elif p.account.startswith(SUSPENSE_POSITION) and p.quantity:
+            klass, instrument = CLOSE_SUSPENSE_SHARES, p.account[len(SUSPENSE_POSITION) :]
+        else:
+            continue
+        identity = (klass, gap.account, close_day[:7], f"{instrument}@{gap.trading_day}")
+        out.append(exception_id(SOURCE_MONTH_END_CLOSE, close_day, identity, tenant=gap.tenant))
     return out
 
 

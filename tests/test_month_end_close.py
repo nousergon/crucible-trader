@@ -32,6 +32,7 @@ from crucible_trader.ledger import (
     SUSPENSE_POSITION,
     Entry,
     Posting,
+    close_suspense_line_ids,
     journal_document,
     journal_key,
     load_journals,
@@ -422,6 +423,11 @@ class TestClose:
             "close_share_delta",
             "close_suspense_shares",
         ]
+        # The ledger derives the same id for the gap's close line, so a
+        # decision on that line clears the gap (alpha-engine-config-I13160).
+        (gap,) = [e for e in journals["2026-11-30"] if e.kind == "position_gap"]
+        (line,) = [e for e in document["exceptions"] if e["class"] == "close_suspense_shares"]
+        assert close_suspense_line_ids(gap, "2026-11-30") == [line["exception_id"]]
 
     def test_the_next_month_starts_from_the_prior_close(self, store):
         november(store)
