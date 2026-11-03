@@ -5,6 +5,8 @@ Synthetic documents only."""
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 
 import pytest
@@ -13,6 +15,7 @@ from crucible_trader.exception_record import (
     CLASSES_BY_SOURCE,
     CONTROL_ARM_VOID,
     DETECTING_JOB,
+    PAPER_FUND_TENANT,
     SOURCE_BROKER_RECONCILIATION,
     SOURCE_ORDER_INTENT_RECONCILIATION,
     ExceptionRecordError,
@@ -106,6 +109,50 @@ class TestVocabulary:
         assert one == exception_id("s", DAY, ("share_delta", "AAA"))
         assert one != exception_id("s", DAY, ("share_delta", "BBB"))
         assert len(one) == 32
+
+
+class TestTenant:
+    """`alpha-engine-config-I13118` (back office 1a): every record names its
+    tenant, and ids are stable per tenant."""
+
+    def test_the_paper_fund_keeps_every_id_filed_before_the_field(self):
+        legacy = hashlib.sha256(
+            json.dumps(["s", DAY, "share_delta", "AAA"], separators=(",", ":")).encode()
+        ).hexdigest()[:32]
+        assert exception_id("s", DAY, ("share_delta", "AAA")) == legacy
+        assert exception_id("s", DAY, ("share_delta", "AAA"), tenant=PAPER_FUND_TENANT) == legacy
+
+    def test_another_tenant_has_its_own_stable_ids(self):
+        mine = exception_id("s", DAY, ("share_delta", "AAA"), tenant="fund-b")
+        assert mine == exception_id("s", DAY, ("share_delta", "AAA"), tenant="fund-b")
+        assert mine != exception_id("s", DAY, ("share_delta", "AAA"))
+        assert mine != exception_id("s", DAY, ("share_delta", "AAA"), tenant="fund-c")
+
+    def test_both_converters_carry_the_tenant(self):
+        (share, _) = records_from_broker_reconciliation(broker_document(), detected_at=STAMP)
+        (intent,) = records_from_order_intent_reconciliation(intent_document([INTENT_ROW]))
+        assert share.to_document()["tenant"] == intent.to_document()["tenant"] == PAPER_FUND_TENANT
+        (theirs,) = records_from_order_intent_reconciliation(
+            intent_document([INTENT_ROW]), tenant="fund-b"
+        )
+        assert theirs.to_document()["tenant"] == "fund-b"
+        (other, _) = records_from_broker_reconciliation(
+            broker_document(), detected_at=STAMP, tenant="fund-b"
+        )
+        doc = other.to_document()
+        assert doc["tenant"] == "fund-b" and doc["exception_id"] != share.exception_id
+
+    def test_a_missing_or_malformed_tenant_is_refused(self):
+        (record, _) = records_from_broker_reconciliation(broker_document(), detected_at=STAMP)
+        doc = record.to_document()
+        missing = {k: v for k, v in doc.items() if k != "tenant"}
+        with pytest.raises(ExceptionRecordError):
+            validate_exception_record(missing)
+        for bad in ("", "Fund B", "-x", "x" * 64):
+            with pytest.raises(ExceptionRecordError, match="tenant"):
+                validate_exception_record({**doc, "tenant": bad})
+        with pytest.raises(ExceptionRecordError, match="tenant"):
+            exception_id("s", DAY, ("x",), tenant="NOPE")
 
 
 class TestBrokerConverter:

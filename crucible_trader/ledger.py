@@ -10,7 +10,7 @@ book and reconciles THAT to the broker.
 s whose ``amount_cents`` sum to exactly zero (USD, integer cents: Brian's
 "cash to whole cents"; never a float). A posting on a securities account also
 carries ``quantity`` (shares). Every entry carries ``tenant`` (multi-tenant from
-day one; the Nous Ergon paper fund is :data:`DEFAULT_TENANT`) and the broker
+day one; the Nous Ergon paper fund is :data:`PAPER_FUND_TENANT`) and the broker
 ``account``.
 
 **One economic event, one entry** (Rule 4). Each fill is a ``fill`` entry
@@ -81,15 +81,16 @@ from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
 )
 
 from crucible_trader.broker_statement import BrokerStatement
-from crucible_trader.exception_record import exception_id, records_from_broker_reconciliation
+from crucible_trader.exception_record import (
+    PAPER_FUND_TENANT,
+    exception_id,
+    records_from_broker_reconciliation,
+)
 from crucible_trader.reconciliation import CashFlow, CorporateActionSet, Fill
 
 LEDGER_SCHEMA_VERSION = "ledger_journal.v1"
 LEDGER_RECONCILIATION_SCHEMA_VERSION = "ledger_reconciliation.v1"
 
-#: The Nous Ergon paper fund. Same value as crucible-trader's exception-record
-#: tenant (alpha-engine-config-I13118); fold into one import once both land.
-DEFAULT_TENANT = "nous-ergon-paper"
 TENANT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 #: Journals are create-only (append-only by grant as well as by code); the
@@ -529,7 +530,9 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
     tenant, broker = inputs.tenant, inputs.broker
     day, account = broker.trading_day, broker.account
     cited: dict[str, list[str]] = {}
-    for record in records_from_broker_reconciliation(inputs.reconciliation, detected_at=day):
+    for record in records_from_broker_reconciliation(
+        inputs.reconciliation, detected_at=day, tenant=tenant
+    ):
         if record.instrument is not None:
             cited.setdefault(record.instrument, []).append(record.exception_id)
     expires = _later_trading_day(day, GAP_EXPIRY_TRADING_DAYS)
@@ -540,7 +543,7 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
         ours, theirs = held.get(ticker, 0), int(broker.positions.get(ticker, 0))
         if ours == theirs:
             continue
-        ledger_break = exception_id("ledger", day, ("position_gap", account, ticker))
+        ledger_break = exception_id("ledger", day, ("position_gap", account, ticker), tenant=tenant)
         ids = [*cited.get(ticker, []), ledger_break]
         breaks.append(
             {
@@ -569,7 +572,7 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
     ours_cash, theirs_cash = ledger.cents(tenant, account, CASH), to_cents(broker.cash_usd)
     if ours_cash != theirs_cash:
         delta = theirs_cash - ours_cash
-        ledger_break = exception_id("ledger", day, ("cash_gap", account, "USD"))
+        ledger_break = exception_id("ledger", day, ("cash_gap", account, "USD"), tenant=tenant)
         ids = [*cited.get("USD", []), ledger_break]
         breaks.append(
             {
@@ -664,7 +667,7 @@ def post_daily_ledger(
     corporate_actions: CorporateActionSet,
     reconciliation: Mapping[str, object],
     now: str,
-    tenant: str = DEFAULT_TENANT,
+    tenant: str = PAPER_FUND_TENANT,
 ) -> DayPosting | None:
     """Step 5d of `trader.reconcile`: book the day, reconcile the LEDGER to the
     broker, write the journal (create-only) and the reconciliation view, and

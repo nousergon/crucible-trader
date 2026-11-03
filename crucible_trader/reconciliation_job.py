@@ -22,6 +22,12 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    (:mod:`crucible_trader.exception_record`, `alpha-engine-config-I12892`
    phase 0) -- best effort, and never a change to what step 6 decides or pages
    (see :func:`file_exception_records`);
+5c. run the shadow proposer (:mod:`crucible_trader.exception_proposal`) over
+   the records 5b just filed and file its proposals at
+   `trader/exception_proposals/{day}.json` (`alpha-engine-config-I13119`,
+   back office 1b) -- same contract as 5b: any failure is logged and
+   swallowed, and never changes what step 6 decides or pages (see
+   :func:`file_exception_proposals`);
 5d. book the day into the v2 double-entry ledger, the book of record, and
    reconcile the LEDGER to the broker (:func:`crucible_trader.ledger.post_daily_ledger`,
    `alpha-engine-config-I13128`) -- never raises, and never a change to what
@@ -56,6 +62,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
@@ -75,6 +82,13 @@ from crucible_trader.dividend_entitlements import (
     OWED_BOOTSTRAP_FROM,
     load_declared_entitlements,
     owed_dividends,
+)
+from crucible_trader.exception_proposal import (
+    PROPOSAL_SCHEMA_VERSION,
+    PROPOSALS_PREFIX,
+    exception_proposals_key,
+    proposal_day_document,
+    propose_day,
 )
 from crucible_trader.exception_record import (
     EXCEPTION_SCHEMA_VERSION,
@@ -110,6 +124,8 @@ from crucible_trader.reconciliation_control import (
     ReconciliationVoidError,
     run_control_arm,
 )
+
+_LOG = logging.getLogger(__name__)
 
 RECONCILE_JOB = "trader.reconcile"
 METRIC_MODULE = "crucible_trader.reconciliation"
@@ -335,11 +351,12 @@ def reconcile_cycle(
             intent_document = reconcile_intents_step(ctx, orders=orders, executions=executions)
     finally:
         # In a `finally` so a step-5a raise still files the broker breaks, and
-        # `file_exception_records` never raises, so the raise (or step 6's
-        # page) is exactly what it would have been without it.
-        file_exception_records(ctx, document, intent_document, now=now)
-        # Step 5d: the ledger is the book of record. Like 5b it never raises,
-        # so the decision and page below are exactly what they were.
+        # neither step 5b nor 5c raises, so the raise (or step 6's page) is
+        # exactly what it would have been without them.
+        filed = file_exception_records(ctx, document, intent_document, now=now)
+        file_exception_proposals(ctx, filed, now=now)
+        # Step 5d: the ledger is the book of record. Like 5b and 5c it never
+        # raises, so the decision and page below are exactly what they were.
         post_daily_ledger(
             ctx,
             broker=broker,
@@ -434,7 +451,7 @@ def file_exception_records(
     intent_document: Mapping[str, object] | None,
     *,
     now: str,
-) -> None:
+) -> dict[str, object] | None:
     """Step 5b: file the day's breaks as `exception.v1` records. Never raises.
 
     `alpha-engine-config-I12892` phase 0: a break was a page and nothing else,
@@ -451,10 +468,14 @@ def file_exception_records(
     because the alternative is worse: a raise here would replace step 6's page
     (whose reason names every finding) with a storage error, or fail a run the
     detectors passed. The page is the control; this record rides beside it.
+
+    Returns the day document it filed, for step 5c, or ``None`` when it filed
+    nothing (a clean day, or a failure).
     """
     day = ctx.trading_day.isoformat()
     key = exceptions_key(day)
     count = 0
+    filed: dict[str, object] | None = None
     try:
         records = records_from_broker_reconciliation(broker_document, detected_at=now)
         if intent_document is not None:
@@ -463,13 +484,13 @@ def file_exception_records(
             )
         count = len(records)
         if records:
+            day_document = exception_day_document(day, records)
             ctx.record_output(
                 key,
-                json.dumps(exception_day_document(day, records), indent=2, sort_keys=True).encode(
-                    "utf-8"
-                ),
+                json.dumps(day_document, indent=2, sort_keys=True).encode("utf-8"),
                 EXCEPTION_SCHEMA_VERSION,
             )
+            filed = day_document
     except Exception as exc:  # noqa: BLE001 - see docstring: must never mask the page
         status, value = "FAIL", None
         reason = (
@@ -478,7 +499,7 @@ def file_exception_records(
         )
     else:
         if not records:
-            return
+            return None
         status, value = "OK", float(count)
         reason = f"{count} exception records filed for {day}"
     ctx.record_metric(
@@ -495,6 +516,74 @@ def file_exception_records(
             "last_updated_utc": now,
         }
     )
+    return filed
+
+
+#: The MetricRecord that says whether step 5c filed the day's proposals.
+EXCEPTION_PROPOSALS_METRIC = "exception_proposals_filed"
+
+
+def file_exception_proposals(
+    ctx: RunContext, exception_document: Mapping[str, object] | None, *, now: str
+) -> None:
+    """Step 5c: file the shadow proposer's proposals for the day's records.
+    Never raises.
+
+    `alpha-engine-config-I13119` (back office 1b): the proposer
+    (:func:`~crucible_trader.exception_proposal.propose_day`) ran only by hand,
+    so no day had proposals for a reviewer to decide. This step proposes over
+    exactly the day document step 5b filed and files the result at
+    :func:`~crucible_trader.exception_proposal.exception_proposals_key`, plus
+    one ``exception_proposals_filed`` MetricRecord. When 5b filed nothing there
+    is nothing to propose, and this step adds nothing.
+
+    The proposals are shadow: nothing reads them to act. So ANY failure here --
+    in the proposer, the write or the metric -- is logged and swallowed, and the
+    job's outputs, decision, raise and page text are what they would have been
+    without this step. A failed proposer costs the day's proposals, never the
+    reconciliation.
+    """
+    if exception_document is None:
+        return
+    day = ctx.trading_day.isoformat()
+    key = PROPOSALS_PREFIX  # the metric's source path until the day's key is built
+    try:
+        key = exception_proposals_key(day)
+        proposals = propose_day(exception_document, proposed_at=now)
+        ctx.record_output(
+            key,
+            json.dumps(proposal_day_document(day, proposals), indent=2, sort_keys=True).encode(
+                "utf-8"
+            ),
+            PROPOSAL_SCHEMA_VERSION,
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring: shadow, must never reach the job
+        _LOG.warning("exception proposals for %s were NOT filed", day, exc_info=True)
+        status, value = "FAIL", None
+        reason = (
+            f"exception proposals for {day} were NOT filed: "
+            + (f"{type(exc).__name__}: {exc}")[:400]
+        )
+    else:
+        status, value = "OK", float(len(proposals))
+        reason = f"{len(proposals)} shadow exception proposals filed for {day}"
+    try:
+        ctx.record_metric(
+            {
+                "name": EXCEPTION_PROPOSALS_METRIC,
+                "module": "crucible_trader.exception_proposal",
+                "metric_type": "operational",
+                "value": value,
+                "unit": "count" if value is not None else None,
+                "n_floor": 0,
+                "status": status,
+                "status_reason": reason,
+                "source_path": key,
+                "last_updated_utc": now,
+            }
+        )
+    except Exception:  # noqa: BLE001 - see docstring
+        _LOG.warning("exception proposals metric for %s was NOT recorded", day, exc_info=True)
 
 
 def page_text(result: ReconciliationResult) -> str:

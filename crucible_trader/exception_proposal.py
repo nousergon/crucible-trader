@@ -27,9 +27,16 @@ A proposal names:
 * ``rule_id`` and ``ruleset_version`` -- which rule fired, so a later score can
   attribute agreement to a rule and a rule change starts a fresh record;
 * ``proposal_id`` -- derived from the exception id and the ruleset version, so
-  re-running the same rules over the same break gives the same id.
+  re-running the same rules over the same break gives the same id;
+* ``tenant`` -- the record's own tenant (`alpha-engine-config-I13118`); the
+  exception id is already stable per tenant, so the proposal id is too.
 
-Nothing here writes, places, cancels or books anything. The proposals are built
+The daily reconcile job files the day's proposals at
+:func:`exception_proposals_key` beside the records they are about
+(`alpha-engine-config-I13119`; see
+:func:`crucible_trader.reconciliation_job.file_exception_proposals`).
+
+Nothing here places, cancels or books anything. The proposals are built
 FROM stored `exception.v1` day files, and the CLI only reads the store (wrapped
 in `crucible.store.read_only`) and prints JSON lines:
 
@@ -58,19 +65,23 @@ from crucible_trader.exception_record import (
     SOURCE_BROKER_RECONCILIATION,
     SOURCE_ORDER_INTENT_RECONCILIATION,
     ExceptionRecordError,
+    exceptions_key,
     validate_exception_day_document,
 )
 
 __all__ = [
     "ACTIONS",
     "NATURES",
+    "PROPOSALS_PREFIX",
     "PROPOSAL_SCHEMA_VERSION",
     "PROPOSER",
     "RULESET_VERSION",
     "Proposal",
+    "exception_proposals_key",
     "main",
     "propose",
     "propose_day",
+    "proposal_day_document",
     "proposals_from_store",
 ]
 
@@ -81,6 +92,11 @@ PROPOSAL_SCHEMA_VERSION = "exception_proposal.v1"
 RULESET_VERSION = "deterministic.2026-11-02b"
 
 PROPOSER = "crucible-trader.exception_proposal"
+
+#: Where the reconcile job files the day's proposals: beside
+#: :data:`~crucible_trader.exception_record.EXCEPTIONS_PREFIX`, and outside
+#: `crucible.keys` for the same reason (a key there moves the trader pin).
+PROPOSALS_PREFIX = "trader/exception_proposals/"
 
 NATURES: tuple[str, ...] = ("event", "defect", "detector")
 
@@ -220,6 +236,7 @@ _check_exhaustive(_RULES)
 @dataclasses.dataclass(frozen=True)
 class Proposal:
     exception_id: str
+    tenant: str
     trading_day: str
     source: str
     klass: str
@@ -241,6 +258,7 @@ class Proposal:
             "schema_version": PROPOSAL_SCHEMA_VERSION,
             "proposal_id": self.proposal_id,
             "exception_id": self.exception_id,
+            "tenant": self.tenant,
             "trading_day": self.trading_day,
             "source": self.source,
             "class": self.klass,
@@ -268,6 +286,7 @@ def propose(record: Mapping[str, object], *, proposed_at: str) -> Proposal:
         rationale += "; HELD: the run's control arm was void"
     return Proposal(
         exception_id=cast("str", record["exception_id"]),
+        tenant=cast("str", record["tenant"]),
         trading_day=cast("str", record["trading_day"]),
         source=source,
         klass=klass,
@@ -287,6 +306,29 @@ def propose_day(document: Mapping[str, object], *, proposed_at: str) -> list[Pro
     validate_exception_day_document(document)
     records = cast("list[Mapping[str, object]]", document["records"])
     return [propose(r, proposed_at=proposed_at) for r in records]
+
+
+def exception_proposals_key(trading_day: str) -> str:
+    """The store key of ``trading_day``'s proposals."""
+    return f"{PROPOSALS_PREFIX}{exceptions_key(trading_day).removeprefix(EXCEPTIONS_PREFIX)}"
+
+
+def proposal_day_document(trading_day: str, proposals: Sequence[Proposal]) -> dict[str, object]:
+    """The day's proposals file: every proposal for ``trading_day``, in the
+    records' order, under the ruleset that made them. A proposal for another
+    day is refused."""
+    documents = [p.to_document() for p in proposals]
+    for doc in documents:
+        if doc["trading_day"] != trading_day:
+            raise ExceptionRecordError(
+                f"proposal {doc['proposal_id']} is for {doc['trading_day']}, not {trading_day}"
+            )
+    return {
+        "schema_version": PROPOSAL_SCHEMA_VERSION,
+        "trading_day": trading_day,
+        "ruleset_version": RULESET_VERSION,
+        "proposals": documents,
+    }
 
 
 def proposals_from_store(

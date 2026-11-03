@@ -14,11 +14,10 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement
-from crucible_trader.exception_record import exception_id
+from crucible_trader.exception_record import PAPER_FUND_TENANT, exception_id
 from crucible_trader.ledger import (
     CASH,
     COMMISSIONS,
-    DEFAULT_TENANT,
     SECURITIES,
     SUSPENSE_CASH,
     DayInputs,
@@ -49,7 +48,7 @@ from crucible_trader.reconciliation import (
     reconcile,
 )
 
-T = DEFAULT_TENANT
+T = PAPER_FUND_TENANT
 PREV, DAY, NEXT = "2026-11-02", "2026-11-03", "2026-11-04"
 NONE = CorporateActionSet(resolved=frozenset({"AAA", "BBB"}))
 
