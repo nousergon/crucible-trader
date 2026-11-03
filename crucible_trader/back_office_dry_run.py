@@ -19,9 +19,13 @@ NOTHING it does reaches the store:
    statement and reconciliation, anchored on the previous stored statement.
    v2 kept no fills before the cutover, so ``--fills`` takes them as JSON lines
    (``trading_day``, ``ticker``, ``shares``, ``cash_usd``, optional
-   ``commission_usd`` and ``exec_id``); without it every position change is a
-   ledger gap booked to suspense, which the close then refuses on -- the plan's
-   "any day that ledger cannot reproduce is itself a break to explain";
+   ``commission_usd`` and ``exec_id``; v1's October trades export with
+   :mod:`crucible_trader.v1_fills_export`); without it every position change is
+   a ledger gap booked to suspense, which the close then refuses on -- the
+   plan's "any day that ledger cannot reproduce is itself a break to explain".
+   A fill on a day with no stored reconciliation is booked on the next day the
+   ledger posts, because that day is posted against the last accepted
+   statement (``fills_booked_on_a_later_day``);
 4. **close** the month (:func:`crucible_trader.month_end_close.close_prior_month`)
    as the first run of the next month would, and, if it closes, file its
    statement and fee bill (:func:`crucible_trader.performance_statement.file_statement`).
@@ -184,20 +188,30 @@ def dry_run(
                 ).encode(),
             )
 
-    # 3: book every stored day into the ledger, oldest first.
+    # 3: book every stored day into the ledger, oldest first. A day is posted
+    # against the last statement the ledger accepted, so its fills are every
+    # fill since that statement: a fill on a day with no reconciliation (or on
+    # a day whose posting failed) is booked on the next posted day, not lost
+    # into suspense (`alpha-engine-config-I13124`).
     ledger: list[dict[str, object]] = []
     anchor: BrokerStatement | None = None
+    anchor_day: str | None = None
+    booked_on: dict[str, str] = {}
     for day in stored:
         ctx = _ctx(store, day, now)
         broker = _statement(store, day)
         reconciliation = cast(
             "dict[str, object]", json.loads(store.get_bytes(trader_reconciliation_key(day)))
         )
+        span = sorted(
+            d for d in fills if d == day or (anchor_day is not None and anchor_day < d < day)
+        )
+        booked_on.update({d: day for d in span if d != day})
         posting = post_daily_ledger(
             ctx,
             broker=broker,
             anchor=anchor,
-            fills=fills.get(day, ()),
+            fills=[fill for d in span for fill in fills[d]],
             cash_flows=(),
             corporate_actions=_NO_ACTIONS,
             reconciliation=reconciliation,
@@ -208,7 +222,7 @@ def dry_run(
             for m in cast("list[dict[str, object]]", ctx.metrics)
         )
         if posting is not None:
-            anchor = broker
+            anchor, anchor_day = broker, day
 
     # 4: close the month as the next month's first run would.
     run_day = _next_trading_day(trading_days[-1])
@@ -240,6 +254,7 @@ def dry_run(
         "days_without_reconciliation": [d for d in trading_days if d not in stored],
         "export_failures": export_failures,
         "fills_on_days_without_reconciliation": unused_fills,
+        "fills_booked_on_a_later_day": dict(sorted(booked_on.items())),
         "records": len(records),
         "records_by_class": dict(sorted(Counter(str(r["class"]) for r in records).items())),
         "ledger": ledger,

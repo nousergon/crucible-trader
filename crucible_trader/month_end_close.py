@@ -11,7 +11,8 @@ of record) and closes one month for one tenant's account:
   last trading day;
 * **cash** -- the ledger's month-end cash tied out to the same statement;
 * **P&L** -- realised (average cost), the change in unrealised, dividends,
-  declared cash flows, commissions and suspense movements, which must sum to
+  declared cash flows, commissions, suspense movements and the reconciliation
+  adjustments that clear decided breaks, which must sum to
   the change in NAV to the cent (the attribution check);
 * **fees accrued** -- the commissions booked in the month. The simulated
   adviser and performance fees are 1f's bill, produced from this close
@@ -74,11 +75,14 @@ from crucible_trader.exception_record import (
 )
 from crucible_trader.ledger import (
     CASH,
+    CLOSE_SUSPENSE_CASH,
+    CLOSE_SUSPENSE_SHARES,
     COMMISSIONS,
     DECLARED_FLOWS,
     DIVIDEND_INCOME,
     GAP_EXPIRY_TRADING_DAYS,
     RECEIVABLE,
+    RECONCILIATION_ADJUSTMENTS,
     SECURITIES,
     SUSPENSE_CASH,
     SUSPENSE_POSITION,
@@ -304,7 +308,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             )
 
     # ---- walk the month: average cost, realised P&L, income and expense.
-    realised = dividends = flows = commissions = suspense = 0
+    realised = dividends = flows = commissions = suspense = adjustments = 0
     for d in sorted(within):
         for entry in within[d]:
             if entry.kind == "opening_balance":
@@ -318,6 +322,8 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                     dividends -= p.amount_cents
                 elif p.account == SUSPENSE_CASH or p.account.startswith(SUSPENSE_POSITION):
                     suspense -= p.amount_cents
+                elif p.account == RECONCILIATION_ADJUSTMENTS:
+                    adjustments -= p.amount_cents
                 elif p.account.startswith(SECURITIES):
                     realised += _move(lots, p.account[len(SECURITIES) :], p, entry.kind)
     # A position that went to zero realises whatever cost it still carries.
@@ -391,7 +397,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             for p in e.postings:
                 if p.account == SUSPENSE_CASH:
                     unexplained(
-                        "close_suspense_cash",
+                        CLOSE_SUSPENSE_CASH,
                         f"USD@{d}",
                         f"cash gap {e.entry_id} of {-p.amount_cents} cents booked {d} is not "
                         "cleared by any adjustment",
@@ -400,7 +406,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                 elif p.account.startswith(SUSPENSE_POSITION) and p.quantity:
                     ticker = p.account[len(SUSPENSE_POSITION) :]
                     unexplained(
-                        "close_suspense_shares",
+                        CLOSE_SUSPENSE_SHARES,
                         f"{ticker}@{d}",
                         f"share gap {e.entry_id} of {-p.quantity} {ticker} booked {d} is not "
                         "cleared by any adjustment",
@@ -416,6 +422,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
         "declared_cash_flows_cents": flows,
         "commissions_cents": -commissions,
         "suspense_cents": suspense,
+        "reconciliation_adjustments_cents": adjustments,
     }
     total = sum(attribution.values())
     priced = not unpriced and all(row["close_usd"] is not None for row in positions.values())

@@ -86,6 +86,7 @@ __all__ = [
     "DecisionError",
     "decide",
     "decision_key",
+    "effective_decisions",
     "exception_score_key",
     "load_decisions",
     "load_proposals",
@@ -349,7 +350,7 @@ def load_decisions(store: Store, *, prefix: str = DECISIONS_PREFIX) -> list[dict
     return out
 
 
-def _effective(
+def effective_decisions(
     decisions: Iterable[Mapping[str, object]],
 ) -> dict[str, tuple[str, Mapping[str, object] | None]]:
     """Per proposal id: ``("decided", decision)`` for the one decision nothing
@@ -385,7 +386,7 @@ def record_decision(store: Store, document: Mapping[str, object]) -> str:
         for d in load_decisions(store, prefix=f"{DECISIONS_PREFIX}{day}/")
         if d["proposal_id"] == document["proposal_id"]
     ]
-    state = _effective(prior).get(cast("str", document["proposal_id"]))
+    state = effective_decisions(prior).get(cast("str", document["proposal_id"]))
     standing = state[1]["decision_id"] if state is not None and state[1] is not None else None
     if state is not None and state[0] == "conflicted":
         raise DecisionError("this proposal has conflicting decisions; settle them by hand first")
@@ -423,7 +424,7 @@ def score(
     ``orphan_decisions`` and score nothing.
     """
     _day(as_of)
-    effective = _effective(decisions)
+    effective = effective_decisions(decisions)
     known = {cast("str", p["proposal_id"]) for p in proposals}
     groups: dict[tuple[str, str, str, str], dict[str, object]] = {}
     queue: list[dict[str, object]] = []
