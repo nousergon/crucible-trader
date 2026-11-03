@@ -1,0 +1,744 @@
+"""The v2 double-entry ledger: the trader's book of record.
+
+`alpha-engine-config-I13128` (back office 1g), per nous-ergon-ops
+`policies/portfolio-accounting-policy.md` Rules 1-4 and 8. Until this module the
+v2 reconciler's expected side was IB's prior statement plus the day's fills, so
+the broker's figures were compared with themselves. This module keeps our own
+book and reconciles THAT to the broker.
+
+**Shape.** A journal of :class:`Entry` records, each a set of :class:`Posting`
+s whose ``amount_cents`` sum to exactly zero (USD, integer cents: Brian's
+"cash to whole cents"; never a float). A posting on a securities account also
+carries ``quantity`` (shares). Every entry carries ``tenant`` (multi-tenant from
+day one; the Nous Ergon paper fund is :data:`DEFAULT_TENANT`) and the broker
+``account``.
+
+**One economic event, one entry** (Rule 4). Each fill is a ``fill`` entry
+(security against cash at the execution price) and its commission is its own
+``commission`` entry. A cash dividend is a ``dividend_receivable`` entry and a
+``dividend_settlement`` entry. A split is a ``split`` entry restating quantity
+at unchanged cents. A declared cash flow (interest, fee) is its own entry.
+Entry ids are event-addressed (:func:`entry_id`), so a re-run cannot book an
+event twice.
+
+**Ground truth** (Brian 2026-10-22, Rule 5): IB for shares and cash; Polygon
+(the reconciler's corporate-action set) for splits and dividends. After the
+day's events are booked, the ledger is compared with the broker's statement.
+Every difference is a BREAK, and **every cash gap gets a journal entry**
+(Brian 2026-11-02): a ``cash_gap`` entry moves the difference between cash and
+the named suspense account :data:`SUSPENSE_CASH`; a share difference is a
+``position_gap`` entry against ``suspense:position_gap:<T>``. Each gap entry
+cites the break's exception ids (the reconciler's own ``exception.v1`` ids for
+the same instrument, plus the ledger's break id), ``decision_id`` (``None``
+until a 1c decision posts the clearing adjustment) and an ``expires`` day. The
+suspense balances are reported every day and the ledger is not ``clean`` while
+any is non-zero: a gap is booked, never absorbed (Rule 8).
+
+**Append-only** (Rule 3). A day's journal is written once, create-if-absent
+(:func:`post_daily_ledger`); a re-run that produces the same bytes is a no-op
+and one that produces different bytes is refused and reported. A correction is
+a new ``adjustment`` entry in a later day's journal.
+
+**Trial balance on every append**: :meth:`Ledger.append` refuses an unbalanced
+entry, a duplicate id, and re-checks that the whole ledger sums to zero.
+
+**Opening balance.** The first day a tenant's account has no journal, an
+``opening_balance`` entry books the cash and share counts of the anchor (IB's
+statement for the previous session; on a declared genesis day, today's).
+Securities open at zero cents: cost basis is not established at opening, and
+valuation is shares x settled close (Rule 7), which lands with the close (1e).
+The securities accounts' cents are trade consideration (net cash paid in), not
+cost basis.
+
+**Known deltas, stated rather than hidden.** The corporate-action feed gives a
+dividend on its PAY date, so the receivable is recognised on the pay date, not
+the ex-date (Rule 4 wants the ex-date); the cash settles when the reconciler
+says it arrived (``dividends_unpaid`` / ``dividend_credits``). Valuation entries
+(Rule 7) are not booked here.
+
+**Failure isolation.** :func:`post_daily_ledger` NEVER raises: the trader's
+reconcile job decides and pages exactly as before; this step rides beside it
+and reports through one MetricRecord (``FAIL`` when it could not post).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
+
+from crucible.calendar import is_trading_day  # pyright: ignore[reportMissingTypeStubs]
+from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
+    ETAG_ABSENT,
+    PointerConflictError,
+    Store,
+)
+
+from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.exception_record import exception_id, records_from_broker_reconciliation
+from crucible_trader.reconciliation import CashFlow, CorporateActionSet, Fill
+
+LEDGER_SCHEMA_VERSION = "ledger_journal.v1"
+LEDGER_RECONCILIATION_SCHEMA_VERSION = "ledger_reconciliation.v1"
+
+#: The Nous Ergon paper fund. Same value as crucible-trader's exception-record
+#: tenant (alpha-engine-config-I13118); fold into one import once both land.
+DEFAULT_TENANT = "nous-ergon-paper"
+TENANT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+#: Journals are create-only (append-only by grant as well as by code); the
+#: reconciliation view is a derived document and may be rewritten by a re-run.
+LEDGER_JOURNAL_PREFIX = "trader/ledger/journal/"
+LEDGER_RECONCILIATION_PREFIX = "trader/ledger/reconciliation/"
+
+CASH = "assets:cash:USD"
+COMMISSIONS = "expenses:commissions"
+DECLARED_FLOWS = "income:declared_cash_flows"
+OPENING = "equity:opening_balance"
+SUSPENSE_CASH = "suspense:cash_gap"
+SECURITIES = "assets:securities:"
+RECEIVABLE = "assets:dividends_receivable:"
+DIVIDEND_INCOME = "income:dividends:"
+SUSPENSE_POSITION = "suspense:position_gap:"
+_FIXED_ACCOUNTS = frozenset({CASH, COMMISSIONS, DECLARED_FLOWS, OPENING, SUSPENSE_CASH})
+_PER_INSTRUMENT = (SECURITIES, RECEIVABLE, DIVIDEND_INCOME, SUSPENSE_POSITION)
+#: Only these accounts hold shares.
+_QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION)
+
+ENTRY_KINDS = frozenset(
+    {
+        "opening_balance",
+        "fill",
+        "commission",
+        "declared_cash_flow",
+        "dividend_receivable",
+        "dividend_settlement",
+        "split",
+        "cash_gap",
+        "position_gap",
+        "adjustment",
+    }
+)
+
+#: Trading days a gap entry's suspense may stand before it is overdue (the
+#: plan's break-aging limit: older than 3 trading days pages, 1c/1d).
+GAP_EXPIRY_TRADING_DAYS = 3
+
+LEDGER_METRIC = "ledger_book_of_record"
+
+
+class LedgerError(ValueError):
+    """An entry or journal the ledger refuses. Raised inside the pure core;
+    :func:`post_daily_ledger` catches it and reports, never re-raises."""
+
+
+def to_cents(usd: float | Decimal | str) -> int:
+    """USD to integer cents, half-up on the decimal string (never binary)."""
+    value = Decimal(repr(usd)) if isinstance(usd, float) else Decimal(usd)
+    if not value.is_finite():
+        raise LedgerError(f"amount {usd!r} is not finite")
+    return int((value * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def _valid_account(name: str) -> bool:
+    if name in _FIXED_ACCOUNTS:
+        return True
+    return any(name.startswith(p) and len(name) > len(p) for p in _PER_INSTRUMENT)
+
+
+@dataclasses.dataclass(frozen=True)
+class Posting:
+    account: str
+    amount_cents: int
+    quantity: int | None = None
+
+    def __post_init__(self) -> None:
+        if not _valid_account(self.account):
+            raise LedgerError(f"account {self.account!r} is not in the chart of accounts")
+        if type(self.amount_cents) is not int:
+            raise LedgerError(
+                f"{self.account}: amount_cents must be an int, not {self.amount_cents!r}"
+            )
+        if self.quantity is not None:
+            if type(self.quantity) is not int:
+                raise LedgerError(f"{self.account}: quantity must be an int")
+            if not self.account.startswith(_QUANTITY_ACCOUNTS):
+                raise LedgerError(f"{self.account}: only securities accounts carry shares")
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "account": self.account,
+            "amount_cents": self.amount_cents,
+            "quantity": self.quantity,
+        }
+
+
+def entry_id(tenant: str, account: str, trading_day: str, kind: str, event_ref: str) -> str:
+    """Event-addressed: the same event always has the same id."""
+    payload = json.dumps([tenant, account, trading_day, kind, event_ref], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+@dataclasses.dataclass(frozen=True)
+class Entry:
+    tenant: str
+    account: str
+    trading_day: str
+    kind: str
+    event_ref: str
+    postings: tuple[Posting, ...]
+    evidence: Mapping[str, object] = dataclasses.field(default_factory=dict[str, object])
+
+    def __post_init__(self) -> None:
+        if not TENANT_RE.fullmatch(self.tenant):
+            raise LedgerError(f"tenant {self.tenant!r} does not match {TENANT_RE.pattern}")
+        if self.kind not in ENTRY_KINDS:
+            raise LedgerError(f"entry kind {self.kind!r} is not one of {sorted(ENTRY_KINDS)}")
+        if not self.postings:
+            raise LedgerError(f"{self.kind} {self.event_ref}: an entry needs a posting")
+        total = sum(p.amount_cents for p in self.postings)
+        if total != 0:
+            raise LedgerError(
+                f"{self.kind} {self.event_ref} on {self.trading_day} does not balance: "
+                f"postings sum to {total} cents"
+            )
+        if self.kind == "adjustment" and not (
+            self.evidence.get("exception_ids") and self.evidence.get("decision_id")
+        ):
+            raise LedgerError("an adjustment must cite its exception ids and decision id")
+
+    @property
+    def entry_id(self) -> str:
+        return entry_id(self.tenant, self.account, self.trading_day, self.kind, self.event_ref)
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "entry_id": self.entry_id,
+            "tenant": self.tenant,
+            "account": self.account,
+            "trading_day": self.trading_day,
+            "kind": self.kind,
+            "event_ref": self.event_ref,
+            "postings": [p.to_document() for p in self.postings],
+            "evidence": dict(self.evidence),
+        }
+
+
+def entry_from_document(document: Mapping[str, Any]) -> Entry:  # pyright: ignore[reportExplicitAny]
+    entry = Entry(
+        tenant=document["tenant"],
+        account=document["account"],
+        trading_day=document["trading_day"],
+        kind=document["kind"],
+        event_ref=document["event_ref"],
+        postings=tuple(
+            Posting(p["account"], p["amount_cents"], p.get("quantity"))
+            for p in document["postings"]
+        ),
+        evidence=document.get("evidence") or {},
+    )
+    if document.get("entry_id") != entry.entry_id:
+        raise LedgerError(f"stored entry id {document.get('entry_id')!r} is not its event's id")
+    return entry
+
+
+class Ledger:
+    """An append-only, always-balanced set of entries."""
+
+    def __init__(self) -> None:
+        self._entries: list[Entry] = []
+        self._ids: set[str] = set()
+        self._cents: dict[str, int] = {}
+        self._shares: dict[str, int] = {}
+
+    @property
+    def entries(self) -> tuple[Entry, ...]:
+        return tuple(self._entries)
+
+    def append(self, entry: Entry) -> None:
+        """Append ``entry``; the trial balance is re-checked on every append."""
+        if entry.entry_id in self._ids:
+            raise LedgerError(
+                f"{entry.kind} {entry.event_ref}: entry {entry.entry_id} already booked"
+            )
+        if (
+            sum(p.amount_cents for p in entry.postings) != 0
+        ):  # Entry checks too; never trusted alone
+            raise LedgerError(f"{entry.entry_id} does not balance")
+        for p in entry.postings:
+            key = _balance_key(entry, p.account)
+            self._cents[key] = self._cents.get(key, 0) + p.amount_cents
+            if p.quantity is not None:
+                self._shares[key] = self._shares.get(key, 0) + p.quantity
+        self._entries.append(entry)
+        self._ids.add(entry.entry_id)
+        if self.trial_balance() != 0:
+            raise LedgerError(
+                f"trial balance is {self.trial_balance()} cents after {entry.entry_id}"
+            )
+
+    def trial_balance(self) -> int:
+        return sum(self._cents.values())
+
+    def has_account(self, tenant: str, account: str) -> bool:
+        return any(e.tenant == tenant and e.account == account for e in self._entries)
+
+    def cents(self, tenant: str, account: str, ledger_account: str) -> int:
+        return self._cents.get(f"{tenant}|{account}|{ledger_account}", 0)
+
+    def positions(self, tenant: str, account: str) -> dict[str, int]:
+        prefix = f"{tenant}|{account}|{SECURITIES}"
+        return {k[len(prefix) :]: v for k, v in self._shares.items() if k.startswith(prefix) and v}
+
+    def balances(self, tenant: str, account: str, prefix: str) -> dict[str, int]:
+        head = f"{tenant}|{account}|"
+        return {
+            k[len(head) :]: v for k, v in self._cents.items() if k.startswith(head + prefix) and v
+        }
+
+    def suspense(self, tenant: str, account: str) -> dict[str, object]:
+        head = f"{tenant}|{account}|"
+        return {
+            "cash_cents": self.cents(tenant, account, SUSPENSE_CASH),
+            "shares": {
+                k[len(head + SUSPENSE_POSITION) :]: v
+                for k, v in self._shares.items()
+                if k.startswith(head + SUSPENSE_POSITION) and v
+            },
+        }
+
+
+def _balance_key(entry: Entry, ledger_account: str) -> str:
+    return f"{entry.tenant}|{entry.account}|{ledger_account}"
+
+
+def _later_trading_day(day: str, n: int) -> str:
+    current = dt.date.fromisoformat(day)
+    while n > 0:
+        current += dt.timedelta(days=1)
+        if is_trading_day(current):
+            n -= 1
+    return current.isoformat()
+
+
+@dataclasses.dataclass(frozen=True)
+class DayInputs:
+    """Everything one day's posting reads. ``reconciliation`` is the stored
+    ``broker_reconciliation.v1`` document (with ``control_arm``/``void``)."""
+
+    tenant: str
+    broker: BrokerStatement
+    anchor: BrokerStatement | None
+    fills: tuple[Fill, ...]
+    cash_flows: tuple[CashFlow, ...]
+    corporate_actions: CorporateActionSet
+    reconciliation: Mapping[str, object]
+
+
+@dataclasses.dataclass(frozen=True)
+class DayPosting:
+    entries: tuple[Entry, ...]
+    breaks: tuple[dict[str, object], ...]
+    document: dict[str, object]
+
+
+def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
+    """Book one day's events into ``ledger`` (mutating it), compare with the
+    broker, book a gap entry per break, and return the day's entries and the
+    reconciliation view. Pure: no I/O. Raises :class:`LedgerError`."""
+    tenant, broker = inputs.tenant, inputs.broker
+    day, account = broker.trading_day, broker.account
+    new: list[Entry] = []
+
+    def book(kind: str, ref: str, postings: Iterable[Posting], **evidence: object) -> None:
+        entry = Entry(tenant, account, day, kind, ref, tuple(postings), evidence)
+        ledger.append(entry)
+        new.append(entry)
+
+    opened_from_today = False
+    if not ledger.has_account(tenant, account):
+        opening = (
+            inputs.anchor
+            if inputs.anchor is not None and inputs.anchor.account == account
+            else None
+        )
+        source = opening if opening is not None else broker
+        # Opened from TODAY's statement (genesis, no anchor): today's events are
+        # already inside it, so booking them again would count them twice.
+        opened_from_today = opening is None
+        cash = to_cents(source.cash_usd)
+        book(
+            "opening_balance",
+            f"statement:{source.trading_day}",
+            [Posting(CASH, cash), Posting(OPENING, -cash)]
+            + [
+                Posting(SECURITIES + t, 0, int(q)) for t, q in sorted(source.positions.items()) if q
+            ],
+            source="ib_statement",
+            statement_day=source.trading_day,
+            cost_basis="not established at opening; valued at shares x settled close (Rule 7)",
+            includes_this_days_events=opened_from_today,
+        )
+
+    prior = ledger.positions(tenant, account)
+    actions = () if opened_from_today else inputs.corporate_actions.actions
+    fills = () if opened_from_today else inputs.fills
+    flows = () if opened_from_today else inputs.cash_flows
+    for action in actions:
+        if action.kind != "split" or action.ratio is None or action.ratio <= 0:
+            continue
+        held = prior.get(action.ticker, 0)
+        rebased = held * action.ratio
+        if not float(rebased).is_integer() or int(rebased) == held:
+            continue  # cash in lieu is not modelled; the gap check books it
+        book(
+            "split",
+            f"split:{action.ticker}:{action.ratio!r}",
+            [Posting(SECURITIES + action.ticker, 0, int(rebased) - held)],
+            source="polygon_corporate_actions",
+            ratio=action.ratio,
+        )
+
+    for index, fill in enumerate(fills):
+        ref = fill.exec_id or f"fill:{index}:{fill.ticker}:{fill.shares}:{fill.cash_usd!r}"
+        if fill.commission_usd is None:
+            consideration, separated = to_cents(fill.cash_usd), False
+        else:
+            consideration = to_cents(
+                Decimal(repr(fill.cash_usd)) + Decimal(repr(fill.commission_usd))
+            )
+            separated = True
+        book(
+            "fill",
+            ref,
+            [
+                Posting(CASH, consideration),
+                Posting(SECURITIES + fill.ticker, -consideration, fill.shares),
+            ],
+            source="ib_execution",
+            commission_separated=separated,
+        )
+        if fill.commission_usd is not None and (commission := to_cents(fill.commission_usd)):
+            book(
+                "commission",
+                ref,
+                [Posting(COMMISSIONS, commission), Posting(CASH, -commission)],
+                source="ib_commission_report",
+            )
+
+    for index, flow in enumerate(flows):
+        cents = to_cents(flow.cash_usd)
+        book(
+            "declared_cash_flow",
+            f"flow:{index}:{flow.description}",
+            [Posting(CASH, cents), Posting(DECLARED_FLOWS, -cents)],
+            description=flow.description,
+        )
+
+    unpaid = {
+        (str(u["ticker"]), str(u["pay_date"]))
+        for u in _rows(inputs.reconciliation.get("dividends_unpaid"))
+    }
+    for action in actions:
+        if action.kind != "cash_dividend" or action.amount_per_share is None:
+            continue
+        shares = (
+            action.entitled_shares
+            if action.entitled_shares is not None
+            else prior.get(action.ticker, 0)
+        )
+        cents = to_cents(Decimal(repr(action.amount_per_share)) * shares)
+        if not cents:
+            continue
+        ref = f"dividend:{action.ticker}:{day}"
+        book(
+            "dividend_receivable",
+            ref,
+            [
+                Posting(RECEIVABLE + action.ticker, cents),
+                Posting(DIVIDEND_INCOME + action.ticker, -cents),
+            ],
+            source="polygon_corporate_actions",
+            entitled_shares=shares,
+            entitlement_source=action.entitlement_source,
+            estimated=action.estimated,
+            recognised_on="pay_date (the feed carries no ex-date receivable)",
+        )
+        if (action.ticker, day) not in unpaid:
+            book(
+                "dividend_settlement",
+                ref,
+                [Posting(CASH, cents), Posting(RECEIVABLE + action.ticker, -cents)],
+                source="ib_statement",
+            )
+    credits = [] if opened_from_today else _rows(inputs.reconciliation.get("dividend_credits"))
+    for credit in credits:
+        cents = to_cents(float(credit["amount_usd"]))  # pyright: ignore[reportArgumentType]
+        ticker = str(credit["ticker"])
+        book(
+            "dividend_settlement",
+            f"dividend:{ticker}:{credit['pay_date']}",
+            [Posting(CASH, cents), Posting(RECEIVABLE + ticker, -cents)],
+            source="ib_statement",
+            late_credit_of_pay_date=credit["pay_date"],
+        )
+
+    breaks = _book_gaps(ledger, inputs, book)
+    after = ledger.positions(tenant, account)
+    suspense = ledger.suspense(tenant, account)
+    clean = not breaks and suspense["cash_cents"] == 0 and not suspense["shares"]
+    document: dict[str, object] = {
+        "schema_version": LEDGER_RECONCILIATION_SCHEMA_VERSION,
+        "tenant": tenant,
+        "account": account,
+        "trading_day": day,
+        "trial_balance_cents": ledger.trial_balance(),
+        "entries_today": len(new),
+        "entry_ids": [e.entry_id for e in new],
+        "ledger_cash_cents": ledger.cents(tenant, account, CASH),
+        "broker_cash_cents": to_cents(broker.cash_usd),
+        "ledger_positions": dict(sorted(after.items())),
+        "broker_positions": {t: int(q) for t, q in sorted(broker.positions.items()) if q},
+        "breaks": list(breaks),
+        "suspense": suspense,
+        "dividends_receivable_cents": ledger.balances(tenant, account, RECEIVABLE),
+        "clean": clean,
+        "known_deltas": [
+            "dividend receivable recognised on the pay date, not the ex-date",
+            "no daily valuation entry (Rule 7) yet",
+        ],
+    }
+    return DayPosting(tuple(new), tuple(breaks), document)
+
+
+def _rows(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, Mapping)]  # pyright: ignore[reportUnknownVariableType]
+
+
+def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, object]]:  # pyright: ignore[reportExplicitAny]
+    """Compare with the broker (ground truth for shares and cash) and book one
+    gap entry per break, against named suspense. Returns the breaks."""
+    tenant, broker = inputs.tenant, inputs.broker
+    day, account = broker.trading_day, broker.account
+    cited: dict[str, list[str]] = {}
+    for record in records_from_broker_reconciliation(inputs.reconciliation, detected_at=day):
+        if record.instrument is not None:
+            cited.setdefault(record.instrument, []).append(record.exception_id)
+    expires = _later_trading_day(day, GAP_EXPIRY_TRADING_DAYS)
+    breaks: list[dict[str, object]] = []
+
+    held = ledger.positions(tenant, account)
+    for ticker in sorted(set(held) | {t for t, q in broker.positions.items() if q}):
+        ours, theirs = held.get(ticker, 0), int(broker.positions.get(ticker, 0))
+        if ours == theirs:
+            continue
+        ledger_break = exception_id("ledger", day, ("position_gap", account, ticker))
+        ids = [*cited.get(ticker, []), ledger_break]
+        breaks.append(
+            {
+                "class": "position_gap",
+                "instrument": ticker,
+                "ledger": ours,
+                "broker": theirs,
+                "delta": theirs - ours,
+                "exception_ids": ids,
+            }
+        )
+        book(
+            "position_gap",
+            f"gap:{ticker}",
+            [
+                Posting(SECURITIES + ticker, 0, theirs - ours),
+                Posting(SUSPENSE_POSITION + ticker, 0, ours - theirs),
+            ],
+            source="ib_statement",
+            reason="broker share count differs from the ledger; in suspense pending a decision",
+            exception_ids=ids,
+            decision_id=None,
+            expires=expires,
+        )
+
+    ours_cash, theirs_cash = ledger.cents(tenant, account, CASH), to_cents(broker.cash_usd)
+    if ours_cash != theirs_cash:
+        delta = theirs_cash - ours_cash
+        ledger_break = exception_id("ledger", day, ("cash_gap", account, "USD"))
+        ids = [*cited.get("USD", []), ledger_break]
+        breaks.append(
+            {
+                "class": "cash_gap",
+                "instrument": "USD",
+                "ledger": ours_cash,
+                "broker": theirs_cash,
+                "delta": delta,
+                "exception_ids": ids,
+            }
+        )
+        book(
+            "cash_gap",
+            "gap:USD",
+            [Posting(CASH, delta), Posting(SUSPENSE_CASH, -delta)],
+            source="ib_statement",
+            reason="broker cash differs from the ledger; booked to suspense pending a decision",
+            exception_ids=ids,
+            decision_id=None,
+            expires=expires,
+        )
+    return breaks
+
+
+# --------------------------------------------------------------------------- I/O
+
+
+def journal_key(tenant: str, trading_day: str) -> str:
+    _require(tenant, trading_day)
+    return f"{LEDGER_JOURNAL_PREFIX}{tenant}/{trading_day}.json"
+
+
+def ledger_reconciliation_key(tenant: str, trading_day: str) -> str:
+    _require(tenant, trading_day)
+    return f"{LEDGER_RECONCILIATION_PREFIX}{tenant}/{trading_day}.json"
+
+
+def _require(tenant: str, trading_day: str) -> None:
+    if not TENANT_RE.fullmatch(tenant):
+        raise LedgerError(f"tenant {tenant!r} does not match {TENANT_RE.pattern}")
+    dt.date.fromisoformat(trading_day)
+
+
+def journal_document(tenant: str, trading_day: str, entries: Sequence[Entry]) -> bytes:
+    document = {
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "tenant": tenant,
+        "trading_day": trading_day,
+        "entries": [e.to_document() for e in entries],
+    }
+    return json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+
+
+def load_ledger(store: Store, tenant: str, *, before: str) -> Ledger:
+    """Replay every stored journal of ``tenant`` dated before ``before``."""
+    ledger = Ledger()
+    prefix = f"{LEDGER_JOURNAL_PREFIX}{tenant}/"
+    days = sorted(
+        k[len(prefix) : -len(".json")]
+        for k in store.list_keys(prefix)
+        if k.endswith(".json") and k[len(prefix) : -len(".json")] < before
+    )
+    for day in days:
+        document = json.loads(store.get_bytes(journal_key(tenant, day)).decode("utf-8"))
+        if document.get("schema_version") != LEDGER_SCHEMA_VERSION:
+            raise LedgerError(f"journal {day} is {document.get('schema_version')!r}")
+        for raw in document["entries"]:
+            ledger.append(entry_from_document(raw))
+    return ledger
+
+
+def post_daily_ledger(
+    ctx: Any,  # pyright: ignore[reportExplicitAny]  # crucible.runner.RunContext
+    *,
+    broker: BrokerStatement,
+    anchor: BrokerStatement | None,
+    fills: Sequence[Fill],
+    cash_flows: Sequence[CashFlow],
+    corporate_actions: CorporateActionSet,
+    reconciliation: Mapping[str, object],
+    now: str,
+    tenant: str = DEFAULT_TENANT,
+) -> DayPosting | None:
+    """Step 5c of `trader.reconcile`: book the day, reconcile the LEDGER to the
+    broker, write the journal (create-only) and the reconciliation view, and
+    record one MetricRecord. NEVER raises; returns ``None`` on failure."""
+    day = broker.trading_day
+    key = None
+    try:
+        key = journal_key(tenant, day)
+        ledger = load_ledger(ctx.store, tenant, before=day)
+        posting = book_day(
+            ledger,
+            DayInputs(
+                tenant,
+                broker,
+                anchor,
+                tuple(fills),
+                tuple(cash_flows),
+                corporate_actions,
+                reconciliation,
+            ),
+        )
+        payload = journal_document(tenant, day, posting.entries)
+        try:
+            ctx.record_output_cas(key, ETAG_ABSENT, payload, LEDGER_SCHEMA_VERSION)
+        except PointerConflictError:
+            if ctx.store.get_bytes(key) != payload:
+                raise LedgerError(
+                    f"the {day} journal is already written with different entries; a journal "
+                    "is never rewritten -- post a correction instead"
+                ) from None
+        view_key = ledger_reconciliation_key(tenant, day)
+        ctx.record_output(
+            view_key,
+            json.dumps(posting.document, indent=2, sort_keys=True).encode("utf-8"),
+            LEDGER_RECONCILIATION_SCHEMA_VERSION,
+        )
+    except Exception as exc:  # noqa: BLE001 - must never change what the job decides or pages
+        _metric(
+            ctx,
+            now,
+            key,
+            "FAIL",
+            None,
+            f"ledger for {day} NOT posted: {type(exc).__name__}: {exc}"[:400],
+        )
+        return None
+    n = len(posting.breaks)
+    if posting.document["clean"]:
+        _metric(
+            ctx, now, view_key, "OK", 0.0, f"ledger ties to the broker on {day}; trial balance 0"
+        )
+    else:
+        _metric(
+            ctx,
+            now,
+            view_key,
+            "WATCH",
+            float(n),
+            (
+                f"{n} ledger break(s) on {day} booked to suspense; "
+                f"suspense {posting.document['suspense']}"
+            )[:400],
+        )
+    return posting
+
+
+def _metric(
+    ctx: Any,  # pyright: ignore[reportExplicitAny]  # crucible.runner.RunContext
+    now: str,
+    key: str | None,
+    status: str,
+    value: float | None,
+    reason: str,
+) -> None:
+    try:
+        ctx.record_metric(
+            {
+                "name": LEDGER_METRIC,
+                "module": "crucible_trader.ledger",
+                "metric_type": "operational",
+                "value": value,
+                "unit": "count" if value is not None else None,
+                "n_floor": 0,
+                "status": status,
+                "status_reason": reason,
+                "source_path": key or LEDGER_JOURNAL_PREFIX,
+                "last_updated_utc": now,
+            }
+        )
+    except Exception:  # noqa: BLE001, S110 - a metric must not raise into the trader either
+        pass

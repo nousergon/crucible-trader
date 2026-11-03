@@ -104,11 +104,18 @@ class ReconciliationInputError(ValueError):
 @dataclasses.dataclass(frozen=True)
 class Fill:
     """One execution the trader recorded. ``shares`` signed (+buy), ``cash_usd``
-    signed (a buy is negative), commission included."""
+    signed (a buy is negative), commission included.
+
+    ``commission_usd`` (positive is a cost) and ``exec_id`` are carried for the
+    ledger, which books the commission as its own entry and addresses the fill
+    by its execution id (`alpha-engine-config-I13128`). Neither takes part in
+    equality, and the reconciler reads neither."""
 
     ticker: str
     shares: int
     cash_usd: float
+    commission_usd: float | None = dataclasses.field(default=None, compare=False)
+    exec_id: str | None = dataclasses.field(default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)

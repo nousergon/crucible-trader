@@ -21,6 +21,7 @@ from crucible_trader.exception_record import (
     exceptions_key,
     validate_exception_day_document,
 )
+from crucible_trader.ledger import journal_key, ledger_reconciliation_key
 from crucible_trader.order_intent_reconciliation import BrokerExecution, BrokerOrder
 from crucible_trader.reconciliation import CorporateActionSet, Fill, reconcile
 from crucible_trader.reconciliation_control import ReconciliationVoidError
@@ -91,6 +92,9 @@ class TestCleanCycle:
         assert [o["key"] for o in ctx.outputs] == [
             broker_statement_key("2026-09-11"),
             reconciliation_key("2026-09-11"),
+            # Step 5c (I13128): the ledger's journal and its reconciliation view.
+            journal_key("nous-ergon-paper", "2026-09-11"),
+            ledger_reconciliation_key("nous-ergon-paper", "2026-09-11"),
         ]
         document = output(store, reconciliation_key("2026-09-11"))
         assert document["void"] is False and document["control_arm"]["passed"] is True
@@ -128,10 +132,11 @@ class TestFailures:
         # Outputs are written BEFORE the raise, so the failed manifest carries them:
         # the statement, the result, and the break as an exception record (I12892).
         assert [o["key"] for o in ctx.outputs][2] == exceptions_key(DAY.isoformat())
-        assert len(ctx.outputs) == 3
+        # ... then the ledger's journal and view (step 5c, I13128).
+        assert len(ctx.outputs) == 5
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)
-        assert {m["status"] for m in ctx.metrics} == {"FAIL", "OK"}
+        assert {m["status"] for m in ctx.metrics} == {"FAIL", "OK", "WATCH"}
 
     def test_first_ever_run_without_genesis_fails_no_anchor(self, store):
         with pytest.raises(ReconciliationDiscrepancyError, match="no_anchor"):
@@ -237,6 +242,8 @@ class TestTheHarnessWritesThisJobsManifest:
         assert {o["key"] for o in manifest["outputs"]} == {
             broker_statement_key(DAY.isoformat()),
             reconciliation_key(DAY.isoformat()),
+            journal_key("nous-ergon-paper", DAY.isoformat()),
+            ledger_reconciliation_key("nous-ergon-paper", DAY.isoformat()),
         }
 
     def test_a_discrepancy_is_a_failed_manifest_that_still_chains(self, store):

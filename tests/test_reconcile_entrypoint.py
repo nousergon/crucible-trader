@@ -60,6 +60,9 @@ class TestFillsFromIb:
         )
         (fill,) = fills_from_ib(client, DAY)
         assert fill == Fill(ticker="AAA", shares=10, cash_usd=-201.0)  # -(200) - 1
+        # The ledger books the commission as its own entry, keyed by execution
+        # (alpha-engine-config-I13128).
+        assert fill.commission_usd == 1.0 and fill.exec_id
 
     def test_a_sell_is_signed_negative_and_credits_notional_minus_commission(self):
         client = _Client(
