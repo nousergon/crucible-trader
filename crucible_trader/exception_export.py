@@ -36,9 +36,9 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import cast
 
-from crucible.keys import trader_reconciliation_key  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs; same import is baselined in every other module
-from crucible.manifest import read_manifest  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
-from crucible.store import Store, open_store, read_only  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
+from crucible.keys import trader_reconciliation_key
+from crucible.manifest import read_manifest
+from crucible.store import Store, open_store, read_only
 
 from crucible_trader.exception_record import (
     DETECTING_JOB,

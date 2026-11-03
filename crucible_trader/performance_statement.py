@@ -44,7 +44,7 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 
-from crucible.store import ETAG_ABSENT, PointerConflictError  # pyright: ignore[reportMissingTypeStubs]
+from crucible.store import ETAG_ABSENT, PointerConflictError
 
 from crucible_trader.month_end_close import (
     CloseSource,

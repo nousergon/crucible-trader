@@ -51,7 +51,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 
-from crucible.keys import (  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs; same import is baselined in every other module
+from crucible.keys import (
     manifest_key,
     trader_broker_statement_key,
     trader_reconciliation_key,

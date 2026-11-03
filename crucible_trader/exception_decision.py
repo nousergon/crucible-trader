@@ -57,8 +57,8 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
 
-from crucible.calendar import is_trading_day  # pyright: ignore[reportMissingTypeStubs]
-from crucible.store import (  # pyright: ignore[reportMissingTypeStubs]
+from crucible.calendar import is_trading_day
+from crucible.store import (
     ETAG_ABSENT,
     PointerConflictError,
     Store,

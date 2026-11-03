@@ -36,7 +36,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from crucible.store import ETAG_ABSENT, PointerConflictError, Store  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs; same import is baselined in every other module
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
 __all__ = [
     "ORDER_INTENTS_PREFIX",

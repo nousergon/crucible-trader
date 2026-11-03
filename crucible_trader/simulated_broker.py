@@ -23,6 +23,10 @@ Three refusals, each raised before any broker SDK is loaded:
    :class:`~crucible_trader.order_router.StagingRoutingRefusedError`
    (`order_router.assert_staging_never_routes`, also called by
    `RouterConfig.from_env`, so no entry point can build a routing config there).
+   The fleet registry must agree: :func:`assert_registry_forbids_routing` asks
+   `nousergon_lib.env`'s ``assert_routing_allowed`` about every route this
+   package knows, and a staging registry that would allow one is refused
+   (`trader.routing_allowed`, nousergon-lib#499; `alpha-engine-config-I12685`).
 2. **Prod never simulates.** :data:`SIMULATED_FILLS_VAR` ``on`` outside staging
    raises :class:`SimulatedFillsRefusedError`: a simulated fill must never be
    filed as a prod served day.
@@ -40,17 +44,20 @@ measured. A name the panel does not close is
 :class:`~crucible_trader.order_router.PriceUnavailableError` and the whole plan
 is refused, exactly as in paper.
 
-**What is filed.** No simulated fill is filed as an execution measurement:
+**What is filed** (`alpha-engine-config-I12685`, option a). Simulated fills
+are first-class harness records, and none of them is an execution measurement:
 
-* `trader/execution_shortfall/{day}.json` is ``no_orders`` -- a fact, since no
-  order reached a broker -- with a reason naming the simulated fills. The
-  `execution_shortfall.v1` schema admits no ``fill_source`` field, and a
-  ``computed`` document of zero-slippage fills would read as a measured zero.
+* `trader/execution_shortfall/{day}.json` is ``computed`` with
+  ``fill_source: simulated_close`` (:data:`FILL_SOURCE`). The harness
+  (`crucible.execution.reduce_execution_window`) names such a session and
+  never pools its orders, so a zero-slippage fill cannot read as a measured
+  zero. A session that filled nothing is ``no_orders``, as in paper.
+* The served-day evidence records the day as ``simulated``
+  (`crucible.models.SessionModeLiteral`), which the phase-4 clause counts only
+  under ``NE_ENV=staging`` and never as ``live``; `contract.record_session`
+  refuses the mode anywhere else.
 * `trader/simulated_fills/{day}.json` (:data:`SIMULATED_FILLS_SCHEMA_VERSION`)
-  carries every simulated fill, with ``fill_source: simulated_close``.
-* The served-day evidence records the day as ``shadow``: the harness's
-  `SessionModeLiteral` is ``shadow | live``, and a simulated session is a
-  session that sent no order. It is never ``live``.
+  is kept as the debug copy: every fill with its price source.
 
 **The hold-book control has no broker either** (:class:`StagingHoldControl`).
 It reports no open orders and no accepted orders, refuses to cancel or close,
@@ -72,25 +79,28 @@ import json
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
-from typing import cast
+from typing import Protocol, cast
 
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]  # no pandas-stubs in the lock; the read is cast at its one call
-from crucible.keys import data_panel_key  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
-from crucible.store import Store  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
+from crucible.keys import data_panel_key
+from crucible.store import Store
 
 from crucible_trader.broker_session import OrderRefusedError
 from crucible_trader.broker_statement import BrokerStatement
 from crucible_trader.construction import TargetBook
-from crucible_trader.execution_shortfall import build_no_orders_document
+from crucible_trader.execution_shortfall import build_no_orders_document, build_shortfall_document
 from crucible_trader.kill_switch import AcceptedOrder, assert_trading_permitted, utcnow
 from crucible_trader.order_router import (
     MAX_ORDER_NOTIONAL_VAR,
     MAX_SESSION_NOTIONAL_VAR,
+    ROUTING_ENABLED_VALUE,
+    STAGING_ENVIRONMENT,
     ExecutionRecord,
     PlannedOrder,
     PriceUnavailableError,
     RouterSettingsError,
     RoutingRefusedError,
+    StagingRoutingRefusedError,
     _positive_float,  # pyright: ignore[reportPrivateUsage]  # the paper router's own cap parse, not a second one
     assert_staging_never_routes,
     is_staging,
@@ -107,6 +117,7 @@ __all__ = [
     "SimulatedFillsRefusedError",
     "StagingHoldControl",
     "StagingSessionConfig",
+    "assert_registry_forbids_routing",
     "simulated_fills_key",
 ]
 
@@ -115,8 +126,14 @@ SIMULATED_FILLS_VAR = "CRUCIBLE_TRADER_SIMULATED_FILLS"
 SIMULATED_FILLS_ENABLED_VALUE = "on"
 SIMULATED_FILLS_DISABLED_VALUES: frozenset[str] = frozenset({"", "off"})
 
-#: Where every simulated fill's price came from.
+#: Where every simulated fill's price came from: `execution_shortfall.v1`'s
+#: ``fill_source`` value `crucible.execution.FILL_SOURCE_SIMULATED_CLOSE`
+#: (restated, not imported, so this module imports on a release wheel that
+#: predates the field; `tests/test_simulated_broker.py` asserts they agree).
 FILL_SOURCE = "simulated_close"
+
+#: Every order route this package can build. The registry is asked about each.
+KNOWN_ROUTES: tuple[str, ...] = (ROUTING_ENABLED_VALUE,)
 #: Declared, not measured: the fill is the close the decision was priced at.
 SIMULATED_SLIPPAGE_BPS = 0.0
 SIMULATED_FILLS_SCHEMA_VERSION = "trader_simulated_fills.v1"
@@ -135,6 +152,55 @@ class SimulatedBrokerError(RoutingRefusedError):
 def simulated_fills_key(trading_day: str) -> str:
     """The session's simulated fills, beside its shortfall document."""
     return f"trader/simulated_fills/{trading_day}.json"
+
+
+class RoutingRegistry(Protocol):
+    """What this module reads of a `nousergon_lib.env.Environment`."""
+
+    def assert_routing_allowed(self, route: str) -> None: ...
+
+
+def assert_registry_forbids_routing(
+    environment: Callable[[str], RoutingRegistry] | None = None,
+) -> None:
+    """Refuse a staging run unless the fleet registry denies staging every route.
+
+    The trader's own ``NE_ENV=staging`` guard already refuses the routing
+    switch. This is the second authority (`alpha-engine-config-I12685`, the
+    S-19 design): `nousergon_lib.env`'s ``environments.staging.trader.
+    routing_allowed`` is ``[]``, and ``assert_routing_allowed`` must raise for
+    every route in :data:`KNOWN_ROUTES`. A registry that would allow one is a
+    registry staging's trader disagrees with, and the run stops before anything
+    opens. A registry that cannot be read stops it too.
+
+    Called on the staging path only, and imported lazily: the prod path neither
+    reads the registry nor needs a `nousergon-lib` that carries the field.
+    ``environment`` resolves a registry environment by name (default
+    `nousergon_lib.env.resolve`).
+    """
+    if environment is None:
+        from nousergon_lib import env as fleet_env  # noqa: PLC0415  # staging only
+
+        environment = fleet_env.resolve
+    resolved = environment(STAGING_ENVIRONMENT)
+    allowed = [route for route in KNOWN_ROUTES if _registry_allows(resolved, route)]
+    if allowed:
+        raise StagingRoutingRefusedError(
+            f"the fleet registry allows staging to route {allowed}. Staging never routes "
+            "(S-19): its trader simulates fills and the IB paper account is not staging's, "
+            "so a registry that says otherwise is refused rather than obeyed."
+        )
+
+
+def _registry_allows(resolved: RoutingRegistry, route: str) -> bool:
+    """``True`` unless the registry's ``assert_routing_allowed`` refuses ``route``."""
+    from nousergon_lib.env import RoutingNotAllowedError  # noqa: PLC0415  # staging only
+
+    try:
+        resolved.assert_routing_allowed(route)
+    except RoutingNotAllowedError:
+        return False
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,6 +238,7 @@ class StagingSessionConfig:
                 )
             return None
         assert_staging_never_routes(source)
+        assert_registry_forbids_routing()
         if flag != SIMULATED_FILLS_ENABLED_VALUE:
             return cls(simulated=False)
         return cls(
@@ -322,18 +389,26 @@ class SimulatedFillRouter:
     def shortfall_document(
         self, *, champion: str, trading_day: str, now: dt.datetime
     ) -> dict[str, object]:
-        """``no_orders``: no order reached a broker. The simulated fills are filed apart."""
-        return build_no_orders_document(
+        """``computed`` with ``fill_source: simulated_close``; ``no_orders`` when
+        nothing was filled. Never a broker document: the harness names a
+        simulated session and never pools its orders."""
+        if not self._records:
+            return build_no_orders_document(
+                trading_day=trading_day,
+                champion=champion,
+                reason=(
+                    f"simulated session: none of {len(self._planned)} planned order(s) "
+                    f"filled; no order reached a broker (NE_ENV=staging, "
+                    f"{SIMULATED_FILLS_VAR}=on)"
+                ),
+                now=now,
+            )
+        return build_shortfall_document(
             trading_day=trading_day,
             champion=champion,
-            reason=(
-                f"simulated session: {len(self._records)} of {len(self._planned)} planned "
-                f"order(s) filled by simulation at the session close ({FILL_SOURCE}, "
-                f"{SIMULATED_SLIPPAGE_BPS} bps declared); no order reached a broker "
-                f"(NE_ENV=staging, {SIMULATED_FILLS_VAR}=on). Fills at "
-                f"{simulated_fills_key(trading_day)}"
-            ),
+            fills=[record.fill for record in self._records],
             now=now,
+            fill_source=FILL_SOURCE,
         )
 
     def simulated_fills_document(

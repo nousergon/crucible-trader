@@ -56,7 +56,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 
-from crucible.store import Store, open_store, read_only  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
+from crucible.store import Store, open_store, read_only
 
 from crucible_trader.exception_record import (
     CLASSES_BY_SOURCE,

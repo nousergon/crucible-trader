@@ -49,8 +49,8 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import cast
 
-from crucible.execution import execution_shortfall_key  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
-from crucible.store import Store, open_store, read_only  # pyright: ignore[reportMissingTypeStubs]  # crucible ships no stubs
+from crucible.execution import execution_shortfall_key
+from crucible.store import Store, open_store, read_only
 
 from crucible_trader.execution_decomposition import (
     ExecutionPiece,

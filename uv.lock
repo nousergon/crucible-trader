@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -64,30 +64,30 @@ wheels = [
 
 [[package]]
 name = "boto3"
-version = "1.43.113"
+version = "1.43.123"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "botocore" },
     { name = "jmespath" },
     { name = "s3transfer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d4/d5/3d303c78f5677520f9d3eacaca3d7f9a3dd3388f0ac2b9d357d0e2c0807c/boto3-1.43.113.tar.gz", hash = "sha256:5a3e7750325c22fab0957c41a500fe2f95a936c2bbcf5c18f58472ba5ffbb792", size = 112621, upload-time = "2026-10-13T19:24:59.418Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/8a/64b46f075149f9160da44aa7e1052dd18431b9ad4435beb0cfb02cc48624/boto3-1.43.123.tar.gz", hash = "sha256:055fabb990c5d2f31fce4ca569255bd640cdd11a3ca68c9ecad35f4f8a5b83b5", size = 112638, upload-time = "2026-10-30T19:18:50.085Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/22/f058fdadd4b4bb58640c430d3864f37bbe934827d58182583324b5ed9244/boto3-1.43.113-py3-none-any.whl", hash = "sha256:2e6fa2eef6decd7cbe5cf55b4ccc3218a3784630e54cb5e7e7f7074437dda281", size = 140042, upload-time = "2026-10-13T19:24:57.974Z" },
+    { url = "https://files.pythonhosted.org/packages/96/b2/a7986c327f80aa6f1544f4cb8f2fa7da4e1fccd472379a21cad0508b8a0e/boto3-1.43.123-py3-none-any.whl", hash = "sha256:d18d66e1e13faa0c25d0b1b8c5ce946e29fb5fc0b6456b655a93a678ff4cc313", size = 140044, upload-time = "2026-10-30T19:18:47.734Z" },
 ]
 
 [[package]]
 name = "botocore"
-version = "1.43.113"
+version = "1.43.123"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jmespath" },
     { name = "python-dateutil" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c5/43/e4b25ea3f83142dc13dda0313d5d818e20173c2c710d658dd206f67763e8/botocore-1.43.113.tar.gz", hash = "sha256:941d3f0e289540da7c49d5e2dc022f992e3638127a02a74a0c91df2661bd98ef", size = 16361430, upload-time = "2026-10-13T19:24:54.872Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e0/de/011fc2a47fb066c47064b122498d2fd21f55bc90ea514acbddc37ca0f8c1/botocore-1.43.123.tar.gz", hash = "sha256:80948cb9b1cdf1a1a25809089a42e3a1bc4af0258d198222db6e97dcc660dd0c", size = 16486269, upload-time = "2026-10-30T19:18:44.609Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/61/a9c26912e18ddf6529d628e945711ce94ed62056d31457f25a842fd47929/botocore-1.43.113-py3-none-any.whl", hash = "sha256:8908e4a5fe94a06801a7bf4c451717a38145cc4ffa41aaffa50665940b64b4fa", size = 16063913, upload-time = "2026-10-13T19:24:52.219Z" },
+    { url = "https://files.pythonhosted.org/packages/db/96/4f2dffd304425c07160ab2c12cb13322d852fd956fe9d4386228c93f02ea/botocore-1.43.123-py3-none-any.whl", hash = "sha256:e30580f9c1282c321529238ff8ff75066096a2adbd0a293c8ae592c21d1733a3", size = 16185987, upload-time = "2026-10-30T19:18:39.794Z" },
 ]
 
 [[package]]
@@ -226,7 +226,7 @@ wheels = [
 [[package]]
 name = "crucible"
 version = "0.1.0"
-source = { git = "https://github.com/nousergon/crucible?rev=a49721869582ea48b92f4dae7032bf2b60b707d2#a49721869582ea48b92f4dae7032bf2b60b707d2" }
+source = { git = "https://github.com/nousergon/crucible?rev=8b3b568351695877c35e481da3cdfe24bf4c4b6a#8b3b568351695877c35e481da3cdfe24bf4c4b6a" }
 dependencies = [
     { name = "boto3" },
     { name = "cvxpy" },
@@ -265,7 +265,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "crucible", git = "https://github.com/nousergon/crucible?rev=a49721869582ea48b92f4dae7032bf2b60b707d2" },
+    { name = "crucible", git = "https://github.com/nousergon/crucible?rev=8b3b568351695877c35e481da3cdfe24bf4c4b6a" },
     { name = "ib-async", marker = "extra == 'ib'", specifier = "==2.1.0" },
     { name = "packaging", specifier = ">=24.0" },
 ]
@@ -528,7 +528,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.77"
+version = "0.59.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -536,9 +536,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/97/8f/a6e08ce57636e59b8e9084e9327dce8badecd901abf9b7c6d56db91bc2c8/krepis-0.59.77.tar.gz", hash = "sha256:0504bc3a8ecb35ce0367d4b4cb417a4d2fc23d8d39f0fd973d9d311ed744baba", size = 797073, upload-time = "2026-10-17T05:07:06.077Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/09/94ef1014344b1c9ac20ffae9d45bd8f4865c03451f5b8b3592300f172711/krepis-0.59.90.tar.gz", hash = "sha256:cd4ac986c07574033221751cbd94ddd4c29d72a5c75d9c35a6f0e23a52b3cf7b", size = 821185, upload-time = "2026-11-03T03:47:15.117Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/5a/f06dd9bbd40c8ae053d4c5735064d8cf41df46e8c1313657af170bc9b835/krepis-0.59.77-py3-none-any.whl", hash = "sha256:cc2ca30670e09a81a7e21d3933f8ff5c3abf929cbda4280499cdaed2c07b22b0", size = 498026, upload-time = "2026-10-17T05:07:04.566Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/da/dc4edd2efce7d8a5e97958c4d2699c3cdffc9c015b8e9ce382232cf4ed67/krepis-0.59.90-py3-none-any.whl", hash = "sha256:4bf7cbb2203a884bdc018cb6b604336cf7149675d86044250f0a588fa9dbb29f", size = 508630, upload-time = "2026-11-03T03:47:13.497Z" },
 ]
 
 [package.optional-dependencies]
@@ -619,7 +619,7 @@ wheels = [
 
 [[package]]
 name = "nousergon-lib"
-version = "0.124.165"
+version = "0.124.190"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -628,9 +628,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/e7/9d021cb47aaaa5c8846981936102643b44b0933da259e68e05d834c5a034/nousergon_lib-0.124.165.tar.gz", hash = "sha256:cff725af510e14e5e4742f435898b9dd35e64b12f24b372636349ef55e921a99", size = 1065629, upload-time = "2026-10-03T00:58:54.58Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/e6/f4958d5a329ab9a26b4acc6be37580ce0564af06edf2cd73ff1bbe54b595/nousergon_lib-0.124.190.tar.gz", hash = "sha256:e608d7711d56684dcd69cd59d0aee9491a488cc08f4385dca5bddc03a91a4c28", size = 1116728, upload-time = "2026-10-27T05:50:27.752Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/ae/e7cfc68db18bac6442d5e8e5d27a7d8e1cfc96b3e23dae1a73e248e159cf/nousergon_lib-0.124.165-py3-none-any.whl", hash = "sha256:997ad7c7e26d696bfbbee5787e87a0a1fda55321638dbf996c2dfde6f6429906", size = 730123, upload-time = "2026-10-03T00:58:52.997Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/6d/8b7bd78fa087f96e2437fe4a661f92574a0d5a76a1aab0ccc22dfe65f82d/nousergon_lib-0.124.190-py3-none-any.whl", hash = "sha256:62f0e28ccebac27fefe5f26188e4b5452d239c2b17bcc1427b23e1c4d34a5695", size = 752997, upload-time = "2026-10-27T05:50:25.657Z" },
 ]
 
 [package.optional-dependencies]
