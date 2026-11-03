@@ -13,7 +13,7 @@ import shutil
 import sys
 
 import pytest
-from crucible.keys import trader_broker_statement_key
+from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.store import LocalStore, open_store
 
 from crucible_trader import back_office_dry_run
@@ -24,7 +24,7 @@ from crucible_trader.exception_proposal import close_proposals_key, exception_pr
 from crucible_trader.exception_record import PAPER_FUND_TENANT
 from crucible_trader.ledger import journal_key
 from crucible_trader.month_end_close import close_attempt_key
-from crucible_trader.reconciliation import CorporateActionSet
+from crucible_trader.reconciliation import CorporateActionSet, Fill
 from crucible_trader.reconciliation_job import ReconciliationDiscrepancyError, run_reconciliation
 
 ANCHOR = "2026-09-08"
@@ -135,6 +135,33 @@ class TestDryRun:
             open_store(str(root), dry_run=True), month="2026-09", now=NOW, fills=fills
         )
         assert summary["fills_on_days_without_reconciliation"] == ["2026-09-15"]
+        assert summary["fills_booked_on_a_later_day"] == {}
+
+    def test_a_fill_on_an_unreconciled_day_is_booked_on_the_next_posted_day(self, root):
+        # Without 09-10's reconciliation, 09-11 is posted against 09-09's
+        # statement, so the share bought on 09-10 belongs in 09-11's posting.
+        (root / trader_reconciliation_key(BROKEN)).unlink()
+        fill = Fill("AAA", 1, -10.0, commission_usd=1.0, exec_id="v1:t1")
+
+        def run(fills):
+            summary = dry_run(
+                open_store(str(root), dry_run=True), month="2026-09", now=NOW, fills=fills
+            )
+            share_gaps = [
+                e["instrument"]
+                for e in summary["close"]["exceptions"]
+                if e["class"] == "close_suspense_shares"
+            ]
+            return summary, share_gaps
+
+        summary, share_gaps = run({BROKEN: [fill], CLEAN: []})
+        assert summary["days_with_reconciliation"] == [CLEAN, LATER]
+        assert summary["fills_on_days_without_reconciliation"] == [BROKEN]
+        assert summary["fills_booked_on_a_later_day"] == {BROKEN: LATER}
+        assert share_gaps == []
+        unbooked, unbooked_gaps = run({})
+        assert unbooked["fills_booked_on_a_later_day"] == {}
+        assert unbooked_gaps == [f"AAA@{LATER}"]
 
 
 class TestRefusals:
