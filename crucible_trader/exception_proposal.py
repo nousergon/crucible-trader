@@ -68,20 +68,24 @@ from crucible_trader.exception_record import (
     ExceptionRecordError,
     exceptions_key,
     validate_exception_day_document,
+    validate_exception_record,
 )
 
 __all__ = [
     "ACTIONS",
+    "CLOSE_PROPOSALS_PREFIX",
     "NATURES",
     "PROPOSALS_PREFIX",
     "PROPOSAL_SCHEMA_VERSION",
     "PROPOSER",
     "RULESET_VERSION",
     "Proposal",
+    "close_proposals_key",
     "exception_proposals_key",
     "main",
     "propose",
     "propose_day",
+    "propose_records",
     "proposal_day_document",
     "proposals_from_store",
 ]
@@ -98,6 +102,13 @@ PROPOSER = "crucible-trader.exception_proposal"
 #: :data:`~crucible_trader.exception_record.EXCEPTIONS_PREFIX`, and outside
 #: `crucible.keys` for the same reason (a key there moves the trader pin).
 PROPOSALS_PREFIX = "trader/exception_proposals/"
+
+#: Where a REFUSED month-end close files the proposals for its unexplained
+#: lines (`alpha-engine-config-I13121`): one file per attempt, under
+#: :data:`PROPOSALS_PREFIX` so the review queue reads them with the day files
+#: and the trader's existing write grant on that prefix covers them. See
+#: :func:`close_proposals_key`.
+CLOSE_PROPOSALS_PREFIX = f"{PROPOSALS_PREFIX}month_end_close/"
 
 NATURES: tuple[str, ...] = ("event", "defect", "detector")
 
@@ -352,6 +363,25 @@ def propose_day(document: Mapping[str, object], *, proposed_at: str) -> list[Pro
     validate_exception_day_document(document)
     records = cast("list[Mapping[str, object]]", document["records"])
     return [propose(r, proposed_at=proposed_at) for r in records]
+
+
+def propose_records(records: Sequence[Mapping[str, object]], *, proposed_at: str) -> list[Proposal]:
+    """Proposals for loose `exception.v1` records (a refused close's
+    ``exceptions``), in their order. Each record is validated first; an invalid
+    one raises."""
+    for record in records:
+        validate_exception_record(record)
+    return [propose(r, proposed_at=proposed_at) for r in records]
+
+
+def close_proposals_key(tenant: str, month: str, run_day: str) -> str:
+    """The proposals for the unexplained lines of ``tenant``'s ``month`` close as
+    refused by the run on ``run_day``. The last path segment is the day the file
+    was written, as it is for a day file, so the review queue can tell what was
+    known as of any day."""
+    dt.date.fromisoformat(f"{month}-01")
+    dt.date.fromisoformat(run_day)
+    return f"{CLOSE_PROPOSALS_PREFIX}{tenant}/{month}/{run_day}.json"
 
 
 def exception_proposals_key(trading_day: str) -> str:

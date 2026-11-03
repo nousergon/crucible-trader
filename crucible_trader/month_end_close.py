@@ -23,7 +23,10 @@ explain is an ``exception.v1`` record from
 REFUSES TO FINISH while any exists (plan, Control standard: "the close refuses
 to finish on any unexplained line"). A refused attempt is filed at
 :func:`close_attempt_key` with its records and the close is tried again on the
-next reconcile run.
+next reconcile run. Each refused attempt also files the shadow proposer's
+proposals for its records at
+:func:`~crucible_trader.exception_proposal.close_proposals_key`, so the lines
+wait in the same review queue as the daily breaks (`alpha-engine-config-I13121`).
 
 **Period lock** (Rule 3). A finished close writes the month's
 :func:`~crucible_trader.ledger.period_lock_document` (create-only), after which
@@ -58,6 +61,12 @@ from crucible.keys import trader_broker_statement_key  # pyright: ignore[reportM
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store  # pyright: ignore[reportMissingTypeStubs]
 
 from crucible_trader.broker_statement import BrokerStatement, statement_from_document
+from crucible_trader.exception_proposal import (
+    PROPOSAL_SCHEMA_VERSION,
+    close_proposals_key,
+    proposal_day_document,
+    propose_records,
+)
 from crucible_trader.exception_record import (
     PAPER_FUND_TENANT,
     SOURCE_MONTH_END_CLOSE,
@@ -173,7 +182,12 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
         expected: float | None = None,
         actual: float | None = None,
         document_key: str = view_key,
+        ref: str | None = None,
     ) -> None:
+        # ``ref`` tells apart lines that share a class and instrument -- two
+        # failed checks of one name on different days, or the three missing
+        # inputs -- which would otherwise share one exception id, and so one
+        # proposal and one decision (alpha-engine-config-I13121).
         records.append(
             ExceptionRecord(
                 source=SOURCE_MONTH_END_CLOSE,
@@ -191,7 +205,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                 document_key=document_key,
                 void=False,
                 detected_at=inputs.detected_at,
-                identity=(account, month, instrument),
+                identity=(account, month, instrument, *((ref,) if ref is not None else ())),
                 tenant=tenant,
             )
         )
@@ -259,6 +273,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             "close_input_missing",
             None,
             f"no ledger journal for {missing_days}",
+            ref="journals",
         )
     statement = inputs.statement
     if statement is None or statement.account != account:
@@ -267,10 +282,11 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             None,
             f"no IB statement for {account} on {last_day}",
             document_key=statement_key,
+            ref="statement",
         )
         statement = None
     if inputs.view is None:
-        unexplained("close_input_missing", None, f"no ledger view for {last_day}")
+        unexplained("close_input_missing", None, f"no ledger view for {last_day}", ref="view")
     else:
         for b in _breaks(inputs.view):
             if b.get("check") == "break_aging":
@@ -284,6 +300,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                 klass,
                 str(b.get("check")),
                 f"ledger check {b.get('check')} on {b.get('day')}: {b.get('detail')}",
+                ref=str(b.get("day")),
             )
 
     # ---- walk the month: average cost, realised P&L, income and expense.
@@ -526,13 +543,14 @@ def close_prior_month(
             if finished["status"] != "closed":
                 n = len(cast("list[object]", finished["exceptions"]))
                 late = len(trading_days_between(f"{day[:7]}-01", day)) > GAP_EXPIRY_TRADING_DAYS
+                filed = _file_proposals(ctx, finished, tenant=tenant, month=month, day=day, now=now)
                 _metric(
                     ctx,
                     now,
                     key,
                     "FAIL" if late else "WATCH",
                     float(n),
-                    f"{month} close refused on {day}: {n} unexplained line(s); "
+                    f"{month} close refused on {day}: {n} unexplained line(s), {filed}; "
                     + "; ".join(
                         str(e["class"])
                         for e in cast("list[Mapping[str, object]]", finished["exceptions"])
@@ -600,6 +618,34 @@ def _attempt(
     key = close_key(tenant, month)
     _create_once(ctx, key, payload, CLOSE_SCHEMA_VERSION)
     return {**document, "_key": key}
+
+
+def _file_proposals(
+    ctx: Any,  # pyright: ignore[reportExplicitAny]
+    refused: Mapping[str, object],
+    *,
+    tenant: str,
+    month: str,
+    day: str,
+    now: str,
+) -> str:
+    """File the shadow proposals for a refused close's unexplained lines at
+    :func:`~crucible_trader.exception_proposal.close_proposals_key`, so they
+    join the review queue step 5e builds (`alpha-engine-config-I13121`).
+    NEVER raises: a failure costs the proposals, never the close or its
+    metric, and is named in the metric's reason. Returns that phrase."""
+    try:
+        records = cast("list[Mapping[str, object]]", refused["exceptions"])
+        proposals = propose_records(records, proposed_at=now)
+        document = proposal_day_document(cast("str", refused["last_trading_day"]), proposals)
+        ctx.record_output(
+            close_proposals_key(tenant, month, day),
+            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+            PROPOSAL_SCHEMA_VERSION,
+        )
+    except Exception as exc:  # noqa: BLE001 - shadow output must not change the close
+        return f"proposals NOT filed ({type(exc).__name__}: {exc})"[:120]
+    return f"{len(proposals)} proposal(s) filed for review"
 
 
 def _create_once(ctx: Any, key: str, payload: bytes, schema: str) -> None:  # pyright: ignore[reportExplicitAny]

@@ -37,12 +37,15 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    `trader/exception_scores/{day}.json` and `current.json`: every stored proposal against every
    reviewer decision, agreement per class and ruleset version, and the
    undecided queue oldest first with its age (`alpha-engine-config-I13120`,
-   back office 1c) -- same contract as 5c (see :func:`file_exception_score`);
+   back office 1c) -- same contract as 5c (see :func:`file_exception_score`).
+   It runs after 5f, so the proposals a refused close files are in the same
+   day's queue (`alpha-engine-config-I13121`);
 5f. close the previous month when it is not closed yet
    (:func:`crucible_trader.month_end_close.close_prior_month`, back office 1e,
    `alpha-engine-config-I13122`): positions, cash and P&L tied out to IB and
    the settled closes, the period locked, every unexplained line an
-   `exception.v1` record and a refused close retried next run; then file the
+   `exception.v1` record with a shadow proposal for the review queue, and a
+   refused close retried next run; then file the
    month's performance statement and simulated fee bill from that close
    (:func:`crucible_trader.performance_statement.file_statement`, 1f,
    `alpha-engine-config-I13123`). Never raises; a no-op once the month is closed
@@ -393,8 +396,6 @@ def reconcile_cycle(
             reconciliation=document,
             now=now,
         )
-        # Step 5e: after 5c, so today's proposals are in the queue it files.
-        file_exception_score(ctx, now=now)
         # Step 5f: after 5d, so the month's last journal is in the ledger.
         close_prior_month(
             ctx,
@@ -403,6 +404,9 @@ def reconcile_cycle(
             now=now,
             after_close=lambda close: file_statement(ctx, close, now=now),
         )
+        # Step 5e runs LAST: after 5c and 5f, so today's proposals and a
+        # refused close's proposals are both in the queue it files.
+        file_exception_score(ctx, now=now)
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())

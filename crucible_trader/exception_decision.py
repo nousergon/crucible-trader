@@ -310,14 +310,27 @@ def _json_object(store: Store, key: str) -> dict[str, object]:
 
 
 def load_proposals(store: Store, *, until: str | None = None) -> list[dict[str, object]]:
-    """Every stored proposal, oldest day first, up to ``until`` inclusive."""
+    """Every stored proposal filed up to ``until`` inclusive, each once.
+
+    Two kinds of file sit under the prefix: the day files of step 5c
+    (``{day}.json``) and a refused month-end close's files
+    (:func:`~crucible_trader.exception_proposal.close_proposals_key`,
+    ``month_end_close/{tenant}/{month}/{run_day}.json``,
+    `alpha-engine-config-I13121`). Both end in the day they were written, which
+    is what ``until`` compares. A close refused on several days files the same
+    proposal ids each time; the first filing is the one kept.
+    """
     out: list[dict[str, object]] = []
+    seen: set[object] = set()
     for key in sorted(store.list_keys(PROPOSALS_PREFIX)):
-        day = key.removeprefix(PROPOSALS_PREFIX).removesuffix(".json")
-        if not key.endswith(".json") or (until is not None and day > until):
+        filed_on = key.removesuffix(".json").rsplit("/", 1)[-1]
+        if not key.endswith(".json") or (until is not None and filed_on > until):
             continue
         document = _json_object(store, key)
-        out.extend(cast("list[dict[str, object]]", document.get("proposals", [])))
+        for proposal in cast("list[dict[str, object]]", document.get("proposals", [])):
+            if proposal.get("proposal_id") not in seen:
+                seen.add(proposal.get("proposal_id"))
+                out.append(proposal)
     return out
 
 
