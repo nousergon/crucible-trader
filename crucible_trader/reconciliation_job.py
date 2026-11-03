@@ -32,6 +32,12 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    reconcile the LEDGER to the broker (:func:`crucible_trader.ledger.post_daily_ledger`,
    `alpha-engine-config-I13128`) -- never raises, and never a change to what
    step 6 decides or pages;
+5e. file the back office's score and queue
+   (:func:`crucible_trader.exception_decision.score`) at
+   `trader/exception_scores/{day}.json`: every stored proposal against every
+   reviewer decision, agreement per class and ruleset version, and the
+   undecided queue oldest first with its age (`alpha-engine-config-I13120`,
+   back office 1c) -- same contract as 5c (see :func:`file_exception_score`);
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
    :func:`paging_decision`). Either makes the manifest `status: failed`, which
@@ -82,6 +88,14 @@ from crucible_trader.dividend_entitlements import (
     OWED_BOOTSTRAP_FROM,
     load_declared_entitlements,
     owed_dividends,
+)
+from crucible_trader.exception_decision import (
+    SCORE_SCHEMA_VERSION,
+    SCORES_PREFIX,
+    exception_score_key,
+    load_decisions,
+    load_proposals,
+    score,
 )
 from crucible_trader.exception_proposal import (
     PROPOSAL_SCHEMA_VERSION,
@@ -367,6 +381,8 @@ def reconcile_cycle(
             reconciliation=document,
             now=now,
         )
+        # Step 5e: after 5c, so today's proposals are in the queue it files.
+        file_exception_score(ctx, now=now)
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())
@@ -584,6 +600,78 @@ def file_exception_proposals(
         )
     except Exception:  # noqa: BLE001 - see docstring
         _LOG.warning("exception proposals metric for %s was NOT recorded", day, exc_info=True)
+
+
+#: The MetricRecord that says whether step 5e filed the day's score.
+EXCEPTION_SCORE_METRIC = "exception_score_filed"
+
+
+def file_exception_score(ctx: RunContext, *, now: str) -> None:
+    """Step 5e: file the back office's score and queue for the day. Never raises.
+
+    `alpha-engine-config-I13120` (back office 1c): the reviewer's decisions are
+    written by the reviewer's own identity
+    (:func:`~crucible_trader.exception_decision.record_decision`), never by the
+    trader, which only proposes. This step READS every stored proposal up to
+    today and every decision, and files the derived
+    :func:`~crucible_trader.exception_decision.score` -- agreement per class
+    and ruleset version, and the queue of undecided and deferred proposals
+    oldest first with their age in trading days -- at
+    :func:`~crucible_trader.exception_decision.exception_score_key`, plus one
+    ``exception_score_filed`` MetricRecord whose status is WATCH while any
+    queue item is past the age limit.
+
+    It runs every day, breaks or not, because a queue item ages on a clean day
+    too. Shadow like 5c: ANY failure is logged and swallowed and reported as
+    that metric with status FAIL, and the job's outputs, decision, raise and
+    page text are what they would have been without this step.
+    """
+    day = ctx.trading_day.isoformat()
+    key = SCORES_PREFIX  # the metric's source path until the day's key is built
+    try:
+        key = exception_score_key(day)
+        document = score(
+            load_proposals(ctx.store, until=day),
+            load_decisions(ctx.store),
+            as_of=day,
+            generated_at=now,
+        )
+        ctx.record_output(
+            key,
+            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+            SCORE_SCHEMA_VERSION,
+        )
+        totals = cast("Mapping[str, object]", document["totals"])
+        overdue = cast("int", totals["overdue"])
+        status, value = ("WATCH" if overdue else "OK"), float(cast("int", totals["queue"]))
+        reason = (
+            f"back-office queue for {day}: {totals['queue']} open, {overdue} overdue, "
+            f"agreement {totals['agreement']} over {totals['agree']} agreed and "
+            f"{totals['correct']} corrected"
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring: shadow, must never reach the job
+        _LOG.warning("exception score for %s was NOT filed", day, exc_info=True)
+        status, value = "FAIL", None
+        reason = (
+            f"exception score for {day} was NOT filed: " + (f"{type(exc).__name__}: {exc}")[:400]
+        )
+    try:
+        ctx.record_metric(
+            {
+                "name": EXCEPTION_SCORE_METRIC,
+                "module": "crucible_trader.exception_decision",
+                "metric_type": "operational",
+                "value": value,
+                "unit": "count" if value is not None else None,
+                "n_floor": 0,
+                "status": status,
+                "status_reason": reason,
+                "source_path": key,
+                "last_updated_utc": now,
+            }
+        )
+    except Exception:  # noqa: BLE001 - see docstring
+        _LOG.warning("exception score metric for %s was NOT recorded", day, exc_info=True)
 
 
 def page_text(result: ReconciliationResult) -> str:
