@@ -75,6 +75,8 @@ from crucible_trader.exception_record import (
 )
 from crucible_trader.ledger import (
     CASH,
+    CLOSE_SUSPENSE_CASH,
+    CLOSE_SUSPENSE_SHARES,
     COMMISSIONS,
     DECLARED_FLOWS,
     DIVIDEND_INCOME,
@@ -395,7 +397,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             for p in e.postings:
                 if p.account == SUSPENSE_CASH:
                     unexplained(
-                        "close_suspense_cash",
+                        CLOSE_SUSPENSE_CASH,
                         f"USD@{d}",
                         f"cash gap {e.entry_id} of {-p.amount_cents} cents booked {d} is not "
                         "cleared by any adjustment",
@@ -404,7 +406,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                 elif p.account.startswith(SUSPENSE_POSITION) and p.quantity:
                     ticker = p.account[len(SUSPENSE_POSITION) :]
                     unexplained(
-                        "close_suspense_shares",
+                        CLOSE_SUSPENSE_SHARES,
                         f"{ticker}@{d}",
                         f"share gap {e.entry_id} of {-p.quantity} {ticker} booked {d} is not "
                         "cleared by any adjustment",

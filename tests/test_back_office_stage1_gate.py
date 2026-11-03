@@ -16,7 +16,9 @@ touches AWS. The month is November 2026 so the run on 12-01 closes it:
 
 A reviewer's agree or correct clears the break (`alpha-engine-config-I13160`):
 the next posting books the adjustment that moves it out of suspense, and the
-close then finishes. A defer leaves it in suspense and the close refused.
+close then finishes. A defer leaves it in suspense and the close refused. A
+decision on the refused close's own suspense line clears the gap that line
+reports, exactly as a decision on the reconciler's record does.
 """
 
 from __future__ import annotations
@@ -43,11 +45,12 @@ from crucible_trader.exception_decision import (
     exception_score_key,
     record_decision,
 )
-from crucible_trader.exception_proposal import exception_proposals_key
+from crucible_trader.exception_proposal import close_proposals_key, exception_proposals_key
 from crucible_trader.exception_record import PAPER_FUND_TENANT, exceptions_key
 from crucible_trader.ledger import (
     RECONCILIATION_ADJUSTMENTS,
     SUSPENSE_CASH,
+    close_suspense_line_ids,
     journal_key,
     ledger_reconciliation_key,
     load_journals,
@@ -264,6 +267,56 @@ def test_a_deferred_break_holds_the_close_until_an_agreement_clears_it(store):
     assert_every_day_balances_and_rolls_forward(store, (*DAYS, "2026-12-01", "2026-12-02"))
     close = read(store, close_key(T, "2026-11"))
     assert close["status"] == "closed"
+    assert close["suspense_cleared_after_month_end"] == [gap.entry_id]
+    assert close["pnl"]["total_cents"] == close["nav_end_cents"] - close["nav_start_cents"]
+    assert metric(closed, "month_end_close")["status"] == "OK"
+
+
+def test_a_decision_on_the_close_line_clears_the_gap_it_reports(store):
+    ib, _ = november(store, extra_cash=0.5)
+    run_day(store, ib, DAYS[2], [fill("AAA", -4, 12.0, 1.0, "e2")])
+    (gap,) = [e for e in load_journals(store, T, before=DAYS[2])[DAYS[1]] if e.kind == "cash_gap"]
+
+    # Nobody decided the reconciler's record, so the close refuses on the gap
+    # and files a proposal for its close_suspense_cash line ...
+    refused = run_day(store, ib, "2026-12-01")
+    assert metric(refused, "month_end_close")["status"] == "WATCH"
+    proposals = read(store, close_proposals_key(T, "2026-11", "2026-12-01"))["proposals"]
+    (line,) = [p for p in proposals if p["class"] == "close_suspense_cash"]
+    # ... whose exception id is the one the ledger derives for that gap's line,
+    # and is NOT among the ids the gap cites.
+    assert close_suspense_line_ids(gap, "2026-11-30") == [line["exception_id"]]
+    assert line["exception_id"] not in gap.evidence["exception_ids"]
+
+    # The reviewer decides the close line, not the daily record.
+    decision = decide(
+        line, verdict="agree", decided_by="reviewer", decided_at="2026-12-01T22:00:00Z"
+    )
+    record_decision(store, decision)
+    ib.books["2026-12-03"] = ib.books["2026-12-02"]
+    closed = run_day(store, ib, "2026-12-02")
+    run_day(store, ib, "2026-12-03")
+
+    # The next posting clears exactly that gap, once: the adjustment cites the
+    # gap's own ids (so it settles it whichever line was decided) and names the
+    # decided close line; the day after books nothing more.
+    journals = load_journals(store, T, before="2026-12-04")
+    (adjustment,) = journals["2026-12-02"]
+    assert adjustment.kind == "adjustment"
+    assert adjustment.evidence["exception_ids"] == gap.evidence["exception_ids"]
+    assert adjustment.evidence["decided_exception_id"] == line["exception_id"]
+    assert adjustment.evidence["decision_id"] == decision["decision_id"]
+    assert adjustment.evidence["decided_by"] == "reviewer"
+    assert not [e for e in journals.get("2026-12-03", ()) if e.kind == "adjustment"]
+    assert_every_day_balances_and_rolls_forward(
+        store, (*DAYS, "2026-12-01", "2026-12-02", "2026-12-03")
+    )
+    view = read(store, ledger_reconciliation_key(T, "2026-12-03"))
+    assert view["suspense"] == {"cash_cents": 0, "shares": {}} and view["clean"] is True
+
+    # The retried close finishes, the gap cleared after month end.
+    close = read(store, close_key(T, "2026-11"))
+    assert close["status"] == "closed" and close["exceptions"] == []
     assert close["suspense_cleared_after_month_end"] == [gap.entry_id]
     assert close["pnl"]["total_cents"] == close["nav_end_cents"] - close["nav_start_cents"]
     assert metric(closed, "month_end_close")["status"] == "OK"
