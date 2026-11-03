@@ -13,6 +13,10 @@ touches AWS. The month is November 2026 so the run on 12-01 closes it:
 * 11-27: buy 5 BBB at $20 with a $1 commission; in the break test IB shows 50
   cents more cash than the fill explains;
 * 11-30: sell 4 AAA at $12 with a $1 commission.
+
+A reviewer's agree or correct clears the break (`alpha-engine-config-I13160`):
+the next posting books the adjustment that moves it out of suspense, and the
+close then finishes. A defer leaves it in suspense and the close refused.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from crucible_trader.exception_decision import (
 from crucible_trader.exception_proposal import exception_proposals_key
 from crucible_trader.exception_record import PAPER_FUND_TENANT, exceptions_key
 from crucible_trader.ledger import (
+    RECONCILIATION_ADJUSTMENTS,
     SUSPENSE_CASH,
     journal_key,
     ledger_reconciliation_key,
@@ -121,6 +126,7 @@ def november(store, *, extra_cash=0.0):
             DAYS[1]: ({"AAA": 10, "BBB": 5}, 899.0 + extra_cash),
             DAYS[2]: ({"AAA": 6, "BBB": 5}, 946.0 + extra_cash),
             "2026-12-01": ({"AAA": 6, "BBB": 5}, 946.0 + extra_cash),
+            "2026-12-02": ({"AAA": 6, "BBB": 5}, 946.0 + extra_cash),
         }
     )
     ctxs = {
@@ -186,18 +192,81 @@ def test_one_synthetic_break_goes_from_break_to_proposal_to_decision_to_score(st
     assert (klass["agree"], klass["consecutive_agree"]) == (1, 1)
     assert metric(ctx, "exception_score_filed")["status"] == "OK"
 
-    # Gate clause 1 holds through the break: the gap is booked, not absorbed.
+    # CLEARED: the same posting books the adjustment the decision calls for --
+    # its own entry, citing the break's exception ids and the decision id.
+    (adjustment,) = [
+        e for e in load_journals(store, T, before="2026-12-01")[DAYS[2]] if e.kind == "adjustment"
+    ]
+    assert adjustment.evidence["exception_ids"] == gap.evidence["exception_ids"]
+    assert adjustment.evidence["decision_id"] == decision["decision_id"]
+    assert {(p.account, p.amount_cents) for p in adjustment.postings} == {
+        (SUSPENSE_CASH, 50),
+        (RECONCILIATION_ADJUSTMENTS, -50),
+    }
+
+    # Gate clause 1 holds through the break and its clearing.
     assert_every_day_balances_and_rolls_forward(store, DAYS)
     view = read(store, ledger_reconciliation_key(T, DAYS[2]))
-    assert view["suspense"] and view["clean"] is False
+    assert view["suspense"] == {"cash_cents": 0, "shares": {}} and view["clean"] is True
+    assert view["checks"]["open_breaks"] == []
+
+    # November closes, the 50 cents attributed to the decided break.
+    december = run_day(store, ib, "2026-12-01")
+    assert_every_day_balances_and_rolls_forward(store, (*DAYS, "2026-12-01"))
+    close = read(store, close_key(T, "2026-11"))
+    assert close["status"] == "closed" and close["exceptions"] == []
+    assert close["pnl"]["reconciliation_adjustments_cents"] == 50
+    assert close["pnl"]["suspense_cents"] == 0
+    assert close["pnl"]["total_cents"] == close["nav_end_cents"] - close["nav_start_cents"]
+    for name in ("month_end_close", "performance_statement", "month_rebuild"):
+        assert metric(december, name)["status"] == "OK", name
+
+
+def test_a_deferred_break_holds_the_close_until_an_agreement_clears_it(store):
+    ib, _ = november(store, extra_cash=0.5)
+    (proposal,) = read(store, exception_proposals_key(DAYS[1]))["proposals"]
+    deferred = decide(
+        proposal,
+        verdict="defer",
+        decided_by="reviewer",
+        decided_at="2026-11-28T15:00:00Z",
+        note="waiting for IB's activity statement",
+    )
+    record_decision(store, deferred)
+    run_day(store, ib, DAYS[2], [fill("AAA", -4, 12.0, 1.0, "e2")])
+    (gap,) = [e for e in load_journals(store, T, before=DAYS[2])[DAYS[1]] if e.kind == "cash_gap"]
+
+    # Deferred: the gap stays in suspense and November does not close.
+    view = read(store, ledger_reconciliation_key(T, DAYS[2]))
+    assert view["suspense"]["cash_cents"] == -50 and view["clean"] is False
     (open_break,) = view["checks"]["open_breaks"]
     assert (open_break["entry_id"], open_break["age"]) == (gap.entry_id, 1)
-
-    # Until an adjustment citing the decision clears it, November does not close.
-    december = run_day(store, ib, "2026-12-01")
-    attempt = metric(december, "month_end_close")
+    refused = run_day(store, ib, "2026-12-01")
+    attempt = metric(refused, "month_end_close")
     assert attempt["status"] == "WATCH" and "close_suspense_cash" in attempt["status_reason"]
     assert not store.exists(close_key(T, "2026-11"))
+
+    # The reviewer agrees, superseding the deferral: the next posting clears it
+    # with a prior-period adjustment dated in the open month, and the retried
+    # close finishes.
+    agreed = decide(
+        proposal,
+        verdict="agree",
+        decided_by="reviewer",
+        decided_at="2026-12-01T22:00:00Z",
+        supersedes=deferred["decision_id"],
+    )
+    record_decision(store, agreed)
+    closed = run_day(store, ib, "2026-12-02")
+    (adjustment,) = load_journals(store, T, before="2026-12-03")["2026-12-02"]
+    assert adjustment.kind == "adjustment"
+    assert adjustment.evidence["decision_id"] == agreed["decision_id"]
+    assert_every_day_balances_and_rolls_forward(store, (*DAYS, "2026-12-01", "2026-12-02"))
+    close = read(store, close_key(T, "2026-11"))
+    assert close["status"] == "closed"
+    assert close["suspense_cleared_after_month_end"] == [gap.entry_id]
+    assert close["pnl"]["total_cents"] == close["nav_end_cents"] - close["nav_start_cents"]
+    assert metric(closed, "month_end_close")["status"] == "OK"
 
 
 def test_a_clean_month_closes_files_its_statement_and_rebuilds_from_raw(store):

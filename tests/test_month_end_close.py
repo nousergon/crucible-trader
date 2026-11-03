@@ -179,6 +179,7 @@ class TestClose:
             "declared_cash_flows_cents": 0,
             "commissions_cents": -200,
             "suspense_cents": 0,
+            "reconciliation_adjustments_cents": 0,
             "total_cents": 1_700,
         }
         assert close["positions"]["AAA"] == {
