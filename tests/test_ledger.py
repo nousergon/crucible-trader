@@ -18,6 +18,7 @@ from crucible_trader.ledger import (
     CASH,
     COMMISSIONS,
     DEFAULT_TENANT,
+    SECURITIES,
     SUSPENSE_CASH,
     DayInputs,
     Entry,
@@ -25,6 +26,7 @@ from crucible_trader.ledger import (
     LedgerError,
     Posting,
     book_day,
+    entry_from_document,
     journal_key,
     ledger_reconciliation_key,
     load_ledger,
@@ -409,3 +411,73 @@ class TestPostDailyLedger:
         for entry in document["entries"]:
             assert sum(p["amount_cents"] for p in entry["postings"]) == 0
             assert entry["tenant"] == T
+
+
+class TestRefusals:
+    def test_shares_must_be_whole(self):
+        with pytest.raises(LedgerError, match="must be an int"):
+            Posting(SECURITIES + "AAA", 0, 1.5)  # pyright: ignore[reportArgumentType]
+
+    def test_append_rechecks_balance_and_trial_balance(self):
+        entry = Entry(T, "DU1", DAY, "fill", "e1", (Posting(CASH, 1), Posting(COMMISSIONS, -1)))
+        object.__setattr__(entry, "postings", (Posting(CASH, 1),))  # a tampered entry
+        ledger = Ledger()
+        with pytest.raises(LedgerError, match="refusing"):
+            ledger.append(entry)
+        assert ledger.entries == ()
+
+    def test_a_stored_entry_whose_id_is_not_its_events_is_refused(self):
+        document = Entry(T, "DU1", DAY, "fill", "e1", (Posting(CASH, 1), Posting(COMMISSIONS, -1)))
+        raw = {**document.to_document(), "entry_id": "0" * 32}
+        with pytest.raises(LedgerError, match="not its event's id"):
+            entry_from_document(raw)
+        assert entry_from_document(document.to_document()) == document
+
+    def test_a_bad_tenant_has_no_key(self):
+        with pytest.raises(LedgerError):
+            journal_key("Client One", DAY)
+
+    def test_a_fractional_split_and_a_zero_dividend_book_nothing(self):
+        anchor = stmt(PREV, {"AAA": 3}, 1_000.00)
+        actions = CorporateActionSet(
+            frozenset({"AAA"}),
+            (
+                CorporateAction("AAA", "split", ratio=1.5),
+                CorporateAction("AAA", "cash_dividend", amount_per_share=0.25, entitled_shares=0),
+            ),
+        )
+        doc = {**recon_doc(stmt(DAY, {"AAA": 3}, 1_000.0), anchor), "dividend_credits": None}
+        posting = book_day(
+            Ledger(), DayInputs(T, stmt(DAY, {"AAA": 3}, 1_000.0), anchor, (), (), actions, doc)
+        )
+        assert [e.kind for e in posting.entries] == ["opening_balance"]
+
+
+def test_a_journal_of_another_schema_is_refused(store):
+    store.put_bytes(journal_key(T, DAY), json.dumps({"schema_version": "x"}).encode())
+    with pytest.raises(LedgerError, match="journal 2026-11-03"):
+        load_ledger(store, T, before=NEXT)
+
+
+def test_a_metric_that_cannot_be_recorded_does_not_raise(store):
+    class _Ctx:
+        def __init__(self):
+            self.store = store
+
+        def record_metric(self, _metric):
+            raise RuntimeError("metric sink down")
+
+    broker = stmt(DAY, {"AAA": 10}, 1_000.0)
+    assert (
+        post_daily_ledger(
+            _Ctx(),
+            broker=broker,
+            anchor=None,
+            fills=(),
+            cash_flows=(),
+            corporate_actions=NONE,
+            reconciliation={"trading_day": DAY, "account": "DU1", "void": False},
+            now="2026-11-03T21:00:00Z",
+        )
+        is None
+    )

@@ -266,10 +266,14 @@ class Ledger:
             raise LedgerError(
                 f"{entry.kind} {entry.event_ref}: entry {entry.entry_id} already booked"
             )
-        if (
-            sum(p.amount_cents for p in entry.postings) != 0
-        ):  # Entry checks too; never trusted alone
-            raise LedgerError(f"{entry.entry_id} does not balance")
+        # Entry checks its own balance too; the append never trusts that alone.
+        # A balanced entry onto a zero trial balance keeps it zero.
+        entry_sum, balance = sum(p.amount_cents for p in entry.postings), self.trial_balance()
+        if entry_sum != 0 or balance != 0:
+            raise LedgerError(
+                f"refusing {entry.entry_id}: entry sums to {entry_sum} cents onto a trial "
+                f"balance of {balance}"
+            )
         for p in entry.postings:
             key = _balance_key(entry, p.account)
             self._cents[key] = self._cents.get(key, 0) + p.amount_cents
@@ -277,10 +281,6 @@ class Ledger:
                 self._shares[key] = self._shares.get(key, 0) + p.quantity
         self._entries.append(entry)
         self._ids.add(entry.entry_id)
-        if self.trial_balance() != 0:
-            raise LedgerError(
-                f"trial balance is {self.trial_balance()} cents after {entry.entry_id}"
-            )
 
     def trial_balance(self) -> int:
         return sum(self._cents.values())
@@ -374,7 +374,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         cash = to_cents(source.cash_usd)
         book(
             "opening_balance",
-            f"statement:{source.trading_day}",
+            f"statement/{source.trading_day}",
             [Posting(CASH, cash), Posting(OPENING, -cash)]
             + [
                 Posting(SECURITIES + t, 0, int(q)) for t, q in sorted(source.positions.items()) if q
@@ -398,14 +398,14 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
             continue  # cash in lieu is not modelled; the gap check books it
         book(
             "split",
-            f"split:{action.ticker}:{action.ratio!r}",
+            f"split/{action.ticker}/{action.ratio!r}",
             [Posting(SECURITIES + action.ticker, 0, int(rebased) - held)],
             source="polygon_corporate_actions",
             ratio=action.ratio,
         )
 
     for index, fill in enumerate(fills):
-        ref = fill.exec_id or f"fill:{index}:{fill.ticker}:{fill.shares}:{fill.cash_usd!r}"
+        ref = fill.exec_id or f"fill/{index}/{fill.ticker}/{fill.shares}/{fill.cash_usd!r}"
         if fill.commission_usd is None:
             consideration, separated = to_cents(fill.cash_usd), False
         else:
@@ -435,7 +435,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         cents = to_cents(flow.cash_usd)
         book(
             "declared_cash_flow",
-            f"flow:{index}:{flow.description}",
+            f"flow/{index}/{flow.description}",
             [Posting(CASH, cents), Posting(DECLARED_FLOWS, -cents)],
             description=flow.description,
         )
@@ -455,7 +455,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         cents = to_cents(Decimal(repr(action.amount_per_share)) * shares)
         if not cents:
             continue
-        ref = f"dividend:{action.ticker}:{day}"
+        ref = f"dividend/{action.ticker}/{day}"
         book(
             "dividend_receivable",
             ref,
@@ -482,7 +482,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         ticker = str(credit["ticker"])
         book(
             "dividend_settlement",
-            f"dividend:{ticker}:{credit['pay_date']}",
+            f"dividend/{ticker}/{credit['pay_date']}",
             [Posting(CASH, cents), Posting(RECEIVABLE + ticker, -cents)],
             source="ib_statement",
             late_credit_of_pay_date=credit["pay_date"],
@@ -553,7 +553,7 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
         )
         book(
             "position_gap",
-            f"gap:{ticker}",
+            f"gap/{ticker}",
             [
                 Posting(SECURITIES + ticker, 0, theirs - ours),
                 Posting(SUSPENSE_POSITION + ticker, 0, ours - theirs),
@@ -582,7 +582,7 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
         )
         book(
             "cash_gap",
-            "gap:USD",
+            "gap/USD",
             [Posting(CASH, delta), Posting(SUSPENSE_CASH, -delta)],
             source="ib_statement",
             reason="broker cash differs from the ledger; booked to suspense pending a decision",
