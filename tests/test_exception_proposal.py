@@ -26,7 +26,9 @@ from crucible_trader.exception_record import (
     CLASSES_BY_SOURCE,
     CONTROL_ARM_VOID,
     SOURCE_BROKER_RECONCILIATION,
+    SOURCE_MONTH_END_CLOSE,
     SOURCE_ORDER_INTENT_RECONCILIATION,
+    ExceptionRecord,
     ExceptionRecordError,
     exception_day_document,
     exceptions_key,
@@ -91,6 +93,33 @@ def intent_record(klass):
     return record.to_document()
 
 
+def close_record(klass):
+    return ExceptionRecord(
+        source=SOURCE_MONTH_END_CLOSE,
+        klass=klass,
+        trading_day="2026-11-30",
+        account="DU1",
+        instrument="AAA",
+        side=None,
+        amount=None,
+        expected_value=None,
+        expected_record=None,
+        actual_value=None,
+        actual_record=None,
+        detail="close line",
+        document_key="trader/ledger/reconciliation/nous-ergon-paper/2026-11-30.json",
+        void=False,
+        detected_at=LATER,
+        identity=("DU1", "2026-11", "AAA"),
+    ).to_document()
+
+
+def test_month_end_close_lines_are_never_promotable():
+    for klass in sorted(CLASSES_BY_SOURCE[SOURCE_MONTH_END_CLOSE]):
+        proposal = propose(close_record(klass), proposed_at=LATER)
+        assert proposal.nature in ("defect", "detector") and not proposal.promotable
+
+
 def test_every_class_of_every_source_gets_a_proposal_from_the_closed_sets():
     for source, classes in CLASSES_BY_SOURCE.items():
         for klass in classes:
@@ -98,6 +127,8 @@ def test_every_class_of_every_source_gets_a_proposal_from_the_closed_sets():
                 continue
             if source == SOURCE_BROKER_RECONCILIATION:
                 (record,) = broker_records([finding(klass)])
+            elif source == SOURCE_MONTH_END_CLOSE:
+                record = close_record(klass)
             else:
                 assert source == SOURCE_ORDER_INTENT_RECONCILIATION
                 record = intent_record(klass)

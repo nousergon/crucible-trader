@@ -76,6 +76,8 @@ __all__ = [
     "SOURCES",
     "SOURCE_BROKER_RECONCILIATION",
     "SOURCE_ORDER_INTENT_RECONCILIATION",
+    "SOURCE_MONTH_END_CLOSE",
+    "MONTH_END_CLOSE_CLASSES",
     "ExceptionRecord",
     "ExceptionRecordError",
     "exception_day_document",
@@ -106,6 +108,22 @@ PAPER_FUND_TENANT = "nous-ergon-paper"
 
 SOURCE_BROKER_RECONCILIATION = "crucible-trader.broker_reconciliation"
 SOURCE_ORDER_INTENT_RECONCILIATION = "crucible-trader.order_intent_reconciliation"
+#: The month-end close (`crucible_trader.month_end_close`, back office 1e,
+#: `alpha-engine-config-I13122`): every line the close cannot explain.
+SOURCE_MONTH_END_CLOSE = "crucible-trader.month_end_close"
+#: Its closed set of classes, defined here (not imported) because that module
+#: imports this one.
+MONTH_END_CLOSE_CLASSES: frozenset[str] = frozenset(
+    {
+        "close_cash_delta",
+        "close_share_delta",
+        "close_suspense_cash",
+        "close_suspense_shares",
+        "close_input_missing",
+        "close_checks_failed",
+        "close_attribution",
+    }
+)
 
 #: A run whose control arm missed a planted discrepancy is VOID and pages for
 #: that reason alone (`ReconciliationVoidError`), so the void is a break in its
@@ -119,6 +137,7 @@ CONTROL_ARM_VOID = "control_arm_void"
 CLASSES_BY_SOURCE: Mapping[str, frozenset[str]] = {
     SOURCE_BROKER_RECONCILIATION: frozenset(DISCREPANCY_CLASSES) | {CONTROL_ARM_VOID},
     SOURCE_ORDER_INTENT_RECONCILIATION: INTENT_BREAK_CLASSES,
+    SOURCE_MONTH_END_CLOSE: MONTH_END_CLOSE_CLASSES,
 }
 SOURCES: tuple[str, ...] = tuple(CLASSES_BY_SOURCE)
 
@@ -132,6 +151,11 @@ _UNIT_BY_CLASS: Mapping[tuple[str, str], str] = {
     (SOURCE_BROKER_RECONCILIATION, "position_count"): "positions",
     (SOURCE_ORDER_INTENT_RECONCILIATION, "overfilled"): "shares",
     (SOURCE_ORDER_INTENT_RECONCILIATION, "closed_partial"): "shares",
+    (SOURCE_MONTH_END_CLOSE, "close_cash_delta"): "usd",
+    (SOURCE_MONTH_END_CLOSE, "close_share_delta"): "shares",
+    (SOURCE_MONTH_END_CLOSE, "close_suspense_cash"): "usd",
+    (SOURCE_MONTH_END_CLOSE, "close_suspense_shares"): "shares",
+    (SOURCE_MONTH_END_CLOSE, "close_attribution"): "usd",
 }
 
 _ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
