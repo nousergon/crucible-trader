@@ -20,14 +20,21 @@ V1_BOOK = {
 
 def test_the_committed_declaration_names_v1s_book_from_the_handover_session() -> None:
     effective_from, symbols = load_inherited()
-    assert effective_from == "2026-11-03"
+    assert effective_from == "2026-11-02"
     assert symbols == V1_BOOK
 
 
-def test_nothing_is_inherited_before_the_handover_session() -> None:
-    assert inherited_for("2026-11-02") == frozenset()
+def test_nothing_is_inherited_before_the_handover_book() -> None:
+    assert inherited_for("2026-10-30") == frozenset()
+    assert inherited_for("2026-11-02") == V1_BOOK
     assert inherited_for("2026-11-03") == V1_BOOK
-    assert inherited_for("2026-11-04") == V1_BOOK
+
+
+def test_the_first_v2_session_trades_a_book_the_declaration_covers() -> None:
+    # The 2026-11-03 session (the first after v1 stopped) is opened for the
+    # 2026-11-02 book; keyed to the calendar day it refused SPY.
+    first_session_book_day = "2026-11-02"
+    assert "SPY" in inherited_for(first_session_book_day)
 
 
 def _write(tmp_path: Path, **overrides: object) -> Path:
