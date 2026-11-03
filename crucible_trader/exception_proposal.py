@@ -63,6 +63,7 @@ from crucible_trader.exception_record import (
     CONTROL_ARM_VOID,
     EXCEPTIONS_PREFIX,
     SOURCE_BROKER_RECONCILIATION,
+    SOURCE_MONTH_END_CLOSE,
     SOURCE_ORDER_INTENT_RECONCILIATION,
     ExceptionRecordError,
     exceptions_key,
@@ -131,6 +132,7 @@ def _fixed(
 
 _B = SOURCE_BROKER_RECONCILIATION
 _I = SOURCE_ORDER_INTENT_RECONCILIATION
+_C = SOURCE_MONTH_END_CLOSE
 
 #: One rule per (source, class). Exhaustive over `CLASSES_BY_SOURCE`, asserted
 #: at import: a detector that gains a class without a rule fails loudly here.
@@ -215,6 +217,50 @@ _RULES: Mapping[tuple[str, str], Callable[[Mapping[str, object]], _Rule]] = {
             "orphan",
         )
     },
+    # The month-end close (back office 1e). A close line is unexplained by
+    # definition (an explained one never becomes a record), so none is an event.
+    (_C, "close_cash_delta"): _fixed(
+        "close.cash",
+        "defect",
+        "investigate_cash",
+        "the ledger's month-end cash differs from IB's month-end statement",
+    ),
+    (_C, "close_share_delta"): _fixed(
+        "close.shares",
+        "defect",
+        "investigate_shares",
+        "the ledger's month-end share count differs from IB's month-end statement",
+    ),
+    (_C, "close_suspense_cash"): _fixed(
+        "close.suspense_cash",
+        "defect",
+        "investigate_cash",
+        "a cash gap booked in the month is still in suspense with no adjustment clearing it",
+    ),
+    (_C, "close_suspense_shares"): _fixed(
+        "close.suspense_shares",
+        "defect",
+        "investigate_shares",
+        "a share gap booked in the month is still in suspense with no adjustment clearing it",
+    ),
+    (_C, "close_input_missing"): _fixed(
+        "close.input_missing",
+        "detector",
+        "rerun_after_feed",
+        "a statement, journal, view or settled close the close needs is absent; rerun once it is",
+    ),
+    (_C, "close_checks_failed"): _fixed(
+        "close.checks_failed",
+        "detector",
+        "investigate_detector",
+        "the ledger's own checks failed on the month's last trading day",
+    ),
+    (_C, "close_attribution"): _fixed(
+        "close.attribution",
+        "detector",
+        "investigate_detector",
+        "P&L attribution does not tie to the NAV change; the close's arithmetic is wrong",
+    ),
 }
 
 

@@ -38,6 +38,15 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    reviewer decision, agreement per class and ruleset version, and the
    undecided queue oldest first with its age (`alpha-engine-config-I13120`,
    back office 1c) -- same contract as 5c (see :func:`file_exception_score`);
+5f. close the previous month when it is not closed yet
+   (:func:`crucible_trader.month_end_close.close_prior_month`, back office 1e,
+   `alpha-engine-config-I13122`): positions, cash and P&L tied out to IB and
+   the settled closes, the period locked, every unexplained line an
+   `exception.v1` record and a refused close retried next run; then file the
+   month's performance statement and simulated fee bill from that close
+   (:func:`crucible_trader.performance_statement.file_statement`, 1f,
+   `alpha-engine-config-I13123`). Never raises; a no-op once the month is closed
+   and its statement filed;
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
    :func:`paging_decision`). Either makes the manifest `status: failed`, which
@@ -113,6 +122,7 @@ from crucible_trader.exception_record import (
     records_from_order_intent_reconciliation,
 )
 from crucible_trader.ledger import post_daily_ledger
+from crucible_trader.month_end_close import close_prior_month
 from crucible_trader.order_intent_reconciliation import (
     RECONCILIATION_SCHEMA_VERSION as INTENT_RECONCILIATION_SCHEMA_VERSION,
 )
@@ -124,6 +134,7 @@ from crucible_trader.order_intent_reconciliation import (
     reconcile_order_intents,
 )
 from crucible_trader.order_router import ORDER_REF_PREFIX
+from crucible_trader.performance_statement import file_statement
 from crucible_trader.reconciliation import (
     RECONCILIATION_SCHEMA_VERSION,
     CashFlow,
@@ -384,6 +395,14 @@ def reconcile_cycle(
         )
         # Step 5e: after 5c, so today's proposals are in the queue it files.
         file_exception_score(ctx, now=now)
+        # Step 5f: after 5d, so the month's last journal is in the ledger.
+        close_prior_month(
+            ctx,
+            day=day,
+            account=broker.account,
+            now=now,
+            after_close=lambda close: file_statement(ctx, close, now=now),
+        )
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())

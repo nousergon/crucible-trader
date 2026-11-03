@@ -1,0 +1,575 @@
+"""The month-end close (back office 1e, `alpha-engine-config-I13122`) and the
+performance statement and simulated fee bill built on it (1f, `-I13123`)."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import pathlib
+from decimal import Decimal
+
+import pytest
+from crucible.keys import data_panel_key, trader_broker_statement_key
+from crucible.runner import RunContext
+from crucible.store import LocalStore
+
+from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.exception_record import PAPER_FUND_TENANT, validate_exception_record
+from crucible_trader.ledger import (
+    CASH,
+    DECLARED_FLOWS,
+    DIVIDEND_INCOME,
+    OPENING,
+    RECEIVABLE,
+    SECURITIES,
+    SUSPENSE_CASH,
+    SUSPENSE_POSITION,
+    Entry,
+    Posting,
+    journal_document,
+    journal_key,
+    load_journals,
+    period_lock_key,
+    post_daily_ledger,
+    read_period_locks,
+)
+from crucible_trader.month_end_close import (
+    CloseError,
+    CloseInputs,
+    _Lot,  # pyright: ignore[reportPrivateUsage]
+    _move,  # pyright: ignore[reportPrivateUsage]
+    close_attempt_key,
+    close_key,
+    close_month,
+    close_prior_month,
+    month_trading_days,
+    panel_close_source,
+    previous_month,
+)
+from crucible_trader.performance_statement import (
+    StatementError,
+    benchmark_returns,
+    build_statement,
+    file_statement,
+    statement_key,
+)
+from crucible_trader.reconciliation import (
+    CorporateActionSet,
+    Fill,
+    ReconciliationInputs,
+    reconcile,
+)
+
+T = PAPER_FUND_TENANT
+NOW = "2026-12-01T21:00:00Z"
+NONE = CorporateActionSet(resolved=frozenset({"AAA", "BBB"}))
+CLOSES = {
+    "2026-11-25": {"AAA": 10.0, "SPY": 500.0, "QQQ": 400.0},
+    "2026-11-30": {"AAA": 11.0, "BBB": 21.0, "SPY": 510.0, "QQQ": 404.0},
+}
+
+
+def closes(day, tickers):
+    return {t: CLOSES.get(day, {})[t] for t in tickers if t in CLOSES.get(day, {})}
+
+
+def stmt(day, positions, cash):
+    return BrokerStatement("DU1", day, positions, cash)
+
+
+def ctx_for(store, day):
+    return RunContext(
+        run_id="01JG0000000000000000000000",
+        job="trader.reconcile",
+        trading_day=dt.date.fromisoformat(day),
+        calendar_date=dt.date.fromisoformat(day),
+        store=store,
+        seed=0,
+        started=dt.datetime(2026, 12, 1, 21, 0, tzinfo=dt.UTC),
+    )
+
+
+def post(store, broker, anchor, fills=()):
+    store.put_bytes(
+        trader_broker_statement_key(broker.trading_day),
+        json.dumps(broker.to_document()).encode(),
+    )
+    result = reconcile(
+        ReconciliationInputs(
+            trading_day=broker.trading_day,
+            broker=broker,
+            anchor=anchor,
+            fills=tuple(fills),
+            cash_flows=(),
+            corporate_actions=NONE,
+            genesis=anchor is None,
+        )
+    )
+    document = {**result.to_document(), "control_arm": {"passed": True, "missed": []}}
+    posting = post_daily_ledger(
+        ctx_for(store, broker.trading_day),
+        broker=broker,
+        anchor=anchor,
+        fills=fills,
+        cash_flows=(),
+        corporate_actions=NONE,
+        reconciliation={**document, "void": False},
+        now="2026-11-30T21:00:00Z",
+    )
+    assert posting is not None
+    return posting
+
+
+def fill(ticker, shares, price, commission, exec_id):
+    return Fill(
+        ticker, shares, -shares * price - commission, commission_usd=commission, exec_id=exec_id
+    )
+
+
+def november(store, *, ib_cash_end=946.0):
+    """Genesis 11-25 (10 AAA, $1,000); buy 5 BBB at 20 on 11-27; sell 4 AAA at
+    12 on 11-30. Each with a $1 commission."""
+    d1 = stmt("2026-11-25", {"AAA": 10}, 1_000.0)
+    post(store, d1, None)
+    d2 = stmt("2026-11-27", {"AAA": 10, "BBB": 5}, 899.0)
+    post(store, d2, d1, [fill("BBB", 5, 20.0, 1.0, "e1")])
+    d3 = stmt("2026-11-30", {"AAA": 6, "BBB": 5}, ib_cash_end)
+    post(store, d3, d2, [fill("AAA", -4, 12.0, 1.0, "e2")])
+
+
+@pytest.fixture
+def store(tmp_path: pathlib.Path) -> LocalStore:
+    return LocalStore(tmp_path)
+
+
+def run(store, day="2026-12-01", **kw):
+    ctx = ctx_for(store, day)
+    out = close_prior_month(
+        ctx,
+        day=day,
+        account="DU1",
+        now=NOW,
+        closes=closes,
+        after_close=lambda c: file_statement(ctx, c, now=NOW, closes=closes),
+        **kw,
+    )
+    return ctx, out
+
+
+class TestClose:
+    def test_a_month_that_ties_closes_locks_and_files_its_statement(self, store):
+        november(store)
+        ctx, close = run(store)
+        assert close is not None and close["status"] == "closed", close
+        assert close["nav_start_cents"] == 110_000  # $1,000 + 10 AAA at the opening close
+        assert close["nav_end_cents"] == 94_600 + 6 * 1_100 + 5 * 2_100
+        assert close["pnl"] == {
+            "realised_cents": 800,  # 4 AAA sold for $48 net of nothing, cost $40
+            "unrealised_change_cents": 600 + 500,
+            "dividends_cents": 0,
+            "declared_cash_flows_cents": 0,
+            "commissions_cents": -200,
+            "suspense_cents": 0,
+            "total_cents": 1_700,
+        }
+        assert close["positions"]["AAA"] == {
+            "shares": 6,
+            "close_usd": 11.0,
+            "market_value_cents": 6_600,
+            "cost_basis_cents": 6_000,
+            "unrealised_cents": 600,
+        }
+        assert close["fees_accrued"] == {"commissions_cents": 200}
+        assert close["exceptions"] == [] and close["trial_balance_cents"] == 0
+        assert store.exists(close_key(T, "2026-11"))
+        assert set(read_period_locks(store, T)["2026-11"]) == {
+            "2026-11-25",
+            "2026-11-27",
+            "2026-11-30",
+        }
+        statement = json.loads(store.get_bytes(statement_key(T, "2026-11")))
+        assert statement["time_weighted_return_gross"] == pytest.approx(1_700 / 110_000)
+        assert statement["benchmarks"]["SPY"]["return"] == pytest.approx(0.02)
+        assert statement["benchmarks"]["QQQ"]["return"] == pytest.approx(0.01)
+        assert statement["simulated_fee_bill"]["booked"] is False
+        assert [m["name"] for m in ctx.metrics] == ["month_end_close", "performance_statement"]
+        assert [m["status"] for m in ctx.metrics] == ["OK", "OK"]
+
+        # A later run is a no-op: nothing is rewritten and nothing recorded.
+        again, same = run(store, "2026-12-02")
+        assert same == {k: v for k, v in close.items() if k != "_key"} and again.metrics == []
+        # And the locked month refuses a late journal (step 5d).
+        locked = post_daily_ledger(
+            ctx_for(store, "2026-11-30"),
+            broker=stmt("2026-11-30", {"AAA": 6, "BBB": 5}, 946.0),
+            anchor=None,
+            fills=(),
+            cash_flows=(),
+            corporate_actions=NONE,
+            reconciliation={},
+            now=NOW,
+        )
+        assert locked is None
+
+    def test_the_return_reproduces_from_raw_positions_and_closes_to_the_basis_point(self, store):
+        november(store)
+        _, close = run(store)
+        assert close is not None
+        start = 1_000.0 + 10 * CLOSES["2026-11-25"]["AAA"]
+        end = 946.0 + 6 * CLOSES["2026-11-30"]["AAA"] + 5 * CLOSES["2026-11-30"]["BBB"]
+        statement = json.loads(store.get_bytes(statement_key(T, "2026-11")))
+        assert abs(statement["time_weighted_return_gross"] - (end / start - 1)) < 1e-4
+
+    def test_a_suspense_balance_refuses_the_close_until_an_adjustment_clears_it(self, store):
+        november(store, ib_cash_end=946.5)  # IB has 50 cents the ledger cannot explain
+        ctx, refused = run(store)
+        assert refused is not None and refused["status"] == "refused"
+        classes = [e["class"] for e in refused["exceptions"]]
+        assert classes == ["close_suspense_cash"]
+        for record in refused["exceptions"]:
+            validate_exception_record(record)
+        assert store.exists(close_attempt_key(T, "2026-11", "2026-12-01"))
+        assert not store.exists(close_key(T, "2026-11"))
+        assert not store.exists(period_lock_key(T, "2026-11"))
+        assert ctx.metrics[0]["status"] == "WATCH"
+        # Still refused on the fourth trading day of the month: now it FAILs.
+        late, _ = run(store, "2026-12-04")
+        assert late.metrics[0]["status"] == "FAIL"
+
+        # A prior-period adjustment dated in the open month clears it.
+        gap = next(
+            e
+            for e in load_journals(store, T, before="2026-12-01")["2026-11-30"]
+            if e.kind == "cash_gap"
+        )
+        adjustment = Entry(
+            T,
+            "DU1",
+            "2026-12-02",
+            "adjustment",
+            "interest/2026-11",
+            (Posting(SUSPENSE_CASH, 50), Posting(DECLARED_FLOWS, -50)),
+            {"exception_ids": list(gap.evidence["exception_ids"]), "decision_id": "d1"},
+        )
+        store.put_bytes(
+            journal_key(T, "2026-12-02"), journal_document(T, "2026-12-02", [adjustment])
+        )
+        _, closed = run(store, "2026-12-02")
+        assert closed is not None and closed["status"] == "closed"
+        assert closed["suspense_cleared_after_month_end"] == [gap.entry_id]
+        assert closed["pnl"]["suspense_cents"] == 50
+        assert closed["pnl"]["total_cents"] == closed["nav_end_cents"] - 110_000
+
+    def test_a_missing_close_statement_and_ledger_tie_out_are_each_a_record(self, store):
+        november(store)
+        store.put_bytes(
+            trader_broker_statement_key("2026-11-30"),
+            json.dumps(stmt("2026-11-30", {"AAA": 7, "BBB": 5}, 940.0).to_document()).encode(),
+        )
+        CLOSES["2026-11-30"].pop("BBB")
+        try:
+            _, refused = run(store)
+        finally:
+            CLOSES["2026-11-30"]["BBB"] = 21.0
+        assert refused is not None
+        classes = sorted(str(e["class"]) for e in refused["exceptions"])
+        assert classes == ["close_cash_delta", "close_input_missing", "close_share_delta"]
+
+    def test_missing_inputs_refuse_the_close(self, store):
+        november(store)
+        journals = load_journals(store, T, before="2026-12-01")
+        del journals["2026-11-27"]
+        CLOSES["2026-11-25"].pop("AAA")
+        try:
+            document = close_month(
+                CloseInputs(
+                    T,
+                    "DU1",
+                    "2026-11",
+                    "2026-12-01",
+                    journals,
+                    None,
+                    None,
+                    None,
+                    closes,
+                    NOW,
+                )
+            )
+        finally:
+            CLOSES["2026-11-25"]["AAA"] = 10.0
+        details = [str(e["detail"]) for e in document["exceptions"]]
+        assert document["status"] == "refused"
+        assert any("opening day" in d for d in details)
+        assert any("no ledger journal" in d for d in details)
+        assert any("no IB statement" in d for d in details)
+        assert any("no ledger view" in d for d in details)
+
+    def test_a_failed_ledger_check_on_the_last_day_refuses_the_close(self, store):
+        november(store)
+        view = {
+            "checks": {
+                "breaks": [
+                    {"check": "completeness", "day": "2026-11-26", "detail": "x"},
+                    {"check": "roll_forward", "day": "2026-11-30", "detail": "y"},
+                    {"check": "break_aging", "day": "2026-11-20", "detail": "z"},
+                ]
+            }
+        }
+        document = close_month(
+            CloseInputs(
+                T,
+                "DU1",
+                "2026-11",
+                "2026-12-01",
+                load_journals(store, T, before="2026-12-01"),
+                stmt("2026-11-30", {"AAA": 6, "BBB": 5}, 946.0),
+                view,
+                None,
+                closes,
+                NOW,
+            )
+        )
+        assert sorted(str(e["class"]) for e in document["exceptions"]) == [
+            "close_checks_failed",
+            "close_input_missing",
+        ]
+
+    def test_income_suspense_shares_and_an_unattributed_flow_are_each_explained_or_refused(
+        self, store
+    ):
+        november(store)
+        journals = load_journals(store, T, before="2026-12-01")
+
+        def entry(kind, ref, postings, **evidence):
+            return Entry(T, "DU1", "2026-11-30", kind, ref, tuple(postings), evidence)
+
+        journals["2026-11-30"] = (
+            *journals["2026-11-30"],
+            entry(
+                "declared_cash_flow", "flow/x", [Posting(CASH, 25), Posting(DECLARED_FLOWS, -25)]
+            ),
+            entry(
+                "dividend_receivable",
+                "div/AAA",
+                [Posting(RECEIVABLE + "AAA", 60), Posting(DIVIDEND_INCOME + "AAA", -60)],
+            ),
+            entry(
+                "position_gap",
+                "gap/BBB",
+                [Posting(SECURITIES + "BBB", 0, 1), Posting(SUSPENSE_POSITION + "BBB", 0, -1)],
+                exception_ids=["z"],
+            ),
+            # A capital contribution is an external flow the attribution has no
+            # line for: the close must refuse it rather than call it P&L.
+            entry(
+                "adjustment",
+                "capital",
+                [Posting(CASH, 1_000), Posting(OPENING, -1_000)],
+                exception_ids=["q"],
+                decision_id="d",
+            ),
+        )
+        document = close_month(
+            CloseInputs(
+                T,
+                "DU1",
+                "2026-11",
+                "2026-12-01",
+                journals,
+                stmt("2026-11-30", {"AAA": 6, "BBB": 5}, 946.0),
+                {"checks": "not a mapping"},
+                None,
+                closes,
+                NOW,
+            )
+        )
+        assert document["pnl"]["dividends_cents"] == 60
+        assert document["pnl"]["declared_cash_flows_cents"] == 25
+        assert document["receivables_cents"] == 60
+        assert sorted(str(e["class"]) for e in document["exceptions"]) == [
+            "close_attribution",
+            "close_cash_delta",
+            "close_share_delta",
+            "close_suspense_shares",
+        ]
+
+    def test_the_next_month_starts_from_the_prior_close(self, store):
+        november(store)
+        _, nov = run(store)
+        assert nov is not None
+        prior = json.loads(store.get_bytes(close_key(T, "2026-11")))
+        anchor = stmt("2026-11-30", {"AAA": 6, "BBB": 5}, 946.0)
+        for day in month_trading_days("2026-12"):
+            fills = [fill("AAA", -6, 13.0, 0.0, "e3")] if day == "2026-12-15" else []
+            positions = {"BBB": 5} if day >= "2026-12-15" else {"AAA": 6, "BBB": 5}
+            cash = 946.0 + 78.0 if day >= "2026-12-15" else 946.0
+            today = stmt(day, positions, cash)
+            post(store, today, anchor, fills)
+            anchor = today
+        CLOSES["2026-12-31"] = {"BBB": 22.0, "SPY": 520.0}
+        try:
+            _, dec = run(store, "2027-01-04")
+        finally:
+            del CLOSES["2026-12-31"]
+        assert dec is not None and dec["status"] == "closed", dec["exceptions"]
+        assert dec["nav_start_cents"] == prior["nav_end_cents"]
+        assert dec["pnl"]["realised_cents"] == 7_800 - 6_000
+        statement = json.loads(store.get_bytes(statement_key(T, "2026-12")))
+        assert statement["inputs"]["prior_statement"] == statement_key(T, "2026-11")
+        assert statement["benchmarks"]["QQQ"]["return"] is None
+
+    def test_a_month_before_an_unclosed_month_is_refused_and_nothing_raises(self, store):
+        november(store)
+        ctx, out = run(store, "2027-01-04")  # December's close, with November open
+        assert out is None and ctx.metrics[0]["status"] == "FAIL"
+        assert "close in order" in ctx.metrics[0]["status_reason"]
+
+    def test_an_empty_ledger_has_nothing_to_close(self, store):
+        ctx, out = run(store)
+        assert out is None and ctx.metrics == []
+
+    def test_a_close_written_with_other_bytes_is_a_failure_not_an_overwrite(self, store):
+        november(store)
+        store.put_bytes(period_lock_key(T, "2026-11"), b'{"schema_version": "x"}')
+        ctx, out = run(store)
+        assert out is None and ctx.metrics[0]["status"] == "FAIL"
+
+    def test_a_metric_that_cannot_be_recorded_does_not_raise(self, store):
+        class Broken:
+            def __init__(self):
+                self.store = store
+
+            def record_metric(self, _):
+                raise RuntimeError("no metrics today")
+
+        november(store)
+        assert close_prior_month(Broken(), day="2026-12-01", account="DU1", now=NOW) is None
+        assert file_statement(Broken(), {"tenant": T}, now=NOW) is None
+
+    def test_a_prior_close_of_the_wrong_month_is_refused(self):
+        with pytest.raises(CloseError, match="finished close"):
+            close_month(
+                CloseInputs(
+                    T,
+                    "DU1",
+                    "2026-12",
+                    "2027-01-04",
+                    {},
+                    None,
+                    None,
+                    {"month": "2026-10", "status": "closed"},
+                    closes,
+                    NOW,
+                )
+            )
+
+    def test_keys_and_months(self):
+        assert previous_month("2026-01") == "2025-12"
+        assert close_key(T, "2026-11") == "trader/ledger/close/nous-ergon-paper/2026-11.json"
+        with pytest.raises(CloseError, match="YYYY-MM"):
+            close_key(T, "2026-13")
+
+    def test_lots_sell_past_zero_and_realise_leftover_cost(self):
+        lots = {"AAA": _Lot(2, 2_000)}
+        realised = _move(lots, "AAA", Posting("assets:securities:AAA", -3_300, -3), "fill")
+        assert realised == 2_200 - 2_000 and lots["AAA"] == _Lot(-1, -1_100)
+
+    def test_the_panel_source_reads_close_raw_and_treats_a_bad_panel_as_missing(self, store):
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            {"trading_day": ["2026-11-30"], "ticker": ["SPY"], "close_raw": [510.0]}
+        )
+        store.put_bytes(data_panel_key("2026-11-30"), frame.to_parquet())
+        source = panel_close_source(store)
+        assert source("2026-11-30", ["SPY", "QQQ"]) == {"SPY": 510.0}
+        assert source("2026-11-27", ["SPY"]) == {}
+
+
+def closed(**over):
+    base = {
+        "status": "closed",
+        "tenant": T,
+        "account": "DU1",
+        "month": "2026-11",
+        "opened_in_month": True,
+        "external_flows_cents": 0,
+        "nav_start_cents": 1_000_000,
+        "nav_end_cents": 1_100_000,
+        "start_trading_day": "2026-11-25",
+        "last_trading_day": "2026-11-30",
+        "pnl": {},
+    }
+    return {**base, **over}
+
+
+class TestStatement:
+    def test_the_bill_charges_the_adviser_fee_and_performance_above_the_mark(self):
+        statement = build_statement(closed(), None, {})
+        bill = statement["simulated_fee_bill"]
+        assert bill["aum_cents"] == 1_100_000
+        assert bill["adviser_fee_cents"] == 917  # 1% / 12 of $11,000
+        after = 1_100_000 - 917
+        assert bill["performance_fee_cents"] == int(
+            (Decimal(after - 1_000_000) * Decimal("0.2")).quantize(Decimal(1))
+        )
+        assert statement["high_water_mark_cents"] == statement["shadow_net_nav_end_cents"]
+
+    def test_a_month_below_the_mark_pays_no_performance_fee_and_keeps_the_mark(self):
+        prior = {
+            "month": "2026-11",
+            "tenant": T,
+            "shadow_net_nav_end_cents": 1_000_000,
+            "high_water_mark_cents": 1_200_000,
+        }
+        statement = build_statement(
+            closed(month="2026-12", opened_in_month=False), prior, {"SPY": {"return": 0.01}}
+        )
+        assert statement["simulated_fee_bill"]["performance_fee_cents"] == 0
+        assert statement["high_water_mark_cents"] == 1_200_000
+        assert statement["excess_return_gross"]["SPY"] == pytest.approx(0.09)
+
+    @pytest.mark.parametrize(
+        ("close", "prior", "match"),
+        [
+            (closed(status="refused"), None, "finished close"),
+            (closed(external_flows_cents=5), None, "external flow"),
+            (closed(nav_start_cents=0), None, "no return"),
+            (closed(opened_in_month=False), None, "statement is missing"),
+            (closed(), {"month": "2026-09", "tenant": T}, "prior statement"),
+        ],
+    )
+    def test_refusals(self, close, prior, match):
+        with pytest.raises(StatementError, match=match):
+            build_statement(close, prior, {})
+
+    def test_benchmarks_name_the_missing_day(self):
+        out = benchmark_returns(closes, "2026-11-24", "2026-11-30")
+        assert out["SPY"] == {"return": None, "reason": "no settled close for SPY on 2026-11-24"}
+
+    def test_a_statement_filed_concurrently_is_not_rewritten(self, store):
+        class Racing:
+            def __init__(self):
+                self.store = store
+                self.metrics: list[object] = []
+
+            def record_output_cas(self, *_):
+                from crucible.store import PointerConflictError
+
+                raise PointerConflictError("raced")
+
+            def record_metric(self, m):
+                self.metrics.append(m)
+
+        ctx = Racing()
+        assert file_statement(ctx, closed(), now=NOW, closes=closes) is None
+        assert ctx.metrics == []
+
+    def test_a_statement_that_cannot_be_built_is_a_fail_metric(self, store):
+        ctx = ctx_for(store, "2026-12-01")
+        assert file_statement(ctx, closed(status="refused"), now=NOW, closes=closes) is None
+        assert ctx.metrics[0]["status"] == "FAIL"
+
+
+def test_cash_account_name_is_the_ledgers():
+    assert CASH == "assets:cash:USD"
