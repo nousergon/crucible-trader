@@ -156,3 +156,52 @@ jobs:
       # is passed, so the ratchet lives in exactly one place.
       - name: Tests
         run: uv run --frozen pytest -c pyproject.toml -q --cov=crucible_trader --cov-config=pyproject.toml --cov-report=term-missing
+
+  # The wheel a DISPATCHED `trader.*` box installs (alpha-engine-config-I13159).
+  # BUILD ONLY: this job publishes nothing and holds no credential. It proves
+  # the wheel is reproducible (two builds of one tree, one sha256), that it
+  # carries the `crucible-trader-dispatch` console script, and uploads it as a
+  # run artifact named by its sha256 -- the name the box will verify against.
+  # Publishing it under the release prefix is a separate, granted step.
+  wheel:
+    name: wheel (content-hashed, build only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+
+      - name: Build twice and require one sha256
+        id: build
+        run: |
+          set -euo pipefail
+          uv build --wheel --out-dir "$RUNNER_TEMP/a"
+          uv build --wheel --out-dir "$RUNNER_TEMP/b"
+          a=("$RUNNER_TEMP"/a/*.whl); b=("$RUNNER_TEMP"/b/*.whl)
+          [ "${#a[@]}" -eq 1 ] || { echo "::error::expected one wheel, got ${#a[@]}"; exit 1; }
+          sha="$(sha256sum "${a[0]}" | cut -d' ' -f1)"
+          other="$(sha256sum "${b[0]}" | cut -d' ' -f1)"
+          if [ "$sha" != "$other" ]; then
+            echo "::error::wheel is not reproducible: $sha != $other"
+            exit 1
+          fi
+          name="$(basename "${a[0]}")"
+          unzip -p "${a[0]}" '*.dist-info/entry_points.txt' \
+            | grep -qx 'crucible-trader-dispatch = crucible_trader.dispatch_entry:main' \
+            || { echo "::error::$name carries no crucible-trader-dispatch entry point"; exit 1; }
+          mkdir -p "dist/$sha"
+          cp "${a[0]}" "dist/$sha/$name"
+          (cd "dist/$sha" && sha256sum "$name" > SHA256SUMS)
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "### crucible-trader wheel" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$name\` sha256 \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: crucible-trader-wheel-${{ steps.build.outputs.sha256 }}
+          path: dist/${{ steps.build.outputs.sha256 }}/
+          if-no-files-found: error
+          retention-days: 30
