@@ -66,16 +66,20 @@ class TestLateCredit:
         doc = result.to_document()
         assert {r["ticker"] for r in doc["dividend_credits"]} == {"MU", "SPY"}
         assert [r["estimated"] for r in doc["dividend_credits"] if r["ticker"] == "SPY"] == [True]
+        assert doc["dividends_owed"] == []
 
     def test_one_of_two_credited_matches_only_that_one(self):
         _, result = run(1_000.0 + 18.89, owed=(MU, SPY))
         assert result.clean
         assert [c.ticker for c in result.dividend_credits] == ["SPY"]
+        assert result.dividends_owed == (MU,)
 
     def test_nothing_credited_within_the_window_is_not_a_finding(self):
         _, result = run(1_000.0, owed=(MU, SPY))
         assert result.clean
         assert result.dividend_credits == ()
+        # The day's document shows the open list it was checked against.
+        assert [r["ticker"] for r in result.to_document()["dividends_owed"]] == ["MU", "SPY"]
 
     def test_a_credit_that_disagrees_with_the_derived_entitlement_stays_a_cash_delta(self):
         # 11 shares' worth of SPY, not the 10 derived: the credit never confirms itself.

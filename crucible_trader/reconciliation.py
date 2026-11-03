@@ -285,6 +285,11 @@ class ReconciliationResult:
     dividend_credits: tuple[OwedDividend, ...] = ()
     #: Dividends paying today that the broker did not apply: owed from today.
     dividends_unpaid: tuple[OwedDividend, ...] = ()
+    #: Every dividend carried in as owed and still not credited after today,
+    #: so one day's document shows the whole open list it was checked against.
+    #: Written for traceability only: the carry itself re-reads each dividend's
+    #: originating day (`dividend_entitlements.owed_dividends`), not this field.
+    dividends_owed: tuple[OwedDividend, ...] = ()
 
     @property
     def match_rate(self) -> float | None:
@@ -319,6 +324,7 @@ class ReconciliationResult:
             "discrepancies": [d.to_document() for d in self.discrepancies],
             "dividend_credits": [d.to_document() for d in self.dividend_credits],
             "dividends_unpaid": [d.to_document() for d in self.dividends_unpaid],
+            "dividends_owed": [d.to_document() for d in self.dividends_owed],
         }
 
 
@@ -588,6 +594,7 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         n_matched=sum(1 for t in resolved_rows if expected.get(t, 0) == broker.get(t, 0)),
         dividend_credits=credits,
         dividends_unpaid=tuple(unpaid_today),
+        dividends_owed=tuple(o for o in inputs.owed_dividends if o.key not in credited),
     )
 
 
@@ -603,6 +610,7 @@ def _result(
     cash_rounded_to_broker_usd: float | None = None,
     dividend_credits: tuple[OwedDividend, ...] = (),
     dividends_unpaid: tuple[OwedDividend, ...] = (),
+    dividends_owed: tuple[OwedDividend, ...] = (),
 ) -> ReconciliationResult:
     order = {klass: i for i, klass in enumerate(DISCREPANCY_CLASSES)}
     return ReconciliationResult(
@@ -632,6 +640,7 @@ def _result(
         discrepancies=tuple(sorted(findings, key=lambda d: (order[d.klass], d.instrument))),
         dividend_credits=dividend_credits,
         dividends_unpaid=dividends_unpaid,
+        dividends_owed=dividends_owed,
     )
 
 
