@@ -12,6 +12,9 @@ One record names:
 
 * ``source`` -- which detector raised it (:data:`SOURCES`), and ``class``, one
   of that detector's own closed set of finding classes;
+* ``tenant`` -- whose books the break is in (:data:`PAPER_FUND_TENANT` is the
+  first; `alpha-engine-config-I13118`, back office 1a), so the back office is
+  multi-tenant from day one;
 * ``trading_day``, ``account`` and ``instrument`` -- what the break is about;
 * ``amount`` and ``unit`` -- the detector's own delta, with a unit only where
   the class fixes one (:data:`_UNIT_BY_CLASS`); never inferred;
@@ -23,7 +26,9 @@ One record names:
 * ``detected_at`` -- when, in UTC;
 * ``exception_id`` -- DERIVED from the break's identity (:func:`exception_id`),
   so a re-run or a historical export of the same break yields the same id and a
-  queue can de-duplicate on it.
+  queue can de-duplicate on it. Ids are stable per tenant: the first tenant's
+  ids are exactly the ids filed before the field existed, and any other
+  tenant's ids are its own (see :func:`exception_id`).
 
 The day's records are filed together at :func:`exceptions_key` by the daily
 reconcile job (:func:`crucible_trader.reconciliation_job.file_exception_records`)
@@ -67,6 +72,7 @@ __all__ = [
     "DETECTING_JOB",
     "EXCEPTIONS_PREFIX",
     "EXCEPTION_SCHEMA_VERSION",
+    "PAPER_FUND_TENANT",
     "SOURCES",
     "SOURCE_BROKER_RECONCILIATION",
     "SOURCE_ORDER_INTENT_RECONCILIATION",
@@ -93,6 +99,10 @@ EXCEPTIONS_PREFIX = "trader/exceptions/"
 #: `crucible_trader.reconciliation_job.RECONCILE_JOB` (asserted by a test; not
 #: imported, because that module imports this one).
 DETECTING_JOB = "trader.reconcile"
+
+#: The first tenant: Nous Ergon's paper fund, the only books this trader keeps
+#: today (`alpha-engine-config-I13118`). Every converter defaults to it.
+PAPER_FUND_TENANT = "nous-ergon-paper"
 
 SOURCE_BROKER_RECONCILIATION = "crucible-trader.broker_reconciliation"
 SOURCE_ORDER_INTENT_RECONCILIATION = "crucible-trader.order_intent_reconciliation"
@@ -125,6 +135,7 @@ _UNIT_BY_CLASS: Mapping[tuple[str, str], str] = {
 }
 
 _ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TENANT = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _EXCEPTION_ID = re.compile(r"^[0-9a-f]{32}$")
 _UTC_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 
@@ -132,6 +143,7 @@ _RECORD_FIELDS = frozenset(
     {
         "schema_version",
         "exception_id",
+        "tenant",
         "source",
         "class",
         "trading_day",
@@ -163,10 +175,23 @@ def exceptions_key(trading_day: str) -> str:
     return f"{EXCEPTIONS_PREFIX}{trading_day}.json"
 
 
-def exception_id(source: str, trading_day: str, identity: Sequence[str | None]) -> str:
+def exception_id(
+    source: str,
+    trading_day: str,
+    identity: Sequence[str | None],
+    *,
+    tenant: str = PAPER_FUND_TENANT,
+) -> str:
     """The record's id: a digest of what the break IS, never of when it was
-    seen, so the same break always has the same id."""
-    payload = json.dumps([source, trading_day, *identity], separators=(",", ":"))
+    seen, so the same break always has the same id.
+
+    Stable per tenant. The first tenant's digest is the one filed before
+    ``tenant`` existed, so no stored or exported paper-fund id moves; any other
+    tenant's digest leads with the tenant, so two tenants' breaks of the same
+    shape never share an id."""
+    _require_tenant(tenant)
+    lead = [] if tenant == PAPER_FUND_TENANT else ["tenant", tenant]
+    payload = json.dumps([*lead, source, trading_day, *identity], separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
@@ -191,15 +216,19 @@ class ExceptionRecord:
     detected_at: str
     #: What, beyond source, day and class, makes this break this break.
     identity: tuple[str | None, ...]
+    tenant: str = PAPER_FUND_TENANT
 
     @property
     def exception_id(self) -> str:
-        return exception_id(self.source, self.trading_day, (self.klass, *self.identity))
+        return exception_id(
+            self.source, self.trading_day, (self.klass, *self.identity), tenant=self.tenant
+        )
 
     def to_document(self) -> dict[str, object]:
         document: dict[str, object] = {
             "schema_version": EXCEPTION_SCHEMA_VERSION,
             "exception_id": self.exception_id,
+            "tenant": self.tenant,
             "source": self.source,
             "class": self.klass,
             "trading_day": self.trading_day,
@@ -224,7 +253,7 @@ class ExceptionRecord:
 
 
 def records_from_broker_reconciliation(
-    document: Mapping[str, object], *, detected_at: str
+    document: Mapping[str, object], *, detected_at: str, tenant: str = PAPER_FUND_TENANT
 ) -> list[ExceptionRecord]:
     """The breaks in one stored ``broker_reconciliation.v1`` document (as the
     job files it: the result plus ``control_arm`` and ``void``).
@@ -259,6 +288,7 @@ def records_from_broker_reconciliation(
                 void=True,
                 detected_at=detected_at,
                 identity=(account,),
+                tenant=tenant,
             )
         )
     for finding in _mapping_list(document, "discrepancies"):
@@ -283,13 +313,14 @@ def records_from_broker_reconciliation(
                 void=void,
                 detected_at=detected_at,
                 identity=(account, instrument, side),
+                tenant=tenant,
             )
         )
     return records
 
 
 def records_from_order_intent_reconciliation(
-    document: Mapping[str, object], *, void: bool = False
+    document: Mapping[str, object], *, void: bool = False, tenant: str = PAPER_FUND_TENANT
 ) -> list[ExceptionRecord]:
     """The breaks in one ``order_intent_reconciliation`` document: every row
     whose class is in its ``BREAK_CLASSES``. ``detected_at`` is the document's
@@ -338,6 +369,7 @@ def records_from_order_intent_reconciliation(
                 void=void,
                 detected_at=detected_at,
                 identity=(order_key,),
+                tenant=tenant,
             )
         )
     return records
@@ -388,6 +420,7 @@ def validate_exception_record(document: Mapping[str, object]) -> None:
     _exact_fields(document, _RECORD_FIELDS, "exception record")
     if document["schema_version"] != EXCEPTION_SCHEMA_VERSION:
         raise ExceptionRecordError(f"schema_version {document['schema_version']!r}")
+    _require_tenant(_str(document, "tenant"))
     source = _str(document, "source")
     if source not in CLASSES_BY_SOURCE:
         raise ExceptionRecordError(f"unknown source {source!r}")
@@ -417,6 +450,11 @@ def validate_exception_record(document: Mapping[str, object]) -> None:
         raise ExceptionRecordError(f"detected_at {document['detected_at']!r} is not a UTC stamp")
     if not _EXCEPTION_ID.match(_str(document, "exception_id")):
         raise ExceptionRecordError(f"exception_id {document['exception_id']!r} is not 32 hex")
+
+
+def _require_tenant(tenant: str) -> None:
+    if not _TENANT.match(tenant):
+        raise ExceptionRecordError(f"tenant {tenant!r} is not a lowercase slug")
 
 
 def _require_day(day: str) -> None:

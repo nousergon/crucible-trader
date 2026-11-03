@@ -14,7 +14,10 @@ from crucible_trader.exception_proposal import (
     ACTIONS,
     NATURES,
     PROPOSAL_SCHEMA_VERSION,
+    RULESET_VERSION,
+    exception_proposals_key,
     main,
+    proposal_day_document,
     proposals_from_store,
     propose,
     propose_day,
@@ -152,6 +155,30 @@ def test_proposal_id_is_stable_across_runs_and_distinct_per_break():
 def _day_file(records):
     raw = records_from_broker_reconciliation(broker_doc(records), detected_at=STAMP)
     return exception_day_document(DAY, raw)
+
+
+def test_a_proposal_carries_its_records_tenant():
+    (mine,) = propose_day(_day_file([finding("share_delta")]), proposed_at=LATER)
+    assert mine.to_document()["tenant"] == "nous-ergon-paper"
+    raw = records_from_broker_reconciliation(
+        broker_doc([finding("share_delta")]), detected_at=STAMP, tenant="fund-b"
+    )
+    (theirs,) = propose_day(exception_day_document(DAY, raw), proposed_at=LATER)
+    assert theirs.to_document()["tenant"] == "fund-b"
+    assert theirs.proposal_id != mine.proposal_id
+
+
+def test_the_day_file_and_its_key():
+    assert exception_proposals_key(DAY) == f"trader/exception_proposals/{DAY}.json"
+    with pytest.raises(ExceptionRecordError, match="YYYY-MM-DD"):
+        exception_proposals_key("10/30/2026")
+    proposals = propose_day(_day_file([finding("share_delta")]), proposed_at=LATER)
+    document = proposal_day_document(DAY, proposals)
+    assert document["schema_version"] == PROPOSAL_SCHEMA_VERSION
+    assert document["ruleset_version"] == RULESET_VERSION
+    assert [d["proposal_id"] for d in document["proposals"]] == [p.proposal_id for p in proposals]
+    with pytest.raises(ExceptionRecordError, match="not 2026-10-29"):
+        proposal_day_document("2026-10-29", proposals)
 
 
 def test_propose_day_validates_the_file_first():

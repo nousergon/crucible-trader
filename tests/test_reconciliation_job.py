@@ -16,6 +16,7 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement, BrokerStatementError
+from crucible_trader.exception_proposal import RULESET_VERSION, exception_proposals_key
 from crucible_trader.exception_record import (
     CONTROL_ARM_VOID,
     exceptions_key,
@@ -25,6 +26,7 @@ from crucible_trader.order_intent_reconciliation import BrokerExecution, BrokerO
 from crucible_trader.reconciliation import CorporateActionSet, Fill, reconcile
 from crucible_trader.reconciliation_control import ReconciliationVoidError
 from crucible_trader.reconciliation_job import (
+    EXCEPTION_PROPOSALS_METRIC,
     EXCEPTION_RECORDS_METRIC,
     RECONCILE_JOB,
     ReconciliationDiscrepancyError,
@@ -126,9 +128,12 @@ class TestFailures:
         assert "share_delta: AAA" in str(raised.value) and "delta=-3" in str(raised.value)
         assert "side=broker_under" in str(raised.value)
         # Outputs are written BEFORE the raise, so the failed manifest carries them:
-        # the statement, the result, and the break as an exception record (I12892).
-        assert [o["key"] for o in ctx.outputs][2] == exceptions_key(DAY.isoformat())
-        assert len(ctx.outputs) == 3
+        # the statement, the result, the break as an exception record (I12892),
+        # and the shadow proposal for it (I13119).
+        assert [o["key"] for o in ctx.outputs][2:] == [
+            exceptions_key(DAY.isoformat()),
+            exception_proposals_key(DAY.isoformat()),
+        ]
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)
         assert {m["status"] for m in ctx.metrics} == {"FAIL", "OK"}
@@ -437,6 +442,118 @@ class TestExceptionRecords:
         manifest = read_manifest(store, RECONCILE_JOB, DAY.isoformat())  # validates on read
         assert manifest["status"] == "failed" and "share_delta: AAA" in manifest["reason"]
         assert exceptions_key(DAY.isoformat()) in {o["key"] for o in manifest["outputs"]}
+
+
+class TestExceptionProposals:
+    """Step 5c (`alpha-engine-config-I13119`, back office 1b): the shadow
+    proposer runs over the records 5b filed and files its proposals, and a
+    proposer failure is logged and swallowed -- every other output, the metrics
+    5b and earlier wrote, and the page are exactly what they were."""
+
+    def _discrepant(self, store, ctx):
+        return TestExceptionRecords()._discrepant(store, ctx)
+
+    def test_a_break_gets_a_filed_proposal(self, store):
+        ctx = ctx_for(store)
+        self._discrepant(store, ctx)
+        (record,) = output(store, exceptions_key(DAY.isoformat()))["records"]
+        day = output(store, exception_proposals_key(DAY.isoformat()))
+        assert day["trading_day"] == DAY.isoformat()
+        assert day["ruleset_version"] == RULESET_VERSION
+        (proposal,) = day["proposals"]
+        assert proposal["exception_id"] == record["exception_id"]
+        assert proposal["tenant"] == record["tenant"] == "nous-ergon-paper"
+        assert proposal["action"] == "investigate_shares"
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_PROPOSALS_METRIC]
+        MetricRecordRow.model_validate(metric)
+        assert metric["status"] == "OK" and metric["value"] == 1.0
+
+    def test_a_clean_cycle_proposes_nothing(self, store):
+        put_anchor(store)
+        ctx, _ = cycle(store, FixedSource({"AAA": 12}, 800.0))
+        assert not store.exists(exception_proposals_key(DAY.isoformat()))
+        assert EXCEPTION_PROPOSALS_METRIC not in {m["name"] for m in ctx.metrics}
+
+    @pytest.mark.parametrize("where", ["propose_day", "proposal_day_document", "write"])
+    def test_a_proposer_failure_leaves_the_reconcile_unchanged(
+        self, store, tmp_path, monkeypatch, caplog, where
+    ):
+        import crucible_trader.reconciliation_job as job
+
+        # The baseline: the same day with the proposer working.
+        base_ctx = ctx_for(store)
+        base_page = self._discrepant(store, base_ctx)
+
+        failing = LocalStore(tmp_path / "failing")
+        ctx = ctx_for(failing)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("proposer exploded")
+
+        if where == "write":
+            ctx.store = _NoProposalWrites(failing)
+        else:
+            monkeypatch.setattr(job, where, boom)
+        with caplog.at_level("WARNING", logger=job.__name__):
+            page = self._discrepant(failing, ctx)
+
+        # The page, every output but the proposals file, and every metric but the
+        # proposer's own are byte-for-byte the baseline's.
+        assert page == base_page
+        proposals_key = exception_proposals_key(DAY.isoformat())
+        assert ctx.outputs == [o for o in base_ctx.outputs if o["key"] != proposals_key]
+        assert not failing.exists(proposals_key)
+        others = [m for m in ctx.metrics if m["name"] != EXCEPTION_PROPOSALS_METRIC]
+        assert others == [m for m in base_ctx.metrics if m["name"] != EXCEPTION_PROPOSALS_METRIC]
+        # The failure is logged and reported, never raised.
+        assert "were NOT filed" in caplog.text
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_PROPOSALS_METRIC]
+        MetricRecordRow.model_validate(metric)
+        assert metric["status"] == "FAIL" and metric["value"] is None
+
+    def test_a_failing_metric_write_is_swallowed_too(self, store, monkeypatch):
+        ctx = ctx_for(store)
+        record_metric = ctx.record_metric
+
+        def picky(metric):
+            if metric["name"] == EXCEPTION_PROPOSALS_METRIC:
+                raise ValueError("metric store down")
+            record_metric(metric)
+
+        monkeypatch.setattr(ctx, "record_metric", picky)
+        page = self._discrepant(store, ctx)
+        assert "share_delta: AAA" in page
+        assert store.exists(exception_proposals_key(DAY.isoformat()))
+
+    def test_a_failed_manifest_carries_the_proposals(self, store):
+        put_anchor(store)
+        with pytest.raises(ReconciliationDiscrepancyError):
+            run_reconciliation(
+                store,
+                FixedSource({"AAA": 13}, 800.0),
+                trading_day=DAY,
+                fills=(Fill("AAA", 2, -200.0),),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                run_mode="replay",
+            )
+        manifest = read_manifest(store, RECONCILE_JOB, DAY.isoformat())  # validates on read
+        assert exception_proposals_key(DAY.isoformat()) in {o["key"] for o in manifest["outputs"]}
+
+
+class _NoProposalWrites:
+    """The store, except that writing a proposals file fails."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def put_bytes(self, key, payload):
+        if key.startswith("trader/exception_proposals/"):
+            raise PermissionError("denied")
+        return self._inner.put_bytes(key, payload)
 
 
 class _NoExceptionWrites:
