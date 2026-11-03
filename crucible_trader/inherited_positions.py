@@ -10,6 +10,13 @@ would liquidate them under it. Once v1 stops trading the same refusal would
 stop every session, so the handover is declared here rather than the guard
 loosened.
 
+**``effective_from`` is a BOOK trading day**, the day
+:class:`~crucible_trader.order_router.PaperOrderRouter` is opened for, not the
+calendar day the orders go out. A session trades the previous close's book, so
+the first session after v1 stopped (calendar 2026-11-03) trades the 2026-11-02
+book. Declared as the calendar day, that session found nothing inherited and
+refused SPY (``ForeignPositionError``, 2026-11-03 15:45Z, no order placed).
+
 **What a declaration permits, and nothing more.** From ``effective_from`` on,
 a name listed here that the book does not contain is planned to ZERO (sold
 whole) instead of refused. A name the book does contain is sized by the book

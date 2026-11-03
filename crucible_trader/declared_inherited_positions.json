@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "_comment": "Names the trader inherits from the v1 executor on the shared paper account (crucible_trader/inherited_positions.py). From effective_from on, a listed name the book does not contain is sold to zero instead of refused; every other foreign name is still refused and every risk cap still applies.",
-  "effective_from": "2026-11-03",
+  "_comment": "Names the trader inherits from the v1 executor on the shared paper account (crucible_trader/inherited_positions.py). effective_from is a BOOK trading day, the day the router is opened for, which is the session before the calendar day the orders go out: the 2026-11-03 session trades the 2026-11-02 book. From effective_from on, a listed name the book does not contain is sold to zero instead of refused; every other foreign name is still refused and every risk cap still applies.",
+  "effective_from": "2026-11-02",
   "symbols": ["ANF", "DECK", "DOCS", "DUOL", "LNTH", "MRNA", "MU", "NVDA", "PATH", "PLTR", "SPY", "UAL"],
   "source": "the paper account's positions at the 2026-10-30 close (trader/broker_statements/2026-10-30.json), all held by the v1 executor",
   "ruling": "Brian 2026-11-01, 'Switch to v2' (alpha-engine-config-I13005): the v1 executor stops trading after the 2026-11-02 session"
