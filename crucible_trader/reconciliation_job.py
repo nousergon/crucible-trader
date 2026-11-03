@@ -34,7 +34,7 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    step 6 decides or pages;
 5e. file the back office's score and queue
    (:func:`crucible_trader.exception_decision.score`) at
-   `trader/exception_scores/{day}.json`: every stored proposal against every
+   `trader/exception_scores/{day}.json` and `current.json`: every stored proposal against every
    reviewer decision, agreement per class and ruleset version, and the
    undecided queue oldest first with its age (`alpha-engine-config-I13120`,
    back office 1c) -- same contract as 5c (see :func:`file_exception_score`);
@@ -90,6 +90,7 @@ from crucible_trader.dividend_entitlements import (
     owed_dividends,
 )
 from crucible_trader.exception_decision import (
+    SCORE_CURRENT_KEY,
     SCORE_SCHEMA_VERSION,
     SCORES_PREFIX,
     exception_score_key,
@@ -617,7 +618,10 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
     :func:`~crucible_trader.exception_decision.score` -- agreement per class
     and ruleset version, and the queue of undecided and deferred proposals
     oldest first with their age in trading days -- at
-    :func:`~crucible_trader.exception_decision.exception_score_key`, plus one
+    :func:`~crucible_trader.exception_decision.exception_score_key` and, unless
+    a later day already filed one, at
+    :data:`~crucible_trader.exception_decision.SCORE_CURRENT_KEY` (the review
+    page's read), plus one
     ``exception_score_filed`` MetricRecord whose status is WATCH while any
     queue item is past the age limit.
 
@@ -636,11 +640,15 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
             as_of=day,
             generated_at=now,
         )
-        ctx.record_output(
-            key,
-            json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
-            SCORE_SCHEMA_VERSION,
+        payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+        ctx.record_output(key, payload, SCORE_SCHEMA_VERSION)
+        current: dict[str, object] = (
+            json.loads(ctx.store.get_bytes(SCORE_CURRENT_KEY).decode("utf-8"))
+            if ctx.store.exists(SCORE_CURRENT_KEY)
+            else {}
         )
+        if str(current.get("trading_day", "")) <= day:
+            ctx.record_output(SCORE_CURRENT_KEY, payload, SCORE_SCHEMA_VERSION)
         totals = cast("Mapping[str, object]", document["totals"])
         overdue = cast("int", totals["overdue"])
         status, value = ("WATCH" if overdue else "OK"), float(cast("int", totals["queue"]))

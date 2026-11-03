@@ -16,7 +16,7 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement, BrokerStatementError
-from crucible_trader.exception_decision import exception_score_key
+from crucible_trader.exception_decision import SCORE_CURRENT_KEY, exception_score_key
 from crucible_trader.exception_proposal import RULESET_VERSION, exception_proposals_key
 from crucible_trader.exception_record import (
     CONTROL_ARM_VOID,
@@ -101,6 +101,7 @@ class TestCleanCycle:
             ledger_reconciliation_key("nous-ergon-paper", "2026-09-11"),
             # Step 5e (I13120): the back office's score, filed on a clean day too.
             exception_score_key("2026-09-11"),
+            SCORE_CURRENT_KEY,
         ]
         document = output(store, reconciliation_key("2026-09-11"))
         assert document["void"] is False and document["control_arm"]["passed"] is True
@@ -145,6 +146,7 @@ class TestFailures:
             journal_key("nous-ergon-paper", DAY.isoformat()),
             ledger_reconciliation_key("nous-ergon-paper", DAY.isoformat()),
             exception_score_key(DAY.isoformat()),
+            SCORE_CURRENT_KEY,
         ]
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)
@@ -257,6 +259,7 @@ class TestTheHarnessWritesThisJobsManifest:
             journal_key("nous-ergon-paper", DAY.isoformat()),
             ledger_reconciliation_key("nous-ergon-paper", DAY.isoformat()),
             exception_score_key(DAY.isoformat()),
+            SCORE_CURRENT_KEY,
         }
 
     def test_a_discrepancy_is_a_failed_manifest_that_still_chains(self, store):
@@ -521,7 +524,7 @@ class TestExceptionProposals:
         # which counts the proposals and so differs when there are none.
         assert page == base_page
         proposals_key = exception_proposals_key(DAY.isoformat())
-        derived = {proposals_key, exception_score_key(DAY.isoformat())}
+        derived = {proposals_key, exception_score_key(DAY.isoformat()), SCORE_CURRENT_KEY}
         assert [o for o in ctx.outputs if o["key"] not in derived] == [
             o for o in base_ctx.outputs if o["key"] not in derived
         ]
@@ -732,6 +735,12 @@ class TestExceptionScore:
         file_exception_score(ctx, now="2026-09-18T21:00:00Z")
         (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
         assert metric["status"] == "WATCH" and "1 overdue" in metric["status_reason"]
+        assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
+        # A re-run of an EARLIER day files its own score and leaves `current` alone.
+        earlier = ctx_for(store)
+        file_exception_score(earlier, now="2026-09-18T22:00:00Z")
+        assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
+        assert [o["key"] for o in earlier.outputs] == [exception_score_key(DAY.isoformat())]
 
     def test_a_score_failure_leaves_the_reconcile_unchanged(self, store, monkeypatch, caplog):
         import crucible_trader.reconciliation_job as job

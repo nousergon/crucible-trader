@@ -80,6 +80,7 @@ __all__ = [
     "DECISIONS_PREFIX",
     "DECISION_SCHEMA_VERSION",
     "SCORES_PREFIX",
+    "SCORE_CURRENT_KEY",
     "SCORE_SCHEMA_VERSION",
     "VERDICTS",
     "DecisionError",
@@ -106,6 +107,11 @@ DECISIONS_PREFIX = "trader/exception_decisions/"
 #: The daily score, `{SCORES_PREFIX}{trading_day}.json`; derived, so a same-day
 #: re-run may rewrite it.
 SCORES_PREFIX = "trader/exception_scores/"
+
+#: The newest score, for a reader that wants today's queue and not a dated
+#: series (the console's review page, alpha-engine-config-I13121). Undated, so
+#: legal under plan §4.12; a re-run of an EARLIER day never moves it back.
+SCORE_CURRENT_KEY = f"{SCORES_PREFIX}current.json"
 
 VERDICTS: tuple[str, ...] = ("agree", "correct", "defer")
 
