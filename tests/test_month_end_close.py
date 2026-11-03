@@ -14,7 +14,13 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement
-from crucible_trader.exception_record import PAPER_FUND_TENANT, validate_exception_record
+from crucible_trader.exception_decision import SCORE_CURRENT_KEY, load_proposals
+from crucible_trader.exception_proposal import close_proposals_key
+from crucible_trader.exception_record import (
+    PAPER_FUND_TENANT,
+    SOURCE_MONTH_END_CLOSE,
+    validate_exception_record,
+)
 from crucible_trader.ledger import (
     CASH,
     DECLARED_FLOWS,
@@ -59,6 +65,7 @@ from crucible_trader.reconciliation import (
     ReconciliationInputs,
     reconcile,
 )
+from crucible_trader.reconciliation_job import file_exception_score
 
 T = PAPER_FUND_TENANT
 NOW = "2026-12-01T21:00:00Z"
@@ -235,6 +242,18 @@ class TestClose:
         # Still refused on the fourth trading day of the month: now it FAILs.
         late, _ = run(store, "2026-12-04")
         assert late.metrics[0]["status"] == "FAIL"
+        # Each refused attempt files its lines for review (I13121); the queue
+        # holds each line once however many times the close is refused.
+        assert "1 proposal(s) filed for review" in ctx.metrics[0]["status_reason"]
+        for run_day in ("2026-12-01", "2026-12-04"):
+            assert store.exists(close_proposals_key(T, "2026-11", run_day))
+        queued = load_proposals(store)
+        assert [(p["source"], p["class"], p["trading_day"]) for p in queued] == [
+            (SOURCE_MONTH_END_CLOSE, "close_suspense_cash", "2026-11-30")
+        ]
+        assert queued[0]["exception_id"] == refused["exceptions"][0]["exception_id"]
+        assert queued[0]["proposed_at"] == NOW
+        assert load_proposals(store, until="2026-11-30") == []
 
         # A prior-period adjustment dated in the open month clears it.
         gap = next(
@@ -418,6 +437,31 @@ class TestClose:
         assert statement["inputs"]["prior_statement"] == statement_key(T, "2026-11")
         assert statement["benchmarks"]["QQQ"]["return"] is None
 
+    def test_a_refused_close_is_in_the_same_days_review_queue(self, store):
+        november(store, ib_cash_end=946.5)
+        ctx, refused = run(store)
+        assert refused is not None
+        file_exception_score(ctx, now=NOW)
+        current = json.loads(store.get_bytes(SCORE_CURRENT_KEY))
+        assert [(q["source"], q["class"], q["status"]) for q in current["queue"]] == [
+            (SOURCE_MONTH_END_CLOSE, "close_suspense_cash", "undecided")
+        ]
+
+    def test_proposals_that_cannot_be_filed_cost_nothing_but_the_proposals(
+        self, store, monkeypatch
+    ):
+        def broken(*_a, **_k):
+            raise ValueError("proposer down")
+
+        monkeypatch.setattr("crucible_trader.month_end_close.propose_records", broken)
+        november(store, ib_cash_end=946.5)
+        ctx, refused = run(store)
+        assert refused is not None and refused["status"] == "refused"
+        assert store.exists(close_attempt_key(T, "2026-11", "2026-12-01"))
+        assert ctx.metrics[0]["status"] == "WATCH"
+        assert "proposals NOT filed (ValueError: proposer down)" in ctx.metrics[0]["status_reason"]
+        assert load_proposals(store) == []
+
     def test_a_month_before_an_unclosed_month_is_refused_and_nothing_raises(self, store):
         november(store)
         ctx, out = run(store, "2027-01-04")  # December's close, with November open
@@ -462,6 +506,13 @@ class TestClose:
                     NOW,
                 )
             )
+
+    def test_close_proposal_keys_end_in_the_day_they_were_filed(self):
+        assert close_proposals_key(T, "2026-11", "2026-12-01") == (
+            "trader/exception_proposals/month_end_close/nous-ergon-paper/2026-11/2026-12-01.json"
+        )
+        with pytest.raises(ValueError):
+            close_proposals_key(T, "2026-13", "2026-12-01")
 
     def test_keys_and_months(self):
         assert previous_month("2026-01") == "2025-12"
