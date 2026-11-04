@@ -2,8 +2,9 @@ name: CI
 
 # One workflow. A per-repo workflow exists here only when it needs a credential,
 # a trigger, or a permission a pytest cannot have (`crucible/AGENTS.md`, the RULE
-# and not a count). Nothing here needs any of the three yet, so everything this
-# repository guards about itself is a test in `tests/`.
+# and not a count). One job needs a credential: `wheel-publish`, on push to main
+# only, below. Everything else this repository guards about itself is a test in
+# `tests/`.
 #
 # This repository is public, so GitHub-hosted minutes are free and there is no
 # CodeBuild failover (routing a public repo to paid compute would replace
@@ -166,6 +167,8 @@ jobs:
   wheel:
     name: wheel (content-hashed, build only)
     runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -205,3 +208,71 @@ jobs:
           path: dist/${{ steps.build.outputs.sha256 }}/
           if-no-files-found: error
           retention-days: 30
+
+  # Publishes the wheel the `wheel` job built (alpha-engine-config-I13159) to
+  # s3://alpha-engine-crucible-v2/crucible/trader-wheels/<sha256>/{<wheel>,SHA256SUMS},
+  # where a dispatched `trader.*` box fetches it once a release manifest names
+  # that sha256. A separate job so the build (which runs the build backend)
+  # never holds a credential. Push to main only: the role
+  # (`crucible-v2-github-trader-wheel`, nous-ergon-ops crucible-v2.yaml) trusts
+  # this repository's `main` and this workflow file and nothing else, and may
+  # PUT/GET under `crucible/trader-wheels/*` only. Create-only: every PUT
+  # carries `If-None-Match: *`; on 412 the stored object is read back and must
+  # equal the built bytes, so a re-run is a no-op and nothing is overwritten.
+  wheel-publish:
+    name: wheel publish (main only)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SHA256: ${{ needs.wheel.outputs.sha256 }}
+      STORE: s3://alpha-engine-crucible-v2/crucible
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: crucible-trader-wheel-${{ needs.wheel.outputs.sha256 }}
+          path: dist
+
+      - name: Verify the artifact is the wheel the build hashed
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 '$SHA256'"; exit 1; }
+          whl=(dist/*.whl)
+          [ "${#whl[@]}" -eq 1 ] || { echo "::error::expected one wheel, got ${#whl[@]}"; exit 1; }
+          name="$(basename "${whl[0]}")"
+          [[ "$name" =~ ^crucible_trader-[0-9][0-9A-Za-z.+]*-py3-none-any[.]whl$ ]] \
+            || { echo "::error::unexpected wheel name $name"; exit 1; }
+          [ "$(cat dist/SHA256SUMS)" = "$SHA256  $name" ] \
+            || { echo "::error::SHA256SUMS does not name $SHA256 $name"; exit 1; }
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/crucible-v2-github-trader-wheel
+          aws-region: us-east-1
+
+      - name: Publish create-only, or prove the stored bytes are identical
+        run: |
+          set -euo pipefail
+          name="$(basename dist/*.whl)"
+          bucket="${STORE#s3://}"; bucket="${bucket%%/*}"; prefix="${STORE#s3://$bucket/}"
+          for f in "$name" SHA256SUMS; do
+            key="$prefix/trader-wheels/$SHA256/$f"
+            if aws s3api put-object --bucket "$bucket" --key "$key" --body "dist/$f" \
+                 --if-none-match '*' > /dev/null 2> "$RUNNER_TEMP/put.err"; then
+              echo "published s3://$bucket/$key"
+            elif grep -q PreconditionFailed "$RUNNER_TEMP/put.err"; then
+              aws s3api get-object --bucket "$bucket" --key "$key" "$RUNNER_TEMP/stored" > /dev/null
+              cmp -s "$RUNNER_TEMP/stored" "dist/$f" \
+                || { echo "::error::s3://$bucket/$key exists with different bytes"; exit 1; }
+              echo "already published, identical: s3://$bucket/$key"
+            else
+              cat "$RUNNER_TEMP/put.err"; exit 1
+            fi
+          done
+          echo "### crucible-trader wheel published" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$STORE/trader-wheels/$SHA256/$name\`" >> "$GITHUB_STEP_SUMMARY"

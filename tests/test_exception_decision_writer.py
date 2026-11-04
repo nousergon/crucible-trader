@@ -296,7 +296,7 @@ class TestRefusesTheRequest:
     @pytest.mark.parametrize(
         ("ev", "status"),
         [
-            (event(AGREE, jwt=None, method="GET"), 405),
+            (event(AGREE, jwt=None, method="PUT"), 405),
             (event(AGREE, jwt=None, origin="https://evil.example"), 403),
             (event(AGREE, jwt=None, **{"content-type": "text/plain"}), 415),
             (event(AGREE, jwt=None), 401),
@@ -498,3 +498,95 @@ class TestHandler:
         assert w.handler(event(AGREE, jwt=token(key)), None)["statusCode"] == 201
         assert w.handler(event(AGREE, jwt=None), None)["statusCode"] == 401
         assert len(w._STATE) == 1 and len(load_decisions(store)) == 1
+
+
+def get(*, jwt: str | None, tenant: str | None = None) -> dict:
+    ev = event("", jwt=jwt, method="GET")
+    del ev["headers"]["content-type"], ev["headers"]["origin"]
+    if tenant is not None:
+        ev["queryStringParameters"] = {"tenant": tenant}
+    return ev
+
+
+class TestServesTheForm:
+    def test_the_approvers_queue_with_a_nonced_script(self, config, store, key, capsys):
+        response = w.handle(
+            get(jwt=token(key)),
+            config=config,
+            keys={"k1": (key.n, key.e)}.get,
+            store=store,
+            now=NOW,
+        )
+        assert response["statusCode"] == 200
+        headers = response["headers"]
+        assert (
+            headers["content-type"].startswith("text/html")
+            and headers["cache-control"] == "no-store"
+        )
+        page = response["body"]
+        nonce = headers["content-security-policy"].split("'nonce-")[1].split("'")[0]
+        assert (
+            f'<script nonce="{nonce}">' in page
+            and "connect-src 'self'" in headers["content-security-policy"]
+        )
+        assert (
+            f"{1:032x}" in page and f"{2:032x}" not in page
+        )  # the other tenant's proposal is not shown
+        assert "brian" in page and EMAIL not in page
+        log = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert log["outcome"] == "form" and log["items"] == 1
+        assert load_decisions(store) == []
+
+    def test_a_decided_proposal_leaves_the_form_and_a_deferral_stays(self, config, store, key):
+        keys = {"k1": (key.n, key.e)}.get
+        _, first = call(event(AGREE, jwt=token(key)), config=config, store=store, key=key)
+        page = w.handle(get(jwt=token(key)), config=config, keys=keys, store=store, now=NOW)["body"]
+        assert f"{1:032x}" not in page and "Nothing waits for a decision." in page
+        defer = {
+            **AGREE,
+            "verdict": "defer",
+            "note": "waiting on IB",
+            "supersedes": first["decision_id"],
+        }
+        assert call(event(defer, jwt=token(key)), config=config, store=store, key=key)[0] == 201
+        page = w.handle(get(jwt=token(key)), config=config, keys=keys, store=store, now=NOW)["body"]
+        assert f"{1:032x}" in page and "deferred" in page
+
+    def test_narrowed_to_one_held_tenant(self, config, store, key):
+        response = w.handle(
+            get(jwt=token(key), tenant=TENANT),
+            config=config,
+            keys={"k1": (key.n, key.e)}.get,
+            store=store,
+            now=NOW,
+        )
+        assert response["statusCode"] == 200 and f"{1:032x}" in response["body"]
+
+    @pytest.mark.parametrize(
+        ("jwt_overrides", "tenant", "status"),
+        [
+            (None, None, 401),
+            ({"email": "someone@example.com"}, None, 403),
+            ({}, "second-tenant", 403),
+        ],
+    )
+    def test_refuses_without_an_approver_for_the_tenant(
+        self, config, store, key, jwt_overrides, tenant, status
+    ):
+        jwt = None if jwt_overrides is None else token(key, **jwt_overrides)
+        code, body = call(get(jwt=jwt, tenant=tenant), config=config, store=store, key=key)
+        assert code == status and body["error"]
+
+    def test_unreachable_signing_keys(self, config, store, key):
+        def unavailable(kid: str):
+            raise w.KeysUnavailable("down")
+
+        response = w.handle(
+            get(jwt=token(key)), config=config, keys=unavailable, store=store, now=NOW
+        )
+        assert response["statusCode"] == 503
+
+    def test_an_unreadable_queue_is_unavailable(self, config, store, key):
+        store.put_bytes("trader/exception_decisions/2026-09-11/bad.json", b"[1]")
+        code, body = call(get(jwt=token(key)), config=config, store=store, key=key)
+        assert code == 503 and body["error"].startswith("cannot read the queue")

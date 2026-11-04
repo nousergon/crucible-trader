@@ -182,6 +182,18 @@ _RULES: Mapping[tuple[str, str], Callable[[Mapping[str, object]], _Rule]] = {
         "book_corporate_action_manually",
         "a resolved corporate action of a kind the reconciler cannot apply; book it by hand",
     ),
+    # Polygon, IB and the ledger disagree on a share-affecting action
+    # (`crucible_trader.corporate_action_check`). Which source is wrong is the
+    # question, so it is a defect to investigate, never an event to wait out.
+    # A new class with a new rule changes no existing proposal, so the ruleset
+    # version stands.
+    (_B, "corporate_action_source_mismatch"): _fixed(
+        "corporate_action.source_mismatch",
+        "defect",
+        "investigate_shares",
+        "Polygon, IB and the ledger disagree on a corporate action; find which source is "
+        "wrong before anything is booked, never by preferring one",
+    ),
     (_B, "corporate_action_check_incomplete"): _fixed(
         "detector.feed_incomplete",
         "detector",
