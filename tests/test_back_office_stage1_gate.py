@@ -33,6 +33,7 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader import (
+    ledger,
     month_end_close,
     month_rebuild,
     performance_statement,
@@ -96,6 +97,11 @@ def store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> LocalStore
     # The settled closes the close, the statement and the rebuild read.
     for module in (month_end_close, performance_statement, month_rebuild):
         monkeypatch.setattr(module, "panel_close_source", lambda _store: closes)
+    # The ledger's daily settled-close completeness (I13129) reads every held
+    # day's panel; this synthetic month prices only the days its close reads.
+    monkeypatch.setattr(
+        ledger, "_panel_closes", lambda _store: lambda _day, names: dict.fromkeys(names, 1.0)
+    )
     # The real fund's declared dividend entitlements are not this synthetic book's.
     monkeypatch.setattr(reconciliation_job, "load_declared_entitlements", lambda: {})
     return LocalStore(tmp_path)

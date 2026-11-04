@@ -78,6 +78,11 @@ CLOSES = {
 }
 
 
+def every_close(_day, tickers):
+    """A settled-close source with a close for every name (I13129's daily check)."""
+    return {t: 1.0 for t in tickers}
+
+
 def closes(day, tickers):
     return {t: CLOSES.get(day, {})[t] for t in tickers if t in CLOSES.get(day, {})}
 
@@ -124,6 +129,7 @@ def post(store, broker, anchor, fills=()):
         cash_flows=(),
         corporate_actions=NONE,
         reconciliation={**document, "void": False},
+        closes=every_close,
         now="2026-11-30T21:00:00Z",
     )
     assert posting is not None

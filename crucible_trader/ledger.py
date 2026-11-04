@@ -90,7 +90,7 @@ import datetime as dt
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 
@@ -825,10 +825,13 @@ def post_daily_ledger(
     reconciliation: Mapping[str, object],
     now: str,
     tenant: str = PAPER_FUND_TENANT,
+    closes: SettledCloses | None = None,
 ) -> DayPosting | None:
     """Step 5d of `trader.reconcile`: book the day, reconcile the LEDGER to the
     broker, write the journal (create-only) and the reconciliation view, and
-    record one MetricRecord. NEVER raises; returns ``None`` on failure."""
+    record one MetricRecord. NEVER raises; returns ``None`` on failure.
+
+    ``closes`` defaults to the stored price panels (``close_raw``)."""
     day = broker.trading_day
     key = None
     try:
@@ -865,6 +868,7 @@ def post_daily_ledger(
             journals={**journals, day: posting.entries},
             locks=locks,
             view=posting.document,
+            closes=closes if closes is not None else _panel_closes(ctx.store),
         )
         posting.document["checks"] = checks
         payload = journal_document(tenant, day, posting.entries)
@@ -966,6 +970,25 @@ def _metric(
 
 
 # ------------------------------------------------------------ checks (1h)
+
+#: ``(trading_day, tickers) -> {ticker: settled close in USD}``; a ticker with
+#: no close is absent (the shape of ``month_end_close.CloseSource``).
+SettledCloses = Callable[[str, Sequence[str]], Mapping[str, float]]
+
+
+def _panel_closes(store: Store) -> SettledCloses:
+    """Settled closes from the stored price panels. The import (pandas) and the
+    read both happen inside the call, which `run_checks` guards, so neither
+    can stop a journal from posting."""
+
+    def closes(day: str, tickers: Sequence[str]) -> Mapping[str, float]:
+        from crucible_trader.month_end_close import panel_close_source  # noqa: PLC0415 - cycle, pandas
+
+        return panel_close_source(store)(day, tickers)
+
+    return closes
+
+
 # alpha-engine-config-I13129: roll-forward, completeness, rebuild-from-raw,
 # break aging and period lock over the ledger. Each failure is a BREAK in the
 # day's view and turns the ledger metric FAIL; none of them raises.
@@ -1065,11 +1088,20 @@ def run_checks(
     journals: Mapping[str, Sequence[Entry]],
     locks: Mapping[str, Mapping[str, str]],
     view: Mapping[str, object],
+    closes: SettledCloses | None = None,
 ) -> dict[str, object]:
-    """The 1h checks for ``day`` (whose entries are already in ``journals``)."""
+    """The 1h checks for ``day`` (whose entries are already in ``journals``).
+
+    ``closes`` (``(trading_day, tickers) -> {ticker: close}``) adds the daily
+    settled-close completeness check; ``None`` skips it."""
     breaks: list[dict[str, object]] = []
     days = sorted(journals)
     month_start = f"{day[:7]}-01"
+    # The previous trading day the ledger covers, and the names it held at
+    # that day's end (alpha-engine-config-I13129 settled-close completeness).
+    span = trading_days_between(days[0], day) if days else [day]
+    prev = span[-2] if len(span) > 1 else None
+    held: list[str] = []
 
     # Roll-forward, today, and rebuild-from-raw: each earlier day of the open
     # month rebuilt from its journals must equal the view published for it.
@@ -1089,6 +1121,8 @@ def run_checks(
                 breaks.append({"check": "roll_forward", "day": d, "detail": "does not tie"})
         for entry in journals[d]:
             replay.append(entry)
+        if prev is not None and d <= prev:
+            held = sorted(replay.positions(tenant, account))
         if month_start <= d < day:
             key = ledger_reconciliation_key(tenant, d)
             if not store.exists(key):
@@ -1108,6 +1142,22 @@ def run_checks(
     # Completeness: from the open month's start (or the first journal), every
     # trading day has a journal, a published view and an IB statement.
     first = max(month_start, days[0]) if days else day
+    # ...and every name held at the end of the PREVIOUS trading day has its
+    # settled close. The day's own price panel is compiled after this job runs
+    # (data/<day>/panel.parquet lands ~02:20Z the next morning), so each run
+    # checks the day before; the first trading day of a month leaves the last
+    # day of the prior month to the month-end close (`close_input_missing`).
+    closes_day: str | None = None
+    close_gaps: list[str] = []
+    if closes is not None and prev is not None and prev >= first:
+        closes_day = prev
+        have: set[str] = set()
+        if held:
+            try:
+                have = set(closes(prev, held))
+            except Exception:  # noqa: BLE001 - an unreadable panel is a missing close, never a raise
+                have = set()
+        close_gaps = [f"close:{t}" for t in held if t not in have]
     missing: list[dict[str, object]] = []
     for d in trading_days_between(first, day):
         lacking = [
@@ -1119,7 +1169,7 @@ def run_checks(
                 ("reconciliation", d == day or store.exists(trader_reconciliation_key(d))),
             )
             if not present
-        ]
+        ] + (close_gaps if d == closes_day else [])
         if lacking:
             missing.append({"day": d, "missing": lacking})
             breaks.append({"check": "completeness", "day": d, "detail": f"missing {lacking}"})
@@ -1156,7 +1206,12 @@ def run_checks(
 
     return {
         "roll_forward": rolled,
-        "completeness": {"from": first, "through": day, "missing": missing},
+        "completeness": {
+            "from": first,
+            "through": day,
+            "missing": missing,
+            "closes_day": closes_day,
+        },
         "open_breaks": sorted(open_breaks, key=lambda b: (b["day"], b["entry_id"])),
         "locked_months": sorted(locks),
         "breaks": breaks,
