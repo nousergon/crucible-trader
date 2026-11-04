@@ -13,9 +13,9 @@ of record) and closes one month for one tenant's account:
 * **P&L** -- realised (average cost), the change in unrealised, dividends,
   accrued interest (its first recorded balance on its own line when the
   opening's accrual was not recorded), declared cash flows, commissions,
-  suspense movements and the reconciliation adjustments that clear decided
-  breaks, which must sum to the change in NAV to the cent (the attribution
-  check);
+  suspense movements, the reconciliation adjustments that clear decided
+  breaks and the cash rounded to IB inside the 5-cent band, which must sum
+  to the change in NAV to the cent (the attribution check);
 * **fees accrued** -- the commissions booked in the month. The simulated
   adviser and performance fees are 1f's bill, produced from this close
   (:mod:`crucible_trader.performance_statement`); they are never booked.
@@ -77,6 +77,7 @@ from crucible_trader.exception_record import (
 )
 from crucible_trader.ledger import (
     CASH,
+    CASH_ROUNDING,
     CLOSE_SUSPENSE_CASH,
     CLOSE_SUSPENSE_SHARES,
     COMMISSIONS,
@@ -314,7 +315,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
             )
 
     # ---- walk the month: average cost, realised P&L, income and expense.
-    realised = dividends = flows = commissions = suspense = adjustments = 0
+    realised = dividends = flows = commissions = suspense = adjustments = rounding = 0
     interest = interest_first_recorded = opening_accrual = 0
     for d in sorted(within):
         for entry in within[d]:
@@ -341,6 +342,8 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                     suspense -= p.amount_cents
                 elif p.account == RECONCILIATION_ADJUSTMENTS:
                     adjustments -= p.amount_cents
+                elif p.account == CASH_ROUNDING:
+                    rounding -= p.amount_cents
                 elif p.account.startswith(SECURITIES):
                     realised += _move(lots, p.account[len(SECURITIES) :], p, entry.kind)
     # A position that went to zero realises whatever cost it still carries.
@@ -444,6 +447,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
         "commissions_cents": -commissions,
         "suspense_cents": suspense,
         "reconciliation_adjustments_cents": adjustments,
+        "cash_rounded_to_broker_cents": rounding,
     }
     total = sum(attribution.values())
     priced = not unpriced and all(row["close_usd"] is not None for row in positions.values())

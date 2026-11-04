@@ -156,6 +156,7 @@ from crucible_trader.order_intent_reconciliation import (
 from crucible_trader.order_router import ORDER_REF_PREFIX
 from crucible_trader.performance_statement import file_statement
 from crucible_trader.reconciliation import (
+    CASH_PAGE_THRESHOLD_USD,
     RECONCILIATION_SCHEMA_VERSION,
     CashFlow,
     CorporateActionSet,
@@ -191,8 +192,8 @@ CorporateActionProvider = Callable[[RunContext, str, frozenset[str]], CorporateA
 
 
 #: The largest `cash_delta` (absolute USD) that is filed and queued but does not
-#: page on its own. Above it, a cash gap pages.
-CASH_PAGE_THRESHOLD_USD = 1.00
+#: page on its own is :data:`crucible_trader.reconciliation.CASH_PAGE_THRESHOLD_USD`
+#: (imported above, so the ledger's cash tiers read the same number).
 
 #: The month-to-date total (absolute USD) of cash the job has NOT paged on --
 #: every `cash_rounded_to_broker_usd` plus every low-band `cash_delta` -- above

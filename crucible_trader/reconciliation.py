@@ -73,6 +73,12 @@ RECONCILIATION_SCHEMA_VERSION = "broker_reconciliation.v1"
 CASH_TOLERANCE_USD = 0.05
 _CASH_TOLERANCE_CENTS = round(CASH_TOLERANCE_USD * 100)
 
+#: The largest cash gap (absolute USD) that is filed and queued for review but
+#: does not page on its own (Brian, 2026-11-02, the cash tiers). Above it, a
+#: cash gap pages. Owned here so the reconciler's job and the ledger read one
+#: number: `reconciliation_job` re-exports it.
+CASH_PAGE_THRESHOLD_USD = 1.00
+
 
 def _cash_cents_off(broker_cash: float, expected_cash: float) -> int:
     """How many whole cents the broker's cash is off the expected cash, once the

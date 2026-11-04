@@ -48,6 +48,23 @@ first trading day AFTER the day it was made, so a re-run of any day books the
 same bytes. A gap is cleared once: any adjustment already citing one of its ids
 settles it, exactly as the 1h aging check and the close (1e) read it.
 
+**Cash tiers** (Brian 2026-10-28 and 2026-11-02, the same bands as the
+reconciler's, read from :mod:`crucible_trader.reconciliation`). The ledger's own
+cash difference to IB is judged in whole cents:
+
+- **at most** ``CASH_TOLERANCE_USD`` (5 cents): rounded to IB. It is NOT a break
+  and goes to no suspense; it is booked as its own ``cash_rounding`` entry
+  against the named account :data:`CASH_ROUNDING`, reported in the day's view
+  (``cash_rounded_to_broker_cents``, and the account's running balance) and as
+  its own line in the close's attribution, so every absorbed cent stays visible;
+- **over 5 cents, up to** ``CASH_PAGE_THRESHOLD_USD`` ($1.00): a ``cash_gap`` in
+  suspense with ``tier: review``; the metric says ``WATCH`` and the break goes to
+  the review queue, aging as above;
+- **over $1.00**: the same ``cash_gap`` with ``tier: page``, and the metric
+  says ``FAIL``.
+
+Shares have no band: any share difference is a ``position_gap``.
+
 A decision on the month-end close's own line for a gap still in suspense
 (``close_suspense_cash`` / ``close_suspense_shares``) clears that gap the same
 way: :func:`close_suspense_line_ids` derives the ids the close gives a gap's
@@ -127,7 +144,13 @@ from crucible_trader.exception_record import (
     exception_id,
     records_from_broker_reconciliation,
 )
-from crucible_trader.reconciliation import CashFlow, CorporateActionSet, Fill
+from crucible_trader.reconciliation import (
+    CASH_PAGE_THRESHOLD_USD,
+    CASH_TOLERANCE_USD,
+    CashFlow,
+    CorporateActionSet,
+    Fill,
+)
 
 LEDGER_SCHEMA_VERSION = "ledger_journal.v1"
 LEDGER_RECONCILIATION_SCHEMA_VERSION = "ledger_reconciliation.v1"
@@ -161,6 +184,9 @@ INTEREST_FIRST_RECORDED = "income:interest_first_recorded"
 #: Where a decided share gap's suspense goes: the securities account already
 #: holds IB's count, so the offsetting shares leave suspense to here.
 SHARE_ADJUSTMENTS = "equity:share_adjustments:"
+#: Where a cash difference inside the 5-cent band goes (Brian 2026-10-28: "round
+#: to the IB reporting"): a NAMED plug (policy Rule 2), its balance reported.
+CASH_ROUNDING = "income:cash_rounded_to_broker"
 _FIXED_ACCOUNTS = frozenset(
     {
         CASH,
@@ -169,11 +195,16 @@ _FIXED_ACCOUNTS = frozenset(
         OPENING,
         SUSPENSE_CASH,
         RECONCILIATION_ADJUSTMENTS,
+        CASH_ROUNDING,
         INTEREST_RECEIVABLE,
         INTEREST_INCOME,
         INTEREST_FIRST_RECORDED,
     }
 )
+#: The cash tiers in whole cents: rounded to IB at or under the first; a gap
+#: for review up to the second; a gap that pages above it.
+CASH_ROUNDING_BAND_CENTS = round(CASH_TOLERANCE_USD * 100)
+CASH_PAGE_THRESHOLD_CENTS = round(CASH_PAGE_THRESHOLD_USD * 100)
 _PER_INSTRUMENT = (SECURITIES, RECEIVABLE, DIVIDEND_INCOME, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
 #: Only these accounts hold shares.
 _QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
@@ -196,6 +227,7 @@ ENTRY_KINDS = frozenset(
         "dividend_receivable",
         "dividend_settlement",
         "split",
+        "cash_rounding",
         "cash_gap",
         "position_gap",
         "adjustment",
@@ -594,6 +626,15 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         "broker_positions": {t: int(q) for t, q in sorted(broker.positions.items()) if q},
         "breaks": list(breaks),
         "suspense": suspense,
+        # Inside the 5-cent band: rounded to IB, its own entry, never a break.
+        "cash_rounded_to_broker_cents": sum(
+            p.amount_cents
+            for e in new
+            if e.kind == "cash_rounding"
+            for p in e.postings
+            if p.account == CASH
+        ),
+        "cash_rounding_balance_cents": -ledger.cents(tenant, account, CASH_ROUNDING),
         "dividends_receivable_cents": ledger.balances(tenant, account, RECEIVABLE),
         "interest_receivable_cents": ledger.cents(tenant, account, INTEREST_RECEIVABLE),
         "broker_accrued_interest_cents": (
@@ -726,8 +767,21 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
         )
 
     ours_cash, theirs_cash = ledger.cents(tenant, account, CASH), to_cents(broker.cash_usd)
-    if ours_cash != theirs_cash:
-        delta = theirs_cash - ours_cash
+    delta = theirs_cash - ours_cash
+    if delta and abs(delta) <= CASH_ROUNDING_BAND_CENTS:
+        book(
+            "cash_rounding",
+            "rounding/USD",
+            [Posting(CASH, delta), Posting(CASH_ROUNDING, -delta)],
+            source="ib_statement",
+            reason=(
+                f"broker cash differs from the ledger by {delta} cent(s), inside the "
+                f"{CASH_ROUNDING_BAND_CENTS}-cent band: rounded to IB, not a break"
+            ),
+            ledger_cents=ours_cash,
+            broker_cents=theirs_cash,
+        )
+    elif delta:
         ledger_break = exception_id("ledger", day, ("cash_gap", account, "USD"), tenant=tenant)
         ids = [*cited.get("USD", []), ledger_break]
         breaks.append(
@@ -737,6 +791,7 @@ def _book_gaps(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, o
                 "ledger": ours_cash,
                 "broker": theirs_cash,
                 "delta": delta,
+                "tier": "review" if abs(delta) <= CASH_PAGE_THRESHOLD_CENTS else "page",
                 "exception_ids": ids,
             }
         )
@@ -1020,6 +1075,19 @@ def post_daily_ledger(
             float(len(failed)),
             f"ledger checks failed on {day}: "
             + "; ".join(f"{b['check']} {b['detail']}" for b in failed)[:360],
+        )
+    elif paging := [b for b in posting.breaks if b.get("tier") == "page"]:
+        _metric(
+            ctx,
+            now,
+            view_key,
+            "FAIL",
+            float(n),
+            (
+                f"ledger cash gap over {CASH_PAGE_THRESHOLD_USD:.2f} USD on {day}: "
+                + "; ".join(f"{b['delta']} cents" for b in paging)
+                + f"; booked to suspense {posting.document['suspense']}"
+            )[:400],
         )
     elif posting.document["clean"]:
         _metric(
