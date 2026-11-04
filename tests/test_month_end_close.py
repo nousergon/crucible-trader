@@ -55,6 +55,8 @@ from crucible_trader.month_end_close import (
 )
 from crucible_trader.month_rebuild import REBUILD_METRIC, rebuild_key, verify_month_rebuild
 from crucible_trader.performance_statement import (
+    FEE_SCHEDULES,
+    SIMULATED_FEE_SCHEDULE,
     StatementError,
     benchmark_returns,
     build_statement,
@@ -582,12 +584,48 @@ class TestStatement:
         statement = build_statement(closed(), None, {})
         bill = statement["simulated_fee_bill"]
         assert bill["aum_cents"] == 1_100_000
-        assert bill["adviser_fee_cents"] == 917  # 1% / 12 of $11,000
-        after = 1_100_000 - 917
+        # 1% / 12 of $11,000, prorated: the book opened 11-25, so 6 of 30 days.
+        assert bill["adviser_fee_cents"] == 183
+        assert (bill["billed_days"], bill["days_in_month"]) == (6, 30)
+        after = 1_100_000 - 183
         assert bill["performance_fee_cents"] == int(
             (Decimal(after - 1_000_000) * Decimal("0.2")).quantize(Decimal(1))
         )
         assert statement["high_water_mark_cents"] == statement["shadow_net_nav_end_cents"]
+
+    def test_a_book_open_from_the_first_trading_day_bills_the_whole_month(self):
+        # alpha-engine-config-I13125: proration is for a book that opened late,
+        # not for a month whose first calendar days were a weekend.
+        statement = build_statement(
+            closed(start_trading_day="2026-11-02", first_trading_day="2026-11-02"), None, {}
+        )
+        bill = statement["simulated_fee_bill"]
+        assert bill["adviser_fee_cents"] == 917
+        assert (bill["billed_days"], bill["days_in_month"]) == (30, 30)
+
+    def test_a_month_carried_from_a_prior_statement_bills_the_whole_month(self):
+        prior = {
+            "month": "2026-10",
+            "tenant": T,
+            "shadow_net_nav_end_cents": 1_000_000,
+            "high_water_mark_cents": 1_000_000,
+        }
+        bill = build_statement(
+            closed(opened_in_month=False, start_trading_day="2026-10-30"), prior, {}
+        )["simulated_fee_bill"]
+        assert bill["adviser_fee_cents"] == 917
+        assert bill["billed_days"] == 30
+
+    def test_the_first_schedule_still_bills_a_whole_month_and_says_nothing_of_days(self):
+        bill = build_statement(closed(), None, {}, FEE_SCHEDULES["simulated.2026-11-03"])[
+            "simulated_fee_bill"
+        ]
+        assert bill["adviser_fee_cents"] == 917
+        assert "billed_days" not in bill and "days_in_month" not in bill
+
+    def test_every_registered_schedule_is_keyed_by_its_own_id(self):
+        assert all(k == v["schedule_id"] for k, v in FEE_SCHEDULES.items())
+        assert SIMULATED_FEE_SCHEDULE in FEE_SCHEDULES.values()
 
     def test_a_month_below_the_mark_pays_no_performance_fee_and_keeps_the_mark(self):
         prior = {
@@ -703,6 +741,33 @@ class TestRebuildFromRaw:
         ]
         assert rebuilt["documents"]["fee_bill"]["differs"] == ["adviser_fee_cents"]
         assert ctx.metrics[0]["status"] == "FAIL" and ctx.metrics[0]["value"] == 1.0
+
+    def test_a_bill_filed_under_an_earlier_schedule_rebuilds_under_its_own_terms(self, store):
+        # A schedule change must not turn every earlier month's rebuild red.
+        self._closed(store)
+        key = statement_key(T, "2026-11")
+        published = json.loads(store.get_bytes(key))
+        close = json.loads(store.get_bytes(close_key(T, "2026-11")))
+        earlier = build_statement(
+            close,
+            None,
+            published["benchmarks"],
+            FEE_SCHEDULES["simulated.2026-11-03"],
+        )
+        store.put_bytes(key, json.dumps(earlier).encode())
+        _, rebuilt = self._verify(store)
+        assert rebuilt is not None and rebuilt["matches"] is True, rebuilt
+
+    def test_a_bill_naming_an_unregistered_schedule_is_a_break(self, store):
+        self._closed(store)
+
+        def rename(doc):
+            doc["simulated_fee_bill"]["schedule"]["schedule_id"] = "simulated.unregistered"
+
+        self._rewrite(store, statement_key(T, "2026-11"), rename)
+        _, rebuilt = self._verify(store)
+        assert rebuilt is not None and rebuilt["matches"] is False
+        assert rebuilt["documents"]["fee_bill"]["differs"] == ["schedule"]
 
     def test_a_changed_close_is_a_break_and_the_statement_rebuilds_from_raw(self, store):
         self._closed(store)
