@@ -684,18 +684,75 @@ def test_the_quote_falls_back_to_the_close_and_releases_the_line() -> None:
     assert ib.cancelled_mkt == ["AAA"]
 
 
-def test_a_name_with_no_tick_times_out_to_none() -> None:
+def test_a_name_with_no_tick_is_polled_twice_then_times_out_to_none() -> None:
     ib = RoutingIB(prices={})
-    assert IbQuoteSource(ib, FakeSdk(ib), max_wait=1.0)("AAA") is None
-    assert ib.cancelled_mkt == ["AAA"] and (ib.clock() - T0).total_seconds() == 1.0
+    source = IbQuoteSource(ib, FakeSdk(ib), max_wait=1.0)
+    assert source("AAA") is None
+    assert ib.cancelled_mkt == ["AAA", "AAA"] and (ib.clock() - T0).total_seconds() == 3.0
+    assert source.last_miss is not None
+    assert source.last_miss.startswith("AAA: no tick within 3s; ticker ")
+    assert "last=nan" in source.last_miss and source.last_miss.endswith("IB errors: none")
+
+
+def test_a_cold_farm_answering_on_the_retry_is_a_price() -> None:
+    ib = RoutingIB()
+    calls: list[int] = []
+
+    def req(*_args):
+        calls.append(1)
+        return SimpleNamespace(last=math.nan if len(calls) == 1 else 77.0, close=math.nan)
+
+    ib.reqMktData = req
+    source = IbQuoteSource(ib, FakeSdk(ib), max_wait=1.0)
+    assert source("AAA") == 77.0 and source.last_miss is None and len(calls) == 2
+
+
+class _ErrorEvent:
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def connect(self, handler) -> None:
+        self.handlers.append(handler)
+
+    def disconnect(self, handler) -> None:
+        self.handlers.remove(handler)
+
+
+def test_a_miss_names_the_ib_errors_reported_while_it_waited() -> None:
+    ib = RoutingIB(prices={})
+    ib.errorEvent = _ErrorEvent()
+
+    def req(*_args):
+        for handler in ib.errorEvent.handlers:
+            handler(7, 10197, "No market data during competing live session")
+        return SimpleNamespace(last=math.nan, close=math.nan)
+
+    ib.reqMktData = req
+    source = IbQuoteSource(ib, FakeSdk(ib), max_wait=0.5)
+    assert source("AAA") is None and ib.errorEvent.handlers == []
+    assert source.last_miss is not None
+    assert "10197 No market data during competing live session" in source.last_miss
 
 
 def test_an_unqualifiable_name_has_no_quote() -> None:
     ib = RoutingIB()
     ib.unqualified.add("AAA")
-    assert IbQuoteSource(ib, FakeSdk(ib))("AAA") is None and ib.cancelled_mkt == []
+    source = IbQuoteSource(ib, FakeSdk(ib))
+    assert source("AAA") is None and ib.cancelled_mkt == []
+    assert source.last_miss == "AAA: contract did not qualify; ticker n/a; IB errors: none"
     ib.qualifyContracts = lambda contract: []  # an empty result is refused the same way
     assert IbQuoteSource(ib, FakeSdk(ib))("AAA") is None
+
+
+def test_the_refusal_carries_the_quote_sources_miss() -> None:
+    def quote(symbol: str) -> float | None:
+        return None if symbol == "AAA" else 50.0
+
+    quote.last_miss = "AAA: no tick within 18s; ticker last=nan; IB errors: 354 not subscribed"  # type: ignore[attr-defined]
+    with pytest.raises(
+        PriceUnavailableError, match=r"\[AAA: no tick within 18s; .*354 not subscribed\]"
+    ):
+        _plan(_book(), quote=quote)
 
 
 def test_an_execution_record_names_its_order_and_fill() -> None:

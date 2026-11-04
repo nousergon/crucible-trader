@@ -142,6 +142,9 @@ FILL_TIMEOUT_S = 30.0
 POLL_INTERVAL_S = 0.5
 #: v1's quote wait (`IBKRClient.get_current_price`).
 QUOTE_MAX_WAIT_S = 6.0
+#: A second poll, this many times longer, for a name the first one missed: a
+#: cold data farm answers late, and one refused name holds the whole book.
+QUOTE_RETRY_FACTOR = 2.0
 #: IB market-data type 3: delayed when the account has no live subscription,
 #: live when it has one (v1: avoids Error 10089 on paper accounts).
 MARKET_DATA_TYPE = 3
@@ -396,9 +399,10 @@ def plan_orders(
             continue
         price = quote(symbol)
         if price is None or not (math.isfinite(price) and price > 0):
+            detail = getattr(quote, "last_miss", None)
             raise PriceUnavailableError(
                 f"no usable decision price for {symbol} ({price!r}); the book is not traded "
-                "on a partial price set"
+                "on a partial price set" + (f" [{detail}]" if detail else "")
             )
         target = math.floor(weight * book.portfolio_notional_usd / price)
         delta = target - held
@@ -457,29 +461,77 @@ class ExecutionRecord:
 
 
 class IbQuoteSource:
-    """Decision prices from a connected IB session (v1 `get_current_price`)."""
+    """Decision prices from a connected IB session (v1 `get_current_price`).
+
+    A name that yields no price is polled for :data:`QUOTE_MAX_WAIT_S`, then
+    once more for :data:`QUOTE_RETRY_FACTOR` times as long (a cold data farm), before it is
+    a miss. Every miss leaves :attr:`last_miss`: whether the contract
+    qualified, the ticker's fields and every IB error code the session
+    reported while it waited, which the router's refusal carries. The first
+    live session (2026-11-04) refused on ANF with nothing else to go on.
+    """
 
     def __init__(self, client: Any, sdk: Any, *, max_wait: float = QUOTE_MAX_WAIT_S) -> None:
         self._client = client
         self._sdk = sdk
         self._max_wait = max_wait
+        self._retry_wait = max_wait * QUOTE_RETRY_FACTOR
+        self.last_miss: str | None = None
 
     def __call__(self, symbol: str) -> float | None:
+        self.last_miss = None
         contract = self._sdk.Stock(symbol, "SMART", "USD")
-        if not _qualified(self._client, contract):
+        errors: list[str] = []
+
+        def on_error(_req_id: object, code: object, message: object = "", *_rest: object) -> None:
+            errors.append(f"{code} {message}".strip())
+
+        error_event = getattr(self._client, "errorEvent", None)
+        if error_event is not None:
+            error_event.connect(on_error)
+        try:
+            if not _qualified(self._client, contract):
+                self.last_miss = _miss(symbol, "contract did not qualify", None, errors)
+                return None
+            price, ticker = None, None
+            for wait in (self._max_wait, self._retry_wait):
+                price, ticker = self._poll(contract, wait)
+                if price is not None:
+                    return price
+            self.last_miss = _miss(
+                symbol, f"no tick within {self._max_wait + self._retry_wait:g}s", ticker, errors
+            )
             return None
+        finally:
+            if error_event is not None:
+                error_event.disconnect(on_error)
+
+    def _poll(self, contract: object, max_wait: float) -> tuple[float | None, object]:
         self._client.reqMarketDataType(MARKET_DATA_TYPE)
         ticker = self._client.reqMktData(contract, "", False, False)
         price: float | None = None
         waited = 0.0
         try:
-            while price is None and waited < self._max_wait:
+            while price is None and waited < max_wait:
                 self._client.sleep(POLL_INTERVAL_S)
                 waited += POLL_INTERVAL_S
                 price = _valid(ticker.last) or _valid(ticker.close)
         finally:
             self._client.cancelMktData(contract)
-        return price
+        return price, ticker
+
+
+def _miss(symbol: str, why: str, ticker: object, errors: list[str]) -> str:
+    fields = (
+        ""
+        if ticker is None
+        else " ".join(
+            f"{name}={getattr(ticker, name, None)!r}"
+            for name in ("marketDataType", "last", "close", "bid", "ask")
+        )
+    )
+    seen = "; ".join(errors) if errors else "none"
+    return f"{symbol}: {why}; ticker {fields or 'n/a'}; IB errors: {seen}"
 
 
 def _qualified(client: Any, contract: Any) -> bool:
