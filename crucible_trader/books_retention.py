@@ -56,6 +56,12 @@ BOOKS_PREFIXES: tuple[str, ...] = (
     "trader/exception_scores/",
 )
 
+#: The reviewers' decisions (1c/1d): the approvals the ledger's clearing
+#: adjustments cite, written by the decision writer's own role, never by the
+#: trader, so they are locked by that writer as it records each one
+#: (:mod:`crucible_trader.exception_decision_writer`), not by step 5h.
+DECISIONS_PREFIX = "trader/exception_decisions/"
+
 RETENTION_MODE = "COMPLIANCE"
 
 #: Rule 204-2(e)(1): five years from the end of the fiscal year during which
@@ -76,9 +82,14 @@ def retain_until(trading_day: dt.date) -> dt.datetime:
 
 
 def lock_books_records(
-    store: Store, keys: Iterable[str], *, trading_day: dt.date
+    store: Store,
+    keys: Iterable[str],
+    *,
+    trading_day: dt.date,
+    prefixes: tuple[str, ...] = BOOKS_PREFIXES,
 ) -> tuple[list[str], dict[str, str]]:
-    """Apply COMPLIANCE retention to each books key in ``keys``.
+    """Apply COMPLIANCE retention to each key in ``keys`` under ``prefixes``
+    (the trader's books by default).
 
     Returns ``(locked, refused)``: the keys locked, and ``{key: reason}`` for
     each one S3 refused. A store with no Object Lock concept (``LocalStore``)
@@ -90,7 +101,7 @@ def lock_books_records(
         if not isinstance(store, S3Store):
             return locked, refused
         until = retain_until(trading_day)
-        for key in dict.fromkeys(k for k in keys if is_books_key(k)):
+        for key in dict.fromkeys(k for k in keys if k.startswith(prefixes)):
             try:
                 store.client.put_object_retention(
                     Bucket=store.bucket,
