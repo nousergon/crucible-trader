@@ -62,7 +62,7 @@ RECONCILIATION_SCHEMA_VERSION = "broker_reconciliation.v1"
 #: (`_cash_cents_off`) and a gap of up to this many cents is ROUNDED TO IB: the
 #: result takes IB's figure as the expected cash and records the absorbed
 #: amount as `cash_rounded_to_broker_usd`, so every adjustment stays visible.
-#: Anything larger (an undeclared interest posting, a fee, the 10-26 $0.55
+#: Anything larger (interest the accrual does not explain, a fee, the 10-26 $0.55
 #: avgPrice break) is a `cash_delta` to be explained, never absorbed.
 #:
 #: Why a band and not one cent: the anchor and the broker cash are both
@@ -78,6 +78,16 @@ _CASH_TOLERANCE_CENTS = round(CASH_TOLERANCE_USD * 100)
 #: cash gap pages. Owned here so the reconciler's job and the ledger read one
 #: number: `reconciliation_job` re-exports it.
 CASH_PAGE_THRESHOLD_USD = 1.00
+
+#: The highest annual rate at which IB can have credited interest on the
+#: anchor's cash. IB posts the interest it has accrued (`AccruedCash`) into
+#: cash once a month, so on posting day the cash rises by the accrual's fall
+#: plus whatever accrued and posted between the two statements. That second
+#: part is never on either statement, so it is bounded, not sourced: at most
+#: anchor cash x this rate x calendar days / 360. 11-04 is the case: the
+#: accrual fell 105.85 (109.28 -> 3.43) and cash rose 107.69 more than the
+#: fills explain, 1.84 being one day's interest on 29,589 at ~2.2%.
+INTEREST_RATE_CAP = 0.06
 
 
 def _cash_cents_off(broker_cash: float, expected_cash: float) -> int:
@@ -313,6 +323,10 @@ class ReconciliationResult:
     #: The three-way corporate-action check (Polygon, IB, ledger) for the day;
     #: ``None`` when there was no anchor to compare from.
     corporate_action_check: Mapping[str, Any] | None = None  # pyright: ignore[reportExplicitAny]
+    #: Interest IB posted into cash today, inferred from a fall in its accrual
+    #: and credited only within :data:`INTEREST_RATE_CAP` (:func:`_interest_posted`).
+    #: ``None`` when nothing was credited.
+    interest_posted_usd: float | None = None
 
     @property
     def match_rate(self) -> float | None:
@@ -348,6 +362,7 @@ class ReconciliationResult:
             "dividend_credits": [d.to_document() for d in self.dividend_credits],
             "dividends_unpaid": [d.to_document() for d in self.dividends_unpaid],
             "dividends_owed": [d.to_document() for d in self.dividends_owed],
+            "interest_posted_usd": self.interest_posted_usd,
             "corporate_action_check": (
                 None if self.corporate_action_check is None else dict(self.corporate_action_check)
             ),
@@ -579,6 +594,9 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
                     f"({owed.amount_usd:.2f}) is still not credited after {days} days",
                 )
             )
+    interest = _interest_posted(inputs, expected_cash)
+    if interest is not None:
+        expected_cash += interest
     residual = inputs.broker.cash_usd - expected_cash
     unpaid_today: list[OwedDividend] = []
     if abs(_cash_cents_off(inputs.broker.cash_usd, expected_cash)) > _CASH_TOLERANCE_CENTS:
@@ -653,6 +671,7 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         dividends_unpaid=tuple(unpaid_today),
         dividends_owed=tuple(o for o in inputs.owed_dividends if o.key not in credited),
         corporate_action_check=check,
+        interest_posted_usd=interest,
     )
 
 
@@ -670,6 +689,7 @@ def _result(
     dividends_unpaid: tuple[OwedDividend, ...] = (),
     dividends_owed: tuple[OwedDividend, ...] = (),
     corporate_action_check: Mapping[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
+    interest_posted_usd: float | None = None,
 ) -> ReconciliationResult:
     order = {klass: i for i, klass in enumerate(DISCREPANCY_CLASSES)}
     return ReconciliationResult(
@@ -701,7 +721,35 @@ def _result(
         dividends_unpaid=dividends_unpaid,
         dividends_owed=dividends_owed,
         corporate_action_check=corporate_action_check,
+        interest_posted_usd=interest_posted_usd,
     )
+
+
+def _interest_posted(inputs: ReconciliationInputs, expected_cash: float) -> float | None:
+    """The interest IB posted into cash today, or ``None``.
+
+    Only when both statements record IB's accrual, the accrual FELL from a
+    credit balance (a margin debit is not handled here), the cash is outside
+    the cent band, and the gap lies between the fall and the fall plus the
+    most interest the anchor's cash could have earned since
+    (:data:`INTEREST_RATE_CAP`), both ends widened by the cent band. Anything
+    else stays a `cash_delta`: an amount the accrual does not explain is never
+    absorbed.
+    """
+    anchor, broker = inputs.anchor, inputs.broker
+    if anchor is None or anchor.accrued_cash_usd is None or broker.accrued_cash_usd is None:
+        return None
+    if anchor.accrued_cash_usd <= 0:
+        return None
+    fall = round(anchor.accrued_cash_usd * 100) - round(broker.accrued_cash_usd * 100)
+    gap = _cash_cents_off(broker.cash_usd, expected_cash)
+    if fall <= 0 or abs(gap) <= _CASH_TOLERANCE_CENTS:
+        return None
+    days = (_date(broker.trading_day) - _date(anchor.trading_day)).days
+    bound = math.ceil(max(anchor.cash_usd, 0.0) * 100 * INTEREST_RATE_CAP * days / 360)
+    if not fall - _CASH_TOLERANCE_CENTS <= gap <= fall + bound + _CASH_TOLERANCE_CENTS:
+        return None
+    return gap / 100
 
 
 def _mismatch(row: Mapping[str, Any], *, side: str) -> Discrepancy:  # pyright: ignore[reportExplicitAny]

@@ -306,3 +306,64 @@ class TestInputsRefuseWhatIsNotAReconciliation:
     def test_anchor_not_before_the_day(self):
         with pytest.raises(ReconciliationInputError, match="not before"):
             inputs(statement({}, day=DAY), statement({}))
+
+
+def accrued(positions, cash, accrual, day=DAY):
+    return BrokerStatement(
+        account=ACCOUNT,
+        trading_day=day,
+        positions=positions,
+        cash_usd=cash,
+        accrued_cash_usd=accrual,
+    )
+
+
+class TestInterestPosting:
+    """IB posts its accrued interest into cash once a month (2026-11-04: the
+    accrual fell 109.28 -> 3.43 and cash rose 107.69 past the fills, which paged
+    as a cash_delta though nothing was wrong). The fall is credited, plus at most
+    INTEREST_RATE_CAP of interest on the anchor cash for the days between."""
+
+    def eleven_four(self, broker_cash=496_823.06, broker_accrual=3.43, anchor_accrual=109.28):
+        return inputs(
+            accrued({}, 29_589.00, anchor_accrual, day=PREV),
+            accrued({}, broker_cash, broker_accrual),
+            fills=(Fill("SELLS", 0, 467_126.37),),
+        )
+
+    def test_the_11_04_posting_is_credited_and_reconciles_clean(self):
+        result = reconcile(self.eleven_four())
+        assert result.clean
+        assert result.interest_posted_usd == 107.69
+        assert result.cash_rounded_to_broker_usd == 0.0
+        assert result.to_document()["interest_posted_usd"] == 107.69
+
+    def test_gap_short_of_the_accrual_fall_is_still_a_finding(self):
+        (finding,) = reconcile(self.eleven_four(broker_cash=496_820.00)).discrepancies
+        assert finding.klass == "cash_delta"
+
+    def test_gap_beyond_the_rate_cap_is_still_a_finding(self):
+        # fall 105.85 + cap 4.94 (29,589 x 6% / 360) + band 0.05 = 110.84
+        assert reconcile(self.eleven_four(broker_cash=496_715.37 + 110.84)).clean
+        result = reconcile(self.eleven_four(broker_cash=496_715.37 + 110.85))
+        assert [d.klass for d in result.discrepancies] == ["cash_delta"]
+        assert result.interest_posted_usd is None
+
+    def test_a_rising_accrual_credits_nothing(self):
+        result = reconcile(self.eleven_four(broker_accrual=115.00))
+        assert [d.klass for d in result.discrepancies] == ["cash_delta"]
+
+    def test_no_accrual_on_either_statement_credits_nothing(self):
+        assert reconcile(self.eleven_four(broker_accrual=None)).interest_posted_usd is None
+        assert reconcile(self.eleven_four(anchor_accrual=None)).interest_posted_usd is None
+
+    def test_a_debit_accrual_credits_nothing(self):
+        result = reconcile(self.eleven_four(anchor_accrual=-5.00, broker_accrual=-110.85))
+        assert result.interest_posted_usd is None
+        assert not result.clean
+
+    def test_a_day_inside_the_cent_band_credits_nothing(self):
+        result = reconcile(self.eleven_four(broker_cash=496_715.39))
+        assert result.clean
+        assert result.interest_posted_usd is None
+        assert result.cash_rounded_to_broker_usd == 0.02
