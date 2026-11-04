@@ -11,10 +11,11 @@ of record) and closes one month for one tenant's account:
   last trading day;
 * **cash** -- the ledger's month-end cash tied out to the same statement;
 * **P&L** -- realised (average cost), the change in unrealised, dividends,
-  declared cash flows, commissions, suspense movements, the reconciliation
-  adjustments that clear decided breaks and the cash rounded to IB inside the
-  5-cent band, which must sum to the change in NAV to the cent (the
-  attribution check);
+  accrued interest (its first recorded balance on its own line when the
+  opening's accrual was not recorded), declared cash flows, commissions,
+  suspense movements, the reconciliation adjustments that clear decided
+  breaks and the cash rounded to IB inside the 5-cent band, which must sum
+  to the change in NAV to the cent (the attribution check);
 * **fees accrued** -- the commissions booked in the month. The simulated
   adviser and performance fees are 1f's bill, produced from this close
   (:mod:`crucible_trader.performance_statement`); they are never booked.
@@ -83,6 +84,10 @@ from crucible_trader.ledger import (
     DECLARED_FLOWS,
     DIVIDEND_INCOME,
     GAP_EXPIRY_TRADING_DAYS,
+    INTEREST_FIRST_RECORDED,
+    INTEREST_INCOME,
+    INTEREST_RECEIVABLE,
+    OPENING,
     RECEIVABLE,
     RECONCILIATION_ADJUSTMENTS,
     SECURITIES,
@@ -311,6 +316,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
 
     # ---- walk the month: average cost, realised P&L, income and expense.
     realised = dividends = flows = commissions = suspense = adjustments = rounding = 0
+    interest = interest_first_recorded = opening_accrual = 0
     for d in sorted(within):
         for entry in within[d]:
             if entry.kind == "opening_balance":
@@ -320,6 +326,16 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                     commissions += p.amount_cents
                 elif p.account == DECLARED_FLOWS:
                     flows -= p.amount_cents
+                elif p.account == INTEREST_INCOME:
+                    interest -= p.amount_cents
+                elif p.account == INTEREST_FIRST_RECORDED:
+                    interest_first_recorded -= p.amount_cents
+                elif p.account == OPENING and entry.kind == "interest_accrual":
+                    # the opening's accrued interest, booked as its own entry:
+                    # opening equity, so it is part of the starting NAV. Any
+                    # other credit to opening equity is an external flow the
+                    # attribution has no line for, and refuses.
+                    opening_accrual -= p.amount_cents
                 elif p.account.startswith(DIVIDEND_INCOME):
                     dividends -= p.amount_cents
                 elif p.account == SUSPENSE_CASH or p.account.startswith(SUSPENSE_POSITION):
@@ -333,6 +349,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
     # A position that went to zero realises whatever cost it still carries.
     realised -= sum(lot.cost_cents for lot in lots.values() if not lot.shares)
     lots = {t: lot for t, lot in lots.items() if lot.shares}
+    nav_start += opening_accrual
 
     # ---- month end: value, tie out to IB, suspense.
     ledger = ledger_from(through)
@@ -359,6 +376,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
         }
     cash = ledger.cents(tenant, account, CASH)
     receivables = sum(ledger.balances(tenant, account, RECEIVABLE).values())
+    interest_receivable = ledger.cents(tenant, account, INTEREST_RECEIVABLE)
     ib_cash = to_cents(statement.cash_usd) if statement is not None else None
     if statement is not None:
         if ib_cash != cash:
@@ -417,12 +435,14 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                         amount=float(-p.quantity),
                     )
 
-    nav_end = cash + receivables + market_value
+    nav_end = cash + receivables + interest_receivable + market_value
     unrealised_end = market_value - sum(lot.cost_cents for lot in lots.values())
     attribution = {
         "realised_cents": realised,
         "unrealised_change_cents": unrealised_end - unrealised_start,
         "dividends_cents": dividends,
+        "interest_cents": interest,
+        "interest_first_recorded_cents": interest_first_recorded,
         "declared_cash_flows_cents": flows,
         "commissions_cents": -commissions,
         "suspense_cents": suspense,
@@ -456,6 +476,7 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
         "ib_cash_cents": ib_cash,
         "ib_accrued_interest_usd": statement.accrued_cash_usd if statement else None,
         "receivables_cents": receivables,
+        "interest_receivable_cents": interest_receivable,
         "market_value_cents": market_value,
         "positions": positions,
         "pnl": {**attribution, "total_cents": total},

@@ -95,6 +95,23 @@ the ex-date (Rule 4 wants the ex-date); the cash settles when the reconciler
 says it arrived (``dividends_unpaid`` / ``dividend_credits``). Valuation entries
 (Rule 7) are not booked here.
 
+**Accrued interest** (`alpha-engine-config-I13202`). IB's NetLiquidation
+includes interest accrued and not yet posted to cash (``accrued_cash_usd``,
+``AccruedCash``); GIPS needs it accrued and Rule 1 wants it as its own entry.
+Each day whose statement records an accrual, the ledger moves
+:data:`INTEREST_RECEIVABLE` to IB's figure: a rise is an ``interest_accrual``
+entry against :data:`INTEREST_INCOME`, a fall is an ``interest_settlement``
+entry into cash (a fall is IB posting the interest; the posted amount itself has
+no source yet, so any difference from IB's cash is that day's ordinary cash
+gap). The accrual the book OPENED with is opening equity, not income: the first
+time the receivable is booked, the opening statement's accrual is its own
+``interest_accrual`` entry against :data:`OPENING`. When the opening statement
+did not record an accrual (``broker_statement.v1``), how much of the first
+recorded balance predates the opening is a genuine data gap: the balance is
+booked once to :data:`INTEREST_FIRST_RECORDED`, its own account and its own
+line in the close, never folded into the month's interest income. A statement
+that records no accrual books nothing; the receivable stands.
+
 **Failure isolation.** :func:`post_daily_ledger` NEVER raises: the trader's
 reconcile job decides and pages exactly as before; this step rides beside it
 and reports through one MetricRecord (``FAIL`` when it could not post).
@@ -119,7 +136,7 @@ from crucible.store import (
     Store,
 )
 
-from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.broker_statement import BrokerStatement, statement_from_document
 from crucible_trader.exception_decision import effective_decisions, load_decisions
 from crucible_trader.exception_record import (
     PAPER_FUND_TENANT,
@@ -158,6 +175,12 @@ SUSPENSE_POSITION = "suspense:position_gap:"
 #: broker's cash is ground truth, so a cleared difference is P&L, its own line
 #: in the close's attribution, never folded into another account.
 RECONCILIATION_ADJUSTMENTS = "income:reconciliation_adjustments"
+#: Interest accrued and not yet posted to cash, held at IB's ``AccruedCash``.
+INTEREST_RECEIVABLE = "assets:interest_receivable:USD"
+INTEREST_INCOME = "income:interest"
+#: The first recorded accrual when the opening's accrual was not recorded: the
+#: part earned before the book opened is unknown (alpha-engine-config-I13202).
+INTEREST_FIRST_RECORDED = "income:interest_first_recorded"
 #: Where a decided share gap's suspense goes: the securities account already
 #: holds IB's count, so the offsetting shares leave suspense to here.
 SHARE_ADJUSTMENTS = "equity:share_adjustments:"
@@ -173,6 +196,9 @@ _FIXED_ACCOUNTS = frozenset(
         SUSPENSE_CASH,
         RECONCILIATION_ADJUSTMENTS,
         CASH_ROUNDING,
+        INTEREST_RECEIVABLE,
+        INTEREST_INCOME,
+        INTEREST_FIRST_RECORDED,
     }
 )
 #: The cash tiers in whole cents: rounded to IB at or under the first; a gap
@@ -196,6 +222,8 @@ ENTRY_KINDS = frozenset(
         "fill",
         "commission",
         "declared_cash_flow",
+        "interest_accrual",
+        "interest_settlement",
         "dividend_receivable",
         "dividend_settlement",
         "split",
@@ -422,6 +450,9 @@ class DayInputs:
     #: Every stored ``exception_decision.v1`` record (validated); the ones that
     #: clear a gap are chosen by :func:`clearing_decisions`.
     decisions: tuple[Mapping[str, object], ...] = ()
+    #: The statement the account's ledger was opened from, when that was an
+    #: earlier day: its accrual is the opening's. ``None`` when unreadable.
+    opening: BrokerStatement | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -445,6 +476,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         new.append(entry)
 
     opened_from_today = False
+    opened_with = inputs.opening
     if not ledger.has_account(tenant, account):
         opening = (
             inputs.anchor
@@ -455,6 +487,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         # Opened from TODAY's statement (genesis, no anchor): today's events are
         # already inside it, so booking them again would count them twice.
         opened_from_today = opening is None
+        opened_with = source
         cash = to_cents(source.cash_usd)
         book(
             "opening_balance",
@@ -523,6 +556,8 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
             [Posting(CASH, cents), Posting(DECLARED_FLOWS, -cents)],
             description=flow.description,
         )
+
+    _book_interest(ledger, inputs, opened_with, book)
 
     unpaid = {
         (str(u["ticker"]), str(u["pay_date"]))
@@ -601,14 +636,83 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         ),
         "cash_rounding_balance_cents": -ledger.cents(tenant, account, CASH_ROUNDING),
         "dividends_receivable_cents": ledger.balances(tenant, account, RECEIVABLE),
+        "interest_receivable_cents": ledger.cents(tenant, account, INTEREST_RECEIVABLE),
+        "broker_accrued_interest_cents": (
+            None if broker.accrued_cash_usd is None else to_cents(broker.accrued_cash_usd)
+        ),
         "cleared_today": cleared,
         "clean": clean,
         "known_deltas": [
             "dividend receivable recognised on the pay date, not the ex-date",
             "no daily valuation entry (Rule 7) yet",
+            "interest posted to cash is inferred from a fall in IB's accrual; the posted "
+            "amount has no source, so a difference is that day's cash gap",
         ],
     }
     return DayPosting(tuple(new), tuple(breaks), document)
+
+
+def _book_interest(
+    ledger: Ledger,
+    inputs: DayInputs,
+    opened_with: BrokerStatement | None,
+    book: Any,  # pyright: ignore[reportExplicitAny]
+) -> None:
+    """Hold :data:`INTEREST_RECEIVABLE` at IB's recorded accrual (module doc)."""
+    broker = inputs.broker
+    if broker.accrued_cash_usd is None:
+        return
+    tenant, account, day = inputs.tenant, broker.account, broker.trading_day
+    target = to_cents(broker.accrued_cash_usd)
+    established = any(
+        e.tenant == tenant
+        and e.account == account
+        and e.kind in ("interest_accrual", "interest_settlement")
+        for e in ledger.entries
+    )
+    if not established:
+        if opened_with is None or opened_with.accrued_cash_usd is None:
+            if target:
+                book(
+                    "interest_accrual",
+                    f"accrual/first-recorded/{day}",
+                    [
+                        Posting(INTEREST_RECEIVABLE, target),
+                        Posting(INTEREST_FIRST_RECORDED, -target),
+                    ],
+                    source="ib_statement",
+                    opening_accrual="not recorded by the opening statement",
+                    period="unknown: some of it may predate the opening",
+                )
+            return
+        at_opening = to_cents(opened_with.accrued_cash_usd)
+        if at_opening:
+            book(
+                "interest_accrual",
+                f"accrual/opening/{opened_with.trading_day}",
+                [Posting(INTEREST_RECEIVABLE, at_opening), Posting(OPENING, -at_opening)],
+                source="ib_statement",
+                statement_day=opened_with.trading_day,
+                basis="accrued before the book opened: opening equity, not income",
+            )
+    change = target - ledger.cents(tenant, account, INTEREST_RECEIVABLE)
+    if change > 0:
+        book(
+            "interest_accrual",
+            f"accrual/{day}",
+            [Posting(INTEREST_RECEIVABLE, change), Posting(INTEREST_INCOME, -change)],
+            source="ib_statement",
+            accrued_cents=target,
+        )
+    elif change < 0:
+        book(
+            "interest_settlement",
+            f"accrual/{day}",
+            [Posting(CASH, -change), Posting(INTEREST_RECEIVABLE, change)],
+            source="ib_statement",
+            accrued_cents=target,
+            inferred="a fall in IB's accrual is a posting to cash",
+        )
 
 
 def _rows(value: object) -> list[Mapping[str, object]]:
@@ -907,6 +1011,7 @@ def post_daily_ledger(
         journals = load_journals(ctx.store, tenant, before=day)
         ledger = ledger_from(journals)
         decisions, unreadable = _read_decisions(ctx.store)
+        opening = _opening_statement(ctx.store, journals, tenant, broker.account)
         posting = book_day(
             ledger,
             DayInputs(
@@ -918,6 +1023,7 @@ def post_daily_ledger(
                 corporate_actions,
                 reconciliation,
                 decisions,
+                opening,
             ),
         )
         if unreadable is not None:
@@ -1005,6 +1111,32 @@ def post_daily_ledger(
             )[:400],
         )
     return posting
+
+
+def _opening_statement(
+    store: Store, journals: Mapping[str, Sequence[Entry]], tenant: str, account: str
+) -> BrokerStatement | None:
+    """The stored statement the account's ledger opened from, or ``None`` (no
+    opening yet, or unreadable: the accrual is then treated as unrecorded). Read
+    only while the interest receivable is not yet booked."""
+    if any(
+        e.kind in ("interest_accrual", "interest_settlement")
+        for entries in journals.values()
+        for e in entries
+        if e.tenant == tenant and e.account == account
+    ):
+        return None
+    for day in sorted(journals):
+        for e in journals[day]:
+            if e.kind == "opening_balance" and e.tenant == tenant and e.account == account:
+                statement_day = str(e.evidence.get("statement_day") or e.trading_day)
+                try:
+                    raw = store.get_bytes(trader_broker_statement_key(statement_day))
+                    statement = statement_from_document(json.loads(raw))
+                except Exception:  # noqa: BLE001 - an unreadable opening is "not recorded"
+                    return None
+                return statement if statement.account == account else None
+    return None
 
 
 def _read_decisions(store: Store) -> tuple[tuple[Mapping[str, object], ...], str | None]:
