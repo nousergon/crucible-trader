@@ -9,6 +9,7 @@ the decision record's own create-only path.
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import hashlib
 import io
 import json
@@ -16,7 +17,9 @@ import pathlib
 import random
 
 import pytest
-from crucible.store import LocalStore
+from botocore.exceptions import ClientError
+from crucible.store import LocalStore, S3Store
+from s3_fake import FakeS3
 
 from crucible_trader import exception_decision_writer as w
 from crucible_trader.exception_decision import decision_key, load_decisions, validate_decision
@@ -223,6 +226,70 @@ class TestRecords:
         bad = {**AGREE, "verdict": "correct", "nature": "event", "action": "investigate_shares"}
         status, body = call(event(bad, jwt=token(key)), config=config, store=store, key=key)
         assert status == 400 and "note" in body["error"] and load_decisions(store) == []
+
+
+def s3_with_proposals(client: FakeS3) -> S3Store:
+    s = S3Store("bucket", "crucible", client=client)
+    document = {"schema_version": "exception_proposal.v1", "proposals": [proposal(1)]}
+    s.put_bytes(f"trader/exception_proposals/{DAY}.json", json.dumps(document).encode())
+    return s
+
+
+class RefusingRetention(FakeS3):
+    def put_object_retention(self, **kw: object) -> dict[str, object]:
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "PutObjectRetention"
+        )
+
+
+def emf_lines(out: str) -> list[dict]:
+    return [d for d in map(json.loads, out.strip().splitlines()) if "_aws" in d]
+
+
+class TestWormRetention:
+    """alpha-engine-config-I13191: a recorded decision is a book of record."""
+
+    def test_a_decision_is_locked_compliance_to_year_end_plus_five(self, config, key, capsys):
+        client = FakeS3(now=lambda: dt.datetime(2027, 1, 15, 8, 0, tzinfo=dt.UTC))
+        store = s3_with_proposals(client)
+        status, body = call(event(AGREE, jwt=token(key)), config=config, store=store, key=key)
+        assert status == 201 and body["retention"] == "locked until 2033-01-01"
+        assert client.retention[f"crucible/{body['key']}"] == {
+            "Mode": "COMPLIANCE",
+            "RetainUntilDate": dt.datetime(2033, 1, 1, tzinfo=dt.UTC),
+        }
+        assert len(client.retention) == 1  # the proposals file is not the writer's to lock
+        [emf] = emf_lines(capsys.readouterr().out)
+        assert emf[w.RETENTION_METRIC] == 0
+        assert emf["_aws"]["CloudWatchMetrics"][0]["Namespace"] == w.RETENTION_METRIC_NAMESPACE
+
+    def test_a_refused_lock_still_records_the_decision_and_says_so(self, config, key, capsys):
+        client = RefusingRetention(now=lambda: dt.datetime(2027, 1, 15, 8, 0, tzinfo=dt.UTC))
+        store = s3_with_proposals(client)
+        status, body = call(event(AGREE, jwt=token(key)), config=config, store=store, key=key)
+        assert status == 201 and body["retention"] == "refused"
+        assert len(load_decisions(store)) == 1
+        out = capsys.readouterr().out
+        [emf] = emf_lines(out)
+        assert emf[w.RETENTION_METRIC] == 1
+        log = json.loads(out.strip().splitlines()[-1])
+        assert log["retention"] == "refused" and "AccessDenied" in log["retention_reason"]
+
+    def test_a_store_without_object_lock_locks_nothing(self, config, store, key):
+        status, body = call(event(AGREE, jwt=token(key)), config=config, store=store, key=key)
+        assert status == 201 and body["retention"].startswith("not applicable")
+
+    def test_a_failure_around_the_lock_never_undoes_the_decision(
+        self, config, store, key, monkeypatch, capsys
+    ):
+        def boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("lock path down")
+
+        monkeypatch.setattr(w, "lock_books_records", boom)
+        status, body = call(event(AGREE, jwt=token(key)), config=config, store=store, key=key)
+        assert status == 201 and body["retention"] == "refused"
+        assert len(load_decisions(store)) == 1
+        assert emf_lines(capsys.readouterr().out)[0][w.RETENTION_METRIC] == 1
 
 
 class TestRefusesTheRequest:

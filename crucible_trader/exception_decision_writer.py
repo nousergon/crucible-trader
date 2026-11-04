@@ -42,6 +42,18 @@ Configuration (all required; a missing one refuses every request with 503):
 Every request leaves one structured log line: the outcome, the reviewer, the
 tenant, the proposal and, when written, the decision id and key. The decision
 object itself is the evidence; the log is the trail of refusals.
+
+**WORM retention** (`alpha-engine-config-I13191`). A decision is a book of
+record (the approval a ledger adjustment cites), so after the create-only write
+the handler puts that object under the same COMPLIANCE Object Lock as the
+trader's books (:func:`crucible_trader.books_retention.lock_books_records`):
+until the end of the decision year plus five years, as a SEPARATE
+``PutObjectRetention`` after the write, so a refused lock never leaves a
+decision unwritten. It never raises: a refused lock is still a 201 (the
+decision IS recorded) carrying ``retention: refused``, and the log line carries
+an embedded-metric-format datapoint ``DecisionRetentionRefused`` (1 refused, 0
+locked) in :data:`RETENTION_METRIC_NAMESPACE`, which the operations repository
+alarms on.
 """
 
 from __future__ import annotations
@@ -61,6 +73,11 @@ from typing import cast
 
 from crucible.store import Store, open_store, read_only
 
+from crucible_trader.books_retention import (
+    DECISIONS_PREFIX,
+    lock_books_records,
+    retain_until,
+)
 from crucible_trader.exception_decision import (
     DecisionError,
     decide,
@@ -80,6 +97,11 @@ __all__ = [
     "load_config",
     "verify_access_jwt",
 ]
+
+#: Where the retention outcome is published (CloudWatch embedded metric format,
+#: so the function needs no ``cloudwatch:PutMetricData`` grant).
+RETENTION_METRIC_NAMESPACE = "AlphaEngine/BackOffice"
+RETENTION_METRIC = "DecisionRetentionRefused"
 
 #: Clock skew tolerated on ``exp``, ``nbf`` and ``iat``, in seconds.
 LEEWAY_SECONDS = 30
@@ -412,7 +434,17 @@ def handle(
     except DecisionError as exc:
         return _refuse(409, str(exc), **who)
     decision_id = document["decision_id"]
-    _log(201, "recorded", key=key, decision_id=decision_id, verdict=document["verdict"], **who)
+    retention, retention_reason = _lock(store, key, cast("str", document["decided_at"]), now)
+    _log(
+        201,
+        "recorded",
+        key=key,
+        decision_id=decision_id,
+        verdict=document["verdict"],
+        retention=retention,
+        **({"retention_reason": retention_reason} if retention_reason else {}),
+        **who,
+    )
     return _respond(
         201,
         {
@@ -421,8 +453,46 @@ def handle(
             "verdict": document["verdict"],
             "decided_by": approver.reviewer,
             "decided_at": document["decided_at"],
+            "retention": retention,
         },
     )
+
+
+def _lock(store: Store, key: str, decided_at: str, now: float) -> tuple[str, str | None]:
+    """COMPLIANCE-lock the decision just written; publish the outcome as one
+    embedded-metric datapoint. Returns ``(retention, reason)``. Never raises."""
+    try:
+        decided_on = dt.date.fromisoformat(decided_at[:10])
+        locked, refused = lock_books_records(
+            store, [key], trading_day=decided_on, prefixes=(DECISIONS_PREFIX,)
+        )
+        if refused:
+            outcome, reason = "refused", "; ".join(refused.values())
+        elif locked:
+            outcome, reason = f"locked until {retain_until(decided_on).date().isoformat()}", None
+        else:
+            outcome, reason = "not applicable (store has no object lock)", None
+    except Exception as exc:  # noqa: BLE001 - a lock must never undo a recorded decision
+        outcome, reason = "refused", f"{type(exc).__name__}: {exc}"[:300]
+    no_dimensions: list[list[str]] = [[]]
+    emf: dict[str, object] = {
+        "_aws": {
+            "Timestamp": int(now * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": RETENTION_METRIC_NAMESPACE,
+                    "Dimensions": no_dimensions,
+                    "Metrics": [{"Name": RETENTION_METRIC, "Unit": "Count"}],
+                }
+            ],
+        },
+        RETENTION_METRIC: 1 if outcome == "refused" else 0,
+        "event": "exception_decision_retention",
+        "key": key,
+        "retention": outcome,
+    }
+    print(json.dumps(emf, sort_keys=True), flush=True)
+    return outcome, reason
 
 
 _STATE: list[tuple[WriterConfig, AccessKeys, Store]] = []
