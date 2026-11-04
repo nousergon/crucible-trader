@@ -50,7 +50,7 @@ from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 #: ``tests`` assert it equals ``performance_statement.BENCHMARKS``.
 BENCHMARK_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ")
 BENCHMARK_CLOSES_URI_ENV = "CRUCIBLE_TRADER_BENCHMARK_CLOSES_URI"
-BENCHMARK_CLOSES_PREFIX = "trader/benchmark_closes/"
+BENCHMARK_CLOSES_PREFIX = "trader/ledger/benchmarks/"
 BENCHMARK_CLOSES_SCHEMA_VERSION = "benchmark_closes.v1"
 CAPTURE_METRIC = "benchmark_closes_capture"
 #: The vendor whose close is ground truth; any other row is not taken.

@@ -228,7 +228,7 @@ class TestReading:
 
 
 def test_keys():
-    assert benchmark_closes_key("2026-11-30") == "trader/benchmark_closes/2026-11-30.json"
+    assert benchmark_closes_key("2026-11-30") == "trader/ledger/benchmarks/2026-11-30.json"
     with pytest.raises(ValueError):
         benchmark_closes_key("nope")
     assert bc.CAPTURE_LOOKBACK_TRADING_DAYS == 4
