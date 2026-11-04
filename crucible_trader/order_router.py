@@ -76,6 +76,7 @@ import dataclasses
 import datetime as dt
 import math
 import os
+import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -521,6 +522,45 @@ class IbQuoteSource:
         return price, ticker
 
 
+class CloseFallbackQuote:
+    """IB first; when IB has no price for a name, the book day's close from the panel.
+
+    The orders are market orders, so the decision price only sizes them and
+    checks the caps; the book day's close (the data the book was scored on) is a
+    sound stand-in. Without this one silent name refused the whole book: the
+    first live session (2026-11-04) placed nothing over ANF. Every name priced
+    this way is kept in :attr:`fell_back` and logged. A name neither source
+    prices is still a miss, so the book is still refused on a partial price set.
+    """
+
+    def __init__(self, primary: QuoteSource, fallback: QuoteSource) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self.fell_back: dict[str, float] = {}
+        self.last_miss: str | None = None
+
+    def __call__(self, symbol: str) -> float | None:
+        self.last_miss = None
+        price = _valid(self._primary(symbol))
+        if price is not None:
+            return price
+        miss = getattr(self._primary, "last_miss", None)
+        try:
+            close = _valid(self._fallback(symbol))
+        except PriceUnavailableError as exc:
+            close, miss = None, f"{miss or symbol}; close fallback: {exc}"
+        if close is None:
+            self.last_miss = miss
+            return None
+        self.fell_back[symbol] = close
+        print(
+            f"order_router: {symbol} priced at the book-day close {close} "
+            f"({miss or 'IB: no price'})",
+            file=sys.stderr,
+        )
+        return close
+
+
 def _miss(symbol: str, why: str, ticker: object, errors: list[str]) -> str:
     fields = (
         ""
@@ -601,7 +641,13 @@ class PaperOrderRouter:
         self._store = store
         self._day = trading_day
         self._clock = clock
-        self._quote = quote or IbQuoteSource(client, sdk)
+        if quote is None:
+            from crucible_trader.simulated_broker import PanelCloseSource  # imports this module
+
+            quote = CloseFallbackQuote(
+                IbQuoteSource(client, sdk), PanelCloseSource(store, trading_day)
+            )
+        self._quote = quote
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
