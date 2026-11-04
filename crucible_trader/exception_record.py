@@ -149,6 +149,7 @@ _UNIT_BY_CLASS: Mapping[tuple[str, str], str] = {
     (SOURCE_BROKER_RECONCILIATION, "cash_delta"): "usd",
     (SOURCE_BROKER_RECONCILIATION, "share_delta"): "shares",
     (SOURCE_BROKER_RECONCILIATION, "position_count"): "positions",
+    (SOURCE_BROKER_RECONCILIATION, "corporate_action_source_mismatch"): "shares",
     (SOURCE_ORDER_INTENT_RECONCILIATION, "overfilled"): "shares",
     (SOURCE_ORDER_INTENT_RECONCILIATION, "closed_partial"): "shares",
     (SOURCE_MONTH_END_CLOSE, "close_cash_delta"): "usd",

@@ -128,12 +128,13 @@ from crucible_trader.exception_proposal import (
 )
 from crucible_trader.exception_record import (
     EXCEPTION_SCHEMA_VERSION,
+    PAPER_FUND_TENANT,
     exception_day_document,
     exceptions_key,
     records_from_broker_reconciliation,
     records_from_order_intent_reconciliation,
 )
-from crucible_trader.ledger import post_daily_ledger
+from crucible_trader.ledger import load_ledger, post_daily_ledger
 from crucible_trader.month_end_close import close_prior_month
 from crucible_trader.month_rebuild import verify_month_rebuild
 from crucible_trader.order_intent_reconciliation import (
@@ -344,6 +345,7 @@ def reconcile_cycle(
         ctx.record_input(key, payload, RECONCILIATION_SCHEMA_VERSION)
         documents[prior_day] = json.loads(payload.decode("utf-8"))
     owed = owed_dividends(documents, today=day, declared=load_declared_entitlements())
+    ledger_positions, ledger_source = ledger_leg(ctx.store, day, broker.account)
 
     inputs = ReconciliationInputs(
         trading_day=day,
@@ -355,6 +357,8 @@ def reconcile_cycle(
         previous_trading_day=previous_trading_day(ctx.trading_day).isoformat(),
         genesis=genesis,
         owed_dividends=owed,
+        ledger_positions=ledger_positions,
+        ledger_source=ledger_source,
     )
     result = reconciler(inputs)
     verdict = run_control_arm(inputs, reconciler=reconciler)
@@ -426,6 +430,23 @@ def reconcile_cycle(
     if decision.pages:
         raise ReconciliationDiscrepancyError(f"{page_text(result)} [{decision.reason}]")
     return result
+
+
+def ledger_leg(store: Store, day: str, account: str) -> tuple[dict[str, int] | None, str]:
+    """The ledger's share counts before ``day``: the third leg of the
+    corporate-action check. NEVER raises: an unreadable ledger is an
+    unavailable leg (recorded with its reason), and step 5d reports the ledger's
+    own failure, so this read cannot change what the job decides or pages."""
+    try:
+        ledger = load_ledger(store, PAPER_FUND_TENANT, before=day)
+        if not ledger.has_account(PAPER_FUND_TENANT, account):
+            return None, f"unavailable: no {PAPER_FUND_TENANT} ledger for {account} before {day}"
+        return (
+            dict(ledger.positions(PAPER_FUND_TENANT, account)),
+            f"ledger journals ({PAPER_FUND_TENANT}) before {day}",
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing leg is recorded, never a raise
+        return None, f"unavailable: {type(exc).__name__}: {exc}"[:300]
 
 
 def reconcile_intents_step(

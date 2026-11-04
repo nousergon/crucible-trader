@@ -4,7 +4,7 @@
 §10.7. A reconciler that has only ever been shown a clean book cannot be told
 apart from one that cannot see a dirty one -- v1's split check and ledger replay
 both passed their own tests while producing a false 1.000. So every cycle this
-module REPLAYS the cycle's own reconciliation inputs three times, each with one
+module REPLAYS the cycle's own reconciliation inputs once per class, each with one
 known discrepancy planted, and requires the reconciler to report exactly that
 discrepancy, correctly classified:
 
@@ -12,6 +12,11 @@ discrepancy, correctly classified:
     cash_delta         a known cash amount on the broker side
     corporate_action   a known split recorded for a planted instrument and NOT
                        applied on the broker side
+    corporate_action_source_mismatch
+                       a known split recorded for a planted instrument that the
+                       broker applied at a DIFFERENT ratio: the three-way check
+                       (Polygon, IB, ledger; `alpha-engine-config-I13197`) must
+                       call it a source mismatch, not a plain share_delta
 
 **An undetected or misclassified plant voids the cycle's reconciliation**, the
 same way a failed grader control voids that cycle's verdicts (§10.1):
@@ -55,7 +60,12 @@ from crucible_trader.reconciliation import (
 #: Fault 5's registered name in the §10.7 fault set.
 FAULT_NAME = "reconciliation_planted_discrepancy"
 
-PLANT_CLASSES: tuple[str, ...] = ("share_delta", "cash_delta", "corporate_action")
+PLANT_CLASSES: tuple[str, ...] = (
+    "share_delta",
+    "cash_delta",
+    "corporate_action",
+    "corporate_action_source_mismatch",
+)
 
 #: Not a valid exchange symbol (lowercase, underscores), so never a real holding.
 PLANT_PREFIX = "__planted_"
@@ -63,6 +73,9 @@ PLANT_BASE_SHARES = 100
 PLANTED_SHARE_DELTA = 37
 PLANTED_CASH_DELTA_USD = 1234.56
 PLANTED_SPLIT_RATIO = 3.0
+#: The ratio Polygon reports for the source-mismatch plant (the broker applies
+#: :data:`PLANTED_SPLIT_RATIO`).
+PLANTED_MISMATCH_POLYGON_RATIO = 2.0
 
 #: Used as the replay anchor's day when the cycle itself has no anchor (a
 #: declared genesis): the control still runs, over the broker's own book.
@@ -192,7 +205,7 @@ def plant(
             ),
             Plant(klass, CASH_INSTRUMENT, round(residual + PLANTED_CASH_DELTA_USD, 2)),
         )
-    if klass not in ("share_delta", "corporate_action"):
+    if klass not in ("share_delta", "corporate_action", "corporate_action_source_mismatch"):
         raise ValueError(f"no plant for class {klass!r}; the classes are {PLANT_CLASSES}")
     broker_shares = PLANT_BASE_SHARES + (PLANTED_SHARE_DELTA if klass == "share_delta" else 0)
     new_actions = actions.actions
@@ -200,6 +213,14 @@ def plant(
     if klass == "corporate_action":
         new_actions = (*new_actions, CorporateAction(ticker, "split", ratio=PLANTED_SPLIT_RATIO))
         delta = float(PLANT_BASE_SHARES - PLANT_BASE_SHARES * PLANTED_SPLIT_RATIO)
+    if klass == "corporate_action_source_mismatch":
+        # Polygon says one ratio; the broker applied PLANTED_SPLIT_RATIO.
+        new_actions = (
+            *new_actions,
+            CorporateAction(ticker, "split", ratio=PLANTED_MISMATCH_POLYGON_RATIO),
+        )
+        broker_shares = int(PLANT_BASE_SHARES * PLANTED_SPLIT_RATIO)
+        delta = float(PLANT_BASE_SHARES * (PLANTED_SPLIT_RATIO - PLANTED_MISMATCH_POLYGON_RATIO))
     return (
         dataclasses.replace(
             base,
