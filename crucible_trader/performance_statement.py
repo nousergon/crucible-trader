@@ -233,14 +233,21 @@ def file_statement(
         _metric(ctx, now, key, "FAIL", None, f"statement NOT filed: {type(exc).__name__}: {exc}")
         return None
     bill = cast("Mapping[str, object]", statement["simulated_fee_bill"])
+    # A benchmark with no settled close is stated on the statement's face
+    # (``return: None`` and a reason) and must not read OK on the metric: an
+    # unbenchmarked statement is one a reader would otherwise take as complete
+    # (alpha-engine-config-I13125, found by a planted break).
+    benchmarks = cast("Mapping[str, Mapping[str, object]]", statement["benchmarks"])
+    missing = [f"{s}: {b['reason']}" for s, b in sorted(benchmarks.items()) if b["return"] is None]
     _metric(
         ctx,
         now,
         key,
-        "OK",
+        "WATCH" if missing else "OK",
         float(cast("float", statement["time_weighted_return_gross"])),
         f"{month} statement filed: gross {statement['time_weighted_return_gross']}, net "
-        f"{statement['time_weighted_return_net']}, simulated bill {bill['total_cents']} cents",
+        f"{statement['time_weighted_return_net']}, simulated bill {bill['total_cents']} cents"
+        + (f"; benchmark missing: {'; '.join(missing)}" if missing else ""),
     )
     return statement
 
