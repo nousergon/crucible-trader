@@ -24,7 +24,13 @@ the panel does not carry is ``null`` with a reason, never estimated.
 to anyone. The fee schedule is :data:`SIMULATED_FEE_SCHEDULE`; the bill runs on
 a shadow NET NAV chain carried statement to statement:
 
-* adviser fee = the closed month's AUM (net NAV before fees) x annual rate / 12;
+* adviser fee = the closed month's AUM (net NAV before fees) x annual rate / 12,
+  prorated by calendar days when the book opened inside the month after its
+  first trading day (from the opening day through month end, inclusive): a
+  bill covers the period the statement measures, never a whole month the book
+  did not hold
+  (``partial_period: calendar_days``; found by the October dry run,
+  alpha-engine-config-I13125, where the v2 book opens on 2026-10-09);
 * performance fee = rate x the net NAV after the adviser fee ABOVE the
   high-water mark, crystallised monthly; the mark only rises.
 
@@ -39,6 +45,7 @@ nobody owes.
 
 from __future__ import annotations
 
+import calendar
 import json
 from collections.abc import Mapping
 from decimal import ROUND_HALF_UP, Decimal
@@ -58,17 +65,34 @@ LEDGER_STATEMENTS_PREFIX = "trader/ledger/statements/"
 STATEMENT_METRIC = "performance_statement"
 BENCHMARKS: tuple[str, ...] = ("SPY", "QQQ")
 
-#: The simulated schedule the bill is computed under. Placeholder rates until
-#: the fund's terms are ruled; a change is a new ``schedule_id`` so a bill
-#: always names the terms it was computed under.
-SIMULATED_FEE_SCHEDULE: Mapping[str, object] = {
-    "schedule_id": "simulated.2026-11-03",
-    "adviser_fee_annual_bps": 100,
-    "performance_fee_bps": 2000,
-    "high_water_mark": True,
-    "crystallisation": "monthly",
-    "hurdle": None,
+#: Every fee schedule a bill may name, by ``schedule_id``. Placeholder rates
+#: until the fund's terms are ruled. A schedule is never edited: a change is a
+#: new id here, so a bill always names the terms it was computed under, and the
+#: monthly rebuild (:mod:`crucible_trader.month_rebuild`) recomputes a bill
+#: under the schedule it names rather than under today's default. A schedule
+#: without ``partial_period`` bills a whole month whenever the book opened.
+FEE_SCHEDULES: Mapping[str, Mapping[str, object]] = {
+    "simulated.2026-11-03": {
+        "schedule_id": "simulated.2026-11-03",
+        "adviser_fee_annual_bps": 100,
+        "performance_fee_bps": 2000,
+        "high_water_mark": True,
+        "crystallisation": "monthly",
+        "hurdle": None,
+    },
+    "simulated.2026-11-04": {
+        "schedule_id": "simulated.2026-11-04",
+        "adviser_fee_annual_bps": 100,
+        "performance_fee_bps": 2000,
+        "high_water_mark": True,
+        "crystallisation": "monthly",
+        "hurdle": None,
+        "partial_period": "calendar_days",
+    },
 }
+
+#: The schedule a new bill is computed under.
+SIMULATED_FEE_SCHEDULE: Mapping[str, object] = FEE_SCHEDULES["simulated.2026-11-04"]
 
 
 class StatementError(ValueError):
@@ -142,8 +166,21 @@ def build_statement(
 
     gross = Decimal(nav_end - nav_start) / Decimal(nav_start)
     aum = _cents(Decimal(net_start) * (1 + gross))
+    days_in_month = calendar.monthrange(int(month[:4]), int(month[5:7]))[1]
+    billed_days = days_in_month
+    if (
+        schedule.get("partial_period") == "calendar_days"
+        and close.get("opened_in_month")
+        and close.get("start_trading_day") != close.get("first_trading_day")
+    ):
+        billed_days = days_in_month - int(str(close["start_trading_day"])[8:10]) + 1
     adviser = _cents(
-        Decimal(aum) * Decimal(cast("int", schedule["adviser_fee_annual_bps"])) / 10_000 / 12
+        Decimal(aum)
+        * Decimal(cast("int", schedule["adviser_fee_annual_bps"]))
+        / 10_000
+        / 12
+        * billed_days
+        / days_in_month
     )
     after_adviser = aum - adviser
     performance = _cents(
@@ -183,6 +220,11 @@ def build_statement(
             "performance_fee_cents": performance,
             "total_cents": adviser + performance,
             "high_water_mark_start_cents": hwm_start,
+            **(
+                {"billed_days": billed_days, "days_in_month": days_in_month}
+                if "partial_period" in schedule
+                else {}
+            ),
         },
         "shadow_net_nav_start_cents": net_start,
         "shadow_net_nav_end_cents": net_end,
