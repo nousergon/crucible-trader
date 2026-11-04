@@ -98,6 +98,7 @@ from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
 
+from crucible_trader.benchmark_closes import capture_benchmark_closes
 from crucible_trader.broker_statement import (
     BROKER_STATEMENT_SCHEMA_VERSION,
     BrokerStatement,
@@ -410,6 +411,10 @@ def reconcile_cycle(
             reconciliation=document,
             now=now,
         )
+        # Step 5f': the statement's benchmark closes the panel does not carry,
+        # captured before 5f so the month's last close is there when the
+        # statement is filed (alpha-engine-config-I13201). Never raises.
+        capture_benchmark_closes(ctx, day=day, now=now)
         # Step 5f: after 5d, so the month's last journal is in the ledger.
         close_prior_month(
             ctx,

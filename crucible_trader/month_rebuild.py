@@ -38,6 +38,7 @@ from typing import Any, cast
 from crucible.keys import trader_broker_statement_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
+from crucible_trader.benchmark_closes import with_benchmark_closes
 from crucible_trader.broker_statement import statement_from_document
 from crucible_trader.exception_record import PAPER_FUND_TENANT
 from crucible_trader.ledger import ledger_reconciliation_key, load_journals
@@ -141,7 +142,9 @@ def rebuild_month(
             close,
             _read_json(store, statement_key(tenant, previous_month(month))),
             benchmark_returns(
-                closes, str(close["start_trading_day"]), str(close["last_trading_day"])
+                with_benchmark_closes(store, closes),
+                str(close["start_trading_day"]),
+                str(close["last_trading_day"]),
             ),
             _schedule_named_by(published_statement),
         )
