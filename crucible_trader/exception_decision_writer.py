@@ -5,7 +5,11 @@
 this small handler, deployed as its own Lambda with its own narrow role, behind
 the same Cloudflare Access login as the console.
 
-What it does, per request:
+``GET`` serves the reviewer's form (:mod:`crucible_trader.exception_decision_form`)
+behind the same identity check: the queue of the approver's tenants, one small
+form per proposal, which posts JSON back to this same URL. It only reads.
+
+What it does, per ``POST``:
 
 1. **Who is asking.** The request must carry Cloudflare Access's signed
    assertion (``Cf-Access-Jwt-Assertion``). The handler verifies it itself --
@@ -53,6 +57,7 @@ import hashlib
 import hmac
 import json
 import math
+import secrets
 import time
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -64,8 +69,14 @@ from crucible.store import Store, open_store, read_only
 from crucible_trader.exception_decision import (
     DecisionError,
     decide,
+    load_decisions,
     load_proposals,
     record_decision,
+)
+from crucible_trader.exception_decision_form import (
+    content_security_policy,
+    queue_items,
+    render_queue_page,
 )
 
 __all__ = [
@@ -340,25 +351,14 @@ def _now_stamp(now: float) -> str:
     return dt.datetime.fromtimestamp(now, dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def handle(
-    event: Mapping[str, object],
+def _approver(
+    headers: Mapping[str, str],
     *,
     config: WriterConfig,
     keys: Callable[[str], tuple[int, int] | None],
-    store: Store,
     now: float,
-) -> dict[str, object]:
-    """One Lambda Function URL request (payload 2.0) to one HTTP response."""
-    request_context = cast("dict[str, dict[str, object]]", event.get("requestContext") or {})
-    method = request_context.get("http", {}).get("method")
-    headers = {k.lower(): v for k, v in cast("dict[str, str]", event.get("headers") or {}).items()}
-    if method != "POST":
-        return _refuse(405, "only POST records a decision")
-    origin = headers.get("origin")
-    if origin is not None and origin != config.allowed_origin:
-        return _refuse(403, "request from another origin")
-    if not headers.get("content-type", "").startswith("application/json"):
-        return _refuse(415, "the body must be application/json")
+) -> Approver | dict[str, object]:
+    """The approver the verified Access identity maps to, or the refusal."""
     try:
         claims = verify_access_jwt(
             headers.get("cf-access-jwt-assertion", ""),
@@ -374,6 +374,66 @@ def handle(
     approver = config.approvers.get(cast("str", claims["email"]).strip().lower())
     if approver is None:
         return _refuse(403, "this identity is not an approver")
+    return approver
+
+
+def _form(event: Mapping[str, object], *, approver: Approver, store: Store) -> dict[str, object]:
+    """``GET``: the queue of the approver's tenants as one form per proposal
+    (:mod:`crucible_trader.exception_decision_form`). Reads only."""
+    query = cast("dict[str, str]", event.get("queryStringParameters") or {})
+    wanted = query.get("tenant")
+    tenants = approver.tenants if wanted is None else approver.tenants & {wanted}
+    who = {"reviewer": approver.reviewer, "tenant": wanted}
+    if wanted is not None and not tenants:
+        return _refuse(403, f"{approver.reviewer} may not decide for tenant {wanted}", **who)
+    reader = read_only(store, reason="the decision form only reads proposals and decisions")
+    try:
+        items = queue_items(load_proposals(reader), load_decisions(reader), tenants=tenants)
+    except (DecisionError, ValueError) as exc:
+        return _refuse(503, f"cannot read the queue: {exc}", **who)
+    nonce = secrets.token_urlsafe(18)
+    _log(200, "form", items=len(items), **who)
+    return {
+        "statusCode": 200,
+        "headers": {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "content-security-policy": content_security_policy(nonce),
+            "referrer-policy": "no-referrer",
+            "x-content-type-options": "nosniff",
+        },
+        "body": render_queue_page(items, reviewer=approver.reviewer, tenants=tenants, nonce=nonce),
+    }
+
+
+def handle(
+    event: Mapping[str, object],
+    *,
+    config: WriterConfig,
+    keys: Callable[[str], tuple[int, int] | None],
+    store: Store,
+    now: float,
+) -> dict[str, object]:
+    """One Lambda Function URL request (payload 2.0) to one HTTP response."""
+    request_context = cast("dict[str, dict[str, object]]", event.get("requestContext") or {})
+    method = request_context.get("http", {}).get("method")
+    headers = {k.lower(): v for k, v in cast("dict[str, str]", event.get("headers") or {}).items()}
+    if method == "GET":
+        found = _approver(headers, config=config, keys=keys, now=now)
+        if not isinstance(found, Approver):
+            return found
+        return _form(event, approver=found, store=store)
+    if method != "POST":
+        return _refuse(405, "only POST records a decision (GET serves the form)")
+    origin = headers.get("origin")
+    if origin is not None and origin != config.allowed_origin:
+        return _refuse(403, "request from another origin")
+    if not headers.get("content-type", "").startswith("application/json"):
+        return _refuse(415, "the body must be application/json")
+    found = _approver(headers, config=config, keys=keys, now=now)
+    if not isinstance(found, Approver):
+        return found
+    approver = found
     who = {"reviewer": approver.reviewer}
     try:
         request = _parse_body(event)
