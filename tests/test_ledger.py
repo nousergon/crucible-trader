@@ -59,6 +59,11 @@ PREV, DAY, NEXT = "2026-11-02", "2026-11-03", "2026-11-04"
 NONE = CorporateActionSet(resolved=frozenset({"AAA", "BBB"}))
 
 
+def every_close(_day, tickers):
+    """A settled-close source with a close for every name (I13129's daily check)."""
+    return {t: 1.0 for t in tickers}
+
+
 def stmt(day, positions, cash, account="DU1"):
     return BrokerStatement(account, day, positions, cash)
 
@@ -369,6 +374,7 @@ def post(store, broker, anchor, fills=()):
         cash_flows=(),
         corporate_actions=NONE,
         reconciliation=reconciliation,
+        closes=every_close,
         now="2026-11-03T21:00:00Z",
     )
     return ctx, result
@@ -526,7 +532,12 @@ class TestChecks:
         rolled = checks["roll_forward"]
         assert rolled["ties"] is True and rolled["activity_lines"] == 4
         assert rolled["cash_opening_cents"] + rolled["cash_activity_cents"] == 79_900
-        assert checks["completeness"] == {"from": PREV, "through": DAY, "missing": []}
+        assert checks["completeness"] == {
+            "from": PREV,
+            "through": DAY,
+            "missing": [],
+            "closes_day": PREV,
+        }
 
     def test_a_published_view_that_differs_from_the_journals_is_a_break(self, store):
         post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
@@ -801,3 +812,87 @@ class TestClearingThroughThePostingStep:
         assert "DecisionError" in str(posting.document["decisions_unreadable"])
         assert ctx.metrics[0]["status"] == "WATCH"
         assert "decisions unreadable, nothing cleared" in ctx.metrics[0]["status_reason"]
+
+
+class TestSettledCloseCompleteness:
+    """alpha-engine-config-I13129: every name held at the end of the previous
+    trading day has its settled close, or that day is a completeness break."""
+
+    def _checks(self, store, closes, day=DAY, journals=None):
+        journals = journals if journals is not None else load_journals(store, T, before=day)
+        store.put_bytes(trader_broker_statement_key(day), b"{}")  # today's IB statement is in
+        return run_checks(
+            store,
+            T,
+            "DU1",
+            day=day,
+            journals={**journals, day: ()},
+            locks={},
+            view={"ledger_cash_cents": 100_000, "ledger_positions": {"AAA": 10}},
+            closes=closes,
+        )
+
+    def test_a_held_name_without_a_close_is_a_break_on_the_previous_day(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        asked = []
+
+        def closes(day, tickers):
+            asked.append((day, list(tickers)))
+            return {}
+
+        checks = self._checks(store, closes)
+        assert asked == [(PREV, ["AAA"])]
+        assert checks["completeness"]["closes_day"] == PREV
+        assert checks["completeness"]["missing"] == [{"day": PREV, "missing": ["close:AAA"]}]
+        assert [b["check"] for b in checks["breaks"]] == ["completeness"]
+
+    def test_an_unreadable_close_source_is_a_missing_close_never_a_raise(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+
+        def closes(_day, _tickers):
+            raise RuntimeError("panel unreadable")
+
+        checks = self._checks(store, closes)
+        assert checks["completeness"]["missing"] == [{"day": PREV, "missing": ["close:AAA"]}]
+
+    def test_a_close_for_every_held_name_is_complete(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        checks = self._checks(store, every_close)
+        assert checks["breaks"] == [] and checks["completeness"]["closes_day"] == PREV
+
+    def test_the_first_trading_day_of_a_month_leaves_month_end_to_the_close(self, store):
+        post(store, stmt("2026-11-30", {"AAA": 10}, 1_000.0), None)
+        asked = []
+        checks = self._checks(store, lambda d, t: asked.append(d) or {}, day="2026-12-01")
+        assert asked == [] and checks["completeness"]["closes_day"] is None
+        assert checks["breaks"] == []
+
+    def test_a_flat_book_asks_for_no_close(self, store):
+        post(store, stmt(PREV, {}, 1_000.0), None)
+        asked = []
+        checks = self._checks(store, lambda d, t: asked.append(d) or {})
+        assert asked == [] and checks["completeness"]["missing"] == []
+
+    def test_the_posting_step_reads_the_stored_panel_and_still_posts(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        broker = stmt(DAY, {"AAA": 10}, 1_000.0)
+        reconciliation = recon_doc(broker, stmt(PREV, {"AAA": 10}, 1_000.0), ())
+        store.put_bytes(trader_broker_statement_key(DAY), json.dumps(broker.to_document()).encode())
+        store.put_bytes(trader_reconciliation_key(DAY), json.dumps(reconciliation).encode())
+        ctx = ctx_for(store, DAY)
+        posted = post_daily_ledger(
+            ctx,
+            broker=broker,
+            anchor=stmt(PREV, {"AAA": 10}, 1_000.0),
+            fills=(),
+            cash_flows=(),
+            corporate_actions=NONE,
+            reconciliation=reconciliation,
+            now="2026-11-03T21:00:00Z",
+        )
+        # No panel in this store: the close is missing, the journal still posts.
+        assert posted is not None and store.exists(journal_key(T, DAY))
+        assert checks_of(store, DAY)["completeness"]["missing"] == [
+            {"day": PREV, "missing": ["close:AAA"]}
+        ]
+        assert [m["status"] for m in ctx.metrics] == ["FAIL"]
