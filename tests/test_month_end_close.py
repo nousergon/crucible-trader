@@ -173,6 +173,13 @@ def run(store, day="2026-12-01", **kw):
 
 
 class TestClose:
+    def test_cash_rounded_to_ib_is_its_own_attribution_line_and_still_closes(self, store):
+        november(store, ib_cash_end=946.03)  # 3 cents over: inside the band
+        _, close = run(store)
+        assert close is not None and close["status"] == "closed", close
+        assert close["pnl"]["cash_rounded_to_broker_cents"] == 3
+        assert close["pnl"]["total_cents"] == 1_703
+
     def test_a_month_that_ties_closes_locks_and_files_its_statement(self, store):
         november(store)
         ctx, close = run(store)
@@ -187,6 +194,7 @@ class TestClose:
             "commissions_cents": -200,
             "suspense_cents": 0,
             "reconciliation_adjustments_cents": 0,
+            "cash_rounded_to_broker_cents": 0,
             "total_cents": 1_700,
         }
         assert close["positions"]["AAA"] == {

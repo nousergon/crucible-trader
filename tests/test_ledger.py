@@ -19,6 +19,7 @@ from crucible_trader.exception_proposal import PROPOSAL_SCHEMA_VERSION
 from crucible_trader.exception_record import PAPER_FUND_TENANT, exception_id
 from crucible_trader.ledger import (
     CASH,
+    CASH_ROUNDING,
     COMMISSIONS,
     RECONCILIATION_ADJUSTMENTS,
     SECURITIES,
@@ -172,12 +173,23 @@ class TestOneEventOneEntry:
         ledger = Ledger()
         posting = book_day(ledger, day_inputs(broker, anchor, fills))
         kinds = [e.kind for e in posting.entries]
-        assert kinds == ["opening_balance", "fill", "commission", "fill", "commission", "cash_gap"]
+        assert kinds == [
+            "opening_balance",
+            "fill",
+            "commission",
+            "fill",
+            "commission",
+            "cash_rounding",
+        ]
         assert posting.entries[1].postings[1].quantity == 2
         assert ledger.trial_balance() == 0
         assert ledger.positions(T, "DU1") == {"AAA": 12, "BBB": 3}
-        # 30.015 -> 30.02 at the fill, so the book is a cent off IB: a gap entry.
-        assert [(b["class"], b["delta"]) for b in posting.breaks] == [("cash_gap", 1)]
+        # 30.015 -> 30.02 at the fill, so the book is a cent off IB: inside the
+        # 5-cent band, rounded to IB by its own entry, never a break.
+        assert posting.breaks == () and posting.document["clean"] is True
+        assert posting.entries[-1].postings == (Posting(CASH, 1), Posting(CASH_ROUNDING, -1))
+        assert posting.document["cash_rounded_to_broker_cents"] == 1
+        assert posting.document["cash_rounding_balance_cents"] == 1
         assert ledger.cents(T, "DU1", CASH) == to_cents(broker.cash_usd)
 
     def test_a_clean_day_has_no_breaks_and_no_suspense(self):
@@ -261,20 +273,20 @@ class TestOneEventOneEntry:
 class TestEveryGapIsBookedNeverAbsorbed:
     def test_a_cash_gap_is_an_entry_to_suspense_citing_its_breaks(self):
         anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
-        broker = stmt(DAY, {"AAA": 12}, 799.03)  # 3 cents over
+        broker = stmt(DAY, {"AAA": 12}, 799.30)  # 30 cents over: the review tier
         ledger = Ledger()
         posting = book_day(ledger, day_inputs(broker, anchor, (buy("AAA", 2, 100.0, 1.0, "x1"),)))
         gap = posting.entries[-1]
         assert gap.kind == "cash_gap"
-        assert gap.postings == (Posting(CASH, 3), Posting(SUSPENSE_CASH, -3))
+        assert gap.postings == (Posting(CASH, 30), Posting(SUSPENSE_CASH, -30))
         assert gap.evidence["decision_id"] is None
         assert (
             exception_id("ledger", DAY, ("cash_gap", "DU1", "USD")) in gap.evidence["exception_ids"]
         )
         assert gap.evidence["expires"] == "2026-11-06"
-        assert posting.document["suspense"]["cash_cents"] == -3
+        assert posting.document["suspense"]["cash_cents"] == -30
         assert posting.document["clean"] is False
-        assert ledger.cents(T, "DU1", CASH) == 79_903  # ground truth is IB
+        assert ledger.cents(T, "DU1", CASH) == 79_930  # ground truth is IB
 
     def test_a_reconciler_break_is_cited_by_its_own_exception_id(self):
         anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
@@ -295,12 +307,69 @@ class TestEveryGapIsBookedNeverAbsorbed:
     def test_suspense_standing_from_an_earlier_day_keeps_the_book_unclean(self):
         ledger = Ledger()
         book_day(
-            ledger, day_inputs(stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+            ledger, day_inputs(stmt(DAY, {"AAA": 10}, 1_000.30), stmt(PREV, {"AAA": 10}, 1_000.0))
         )
         day2 = book_day(
-            ledger, day_inputs(stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03))
+            ledger, day_inputs(stmt(NEXT, {"AAA": 10}, 1_000.30), stmt(DAY, {"AAA": 10}, 1_000.30))
         )
         assert day2.breaks == () and day2.document["clean"] is False
+
+
+class TestCashTiers:
+    """The ledger's own cash difference to IB, in whole cents: at most 5 cents
+    is rounded to IB by its own entry; up to $1.00 is a gap for review; more is
+    a gap that pages (Brian 2026-10-28 and 2026-11-02)."""
+
+    @staticmethod
+    def day_with(cash):
+        anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
+        ledger = Ledger()
+        return ledger, book_day(ledger, day_inputs(stmt(DAY, {"AAA": 10}, cash), anchor))
+
+    @pytest.mark.parametrize(("cash", "cents"), [(1_000.05, 5), (999.95, -5), (1_000.01, 1)])
+    def test_inside_the_band_is_its_own_rounding_entry_and_never_a_break(self, cash, cents):
+        ledger, posting = self.day_with(cash)
+        (rounding,) = [e for e in posting.entries if e.kind == "cash_rounding"]
+        assert rounding.postings == (Posting(CASH, cents), Posting(CASH_ROUNDING, -cents))
+        assert rounding.evidence["source"] == "ib_statement"
+        assert posting.breaks == () and posting.document["clean"] is True
+        assert posting.document["suspense"] == {"cash_cents": 0, "shares": {}}
+        assert posting.document["cash_rounded_to_broker_cents"] == cents
+        assert ledger.cents(T, "DU1", CASH) == to_cents(cash) and ledger.trial_balance() == 0
+
+    @pytest.mark.parametrize(
+        ("cash", "delta", "tier"),
+        [(1_000.06, 6, "review"), (999.0, -100, "review"), (1_001.01, 101, "page")],
+    )
+    def test_over_the_band_is_a_gap_in_suspense_with_its_tier(self, cash, delta, tier):
+        ledger, posting = self.day_with(cash)
+        assert [e.kind for e in posting.entries][-1] == "cash_gap"
+        assert [(b["class"], b["delta"], b["tier"]) for b in posting.breaks] == [
+            ("cash_gap", delta, tier)
+        ]
+        assert posting.document["cash_rounded_to_broker_cents"] == 0
+        assert posting.document["clean"] is False
+        assert ledger.cents(T, "DU1", SUSPENSE_CASH) == -delta
+
+    def test_the_rounding_balance_accumulates_across_days(self, store):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.02), stmt(PREV, {"AAA": 10}, 1_000.0))
+        ctx, posting = post(
+            store, stmt(NEXT, {"AAA": 10}, 1_000.05), stmt(DAY, {"AAA": 10}, 1_000.02)
+        )
+        assert posting is not None
+        assert posting.document["cash_rounded_to_broker_cents"] == 3
+        assert posting.document["cash_rounding_balance_cents"] == 5
+        assert [m["status"] for m in ctx.metrics] == ["OK"]
+
+    @pytest.mark.parametrize(("cash", "status"), [(1_000.40, "WATCH"), (1_003.00, "FAIL")])
+    def test_the_metric_watches_the_review_tier_and_fails_the_page_tier(self, store, cash, status):
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        ctx, posting = post(store, stmt(DAY, {"AAA": 10}, cash), stmt(PREV, {"AAA": 10}, 1_000.0))
+        assert posting is not None and [m["status"] for m in ctx.metrics] == [status]
+        if status == "FAIL":
+            assert "over 1.00 USD" in ctx.metrics[0]["status_reason"]
+            assert "300 cents" in ctx.metrics[0]["status_reason"]
 
 
 class TestOpening:
@@ -558,16 +627,16 @@ class TestChecks:
 
     def test_an_open_gap_ages_and_is_overdue_after_three_trading_days(self, store):
         post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
-        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.30), stmt(PREV, {"AAA": 10}, 1_000.0))
         late = "2026-11-09"
-        post(store, stmt(late, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03))
+        post(store, stmt(late, {"AAA": 10}, 1_000.30), stmt(DAY, {"AAA": 10}, 1_000.30))
         checks = checks_of(store, late)
         assert [(b["day"], b["age"]) for b in checks["open_breaks"]] == [(DAY, 4)]
         assert "break_aging" in [b["check"] for b in checks["breaks"]]
 
     def test_an_adjustment_citing_the_gap_clears_it(self, store):
         post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
-        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.30), stmt(PREV, {"AAA": 10}, 1_000.0))
         journals = load_journals(store, T, before="2026-11-10")
         gap = journals[DAY][-1]
         fix = Entry(
@@ -576,7 +645,7 @@ class TestChecks:
             NEXT,
             "adjustment",
             "fix/1",
-            (Posting(SUSPENSE_CASH, 3), Posting("income:declared_cash_flows", -3)),
+            (Posting(SUSPENSE_CASH, 30), Posting("income:declared_cash_flows", -30)),
             {"exception_ids": gap.evidence["exception_ids"], "decision_id": "d1"},
         )
         checks = run_checks(
@@ -586,7 +655,7 @@ class TestChecks:
             day=NEXT,
             journals={**journals, NEXT: (fix,)},
             locks={},
-            view={"ledger_cash_cents": 100_003, "ledger_positions": {"AAA": 10}},
+            view={"ledger_cash_cents": 100_030, "ledger_positions": {"AAA": 10}},
         )
         assert checks["open_breaks"] == [] and checks["roll_forward"]["ties"] is True
 
@@ -677,8 +746,8 @@ def decision_on(exception, verdict="agree", *, at="2026-11-03T22:00:00Z", tenant
     return decide(proposal, verdict=verdict, decided_by="reviewer", decided_at=at, **kwargs)
 
 
-def gapped_ledger(broker_day, *, positions=None, cash=1_000.03):
-    """PREV opens 10 AAA and $1,000; DAY's IB differs (3 cents, or shares)."""
+def gapped_ledger(broker_day, *, positions=None, cash=1_000.30):
+    """PREV opens 10 AAA and $1,000; DAY's IB differs (30 cents, or shares)."""
     ledger = Ledger()
     book_day(ledger, day_inputs(stmt(PREV, {"AAA": 10}, 1_000.0), None))
     posting = book_day(
@@ -688,7 +757,7 @@ def gapped_ledger(broker_day, *, positions=None, cash=1_000.03):
     return ledger, posting.entries[-1]
 
 
-def next_day(ledger, decisions, day=NEXT, prev=DAY, *, positions=None, cash=1_000.03):
+def next_day(ledger, decisions, day=NEXT, prev=DAY, *, positions=None, cash=1_000.30):
     inputs = day_inputs(stmt(day, positions or {"AAA": 10}, cash), stmt(prev, {"AAA": 10}, cash))
     return book_day(
         ledger,
@@ -718,15 +787,15 @@ class TestClearingADecidedBreak:
         (adjustment,) = posting.entries
         assert adjustment.kind == "adjustment" and adjustment.trading_day == NEXT
         assert adjustment.postings == (
-            Posting(SUSPENSE_CASH, 3),
-            Posting(RECONCILIATION_ADJUSTMENTS, -3),
+            Posting(SUSPENSE_CASH, 30),
+            Posting(RECONCILIATION_ADJUSTMENTS, -30),
         )
         assert adjustment.evidence["exception_ids"] == gap.evidence["exception_ids"]
         assert adjustment.evidence["decision_id"] == decision["decision_id"]
         assert adjustment.evidence["decided_by"] == "reviewer"
         assert adjustment.evidence["gap_entry_id"] == gap.entry_id
         assert ledger.trial_balance() == 0
-        assert ledger.cents(T, "DU1", CASH) == 100_003  # cash is untouched: IB stands
+        assert ledger.cents(T, "DU1", CASH) == 100_030  # cash is untouched: IB stands
         assert posting.document["suspense"] == {"cash_cents": 0, "shares": {}}
         assert posting.document["clean"] is True
         assert posting.document["cleared_today"] == [
@@ -779,7 +848,7 @@ class TestClearingADecidedBreak:
             assert clearing_decisions(decisions, T, before=NEXT) == {}
         # A decision on some other exception settles nothing here either.
         assert next_day(ledger, [deferred, decision_on("f" * 32)]).entries == ()
-        assert ledger.suspense(T, "DU1")["cash_cents"] == -3
+        assert ledger.suspense(T, "DU1")["cash_cents"] == -30
         # An agree that supersedes the deferral clears it.
         assert list(clearing_decisions([deferred, other], T, before=NEXT)) == [exception]
 
@@ -787,26 +856,26 @@ class TestClearingADecidedBreak:
 class TestClearingThroughThePostingStep:
     def test_a_recorded_decision_clears_the_gap_on_the_next_posting(self, store):
         post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
-        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.30), stmt(PREV, {"AAA": 10}, 1_000.0))
         (gap,) = [e for e in load_journals(store, T, before=NEXT)[DAY] if e.kind == "cash_gap"]
         record_decision(store, decision_on(gap.evidence["exception_ids"][0]))
         ctx, posting = post(
-            store, stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03)
+            store, stmt(NEXT, {"AAA": 10}, 1_000.30), stmt(DAY, {"AAA": 10}, 1_000.30)
         )
         assert posting is not None and ctx.metrics[0]["status"] == "OK"
         assert [e.kind for e in load_journals(store, T, before=LATER)[NEXT]] == ["adjustment"]
         view = json.loads(store.get_bytes(ledger_reconciliation_key(T, NEXT)))
         assert view["checks"]["open_breaks"] == [] and view["checks"]["breaks"] == []
         # Idempotent: a re-run books the same bytes and changes nothing.
-        _, rerun = post(store, stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03))
+        _, rerun = post(store, stmt(NEXT, {"AAA": 10}, 1_000.30), stmt(DAY, {"AAA": 10}, 1_000.30))
         assert rerun is not None and rerun.entries == posting.entries
 
     def test_an_unreadable_decision_store_leaves_the_gap_in_suspense_and_still_posts(self, store):
         post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
-        post(store, stmt(DAY, {"AAA": 10}, 1_000.03), stmt(PREV, {"AAA": 10}, 1_000.0))
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.30), stmt(PREV, {"AAA": 10}, 1_000.0))
         store.put_bytes(decision_key(DAY, "0" * 32), b'{"schema_version": "nope"}')
         ctx, posting = post(
-            store, stmt(NEXT, {"AAA": 10}, 1_000.03), stmt(DAY, {"AAA": 10}, 1_000.03)
+            store, stmt(NEXT, {"AAA": 10}, 1_000.30), stmt(DAY, {"AAA": 10}, 1_000.30)
         )
         assert posting is not None and posting.entries == ()
         assert "DecisionError" in str(posting.document["decisions_unreadable"])
