@@ -15,7 +15,9 @@ month. A close that ever carries a flow is REFUSED here rather than reported
 with the wrong formula; daily linking lands with the first flow.
 
 **Benchmarks.** SPY and QQQ, each its settled-close PRICE return over the same
-two days (the close's start and last trading day, from the day's price panel).
+two days (the close's start and last trading day, from the day's price panel,
+or, for a benchmark the panel does not carry, from the trader's own capture of
+the Polygon close: :mod:`crucible_trader.benchmark_closes`).
 The fund's return includes its dividends, so the comparison is total return
 against price return; the statement says so in ``benchmark_basis``. A benchmark
 the panel does not carry is ``null`` with a reason, never estimated.
@@ -53,6 +55,7 @@ from typing import Any, cast
 
 from crucible.store import ETAG_ABSENT, PointerConflictError
 
+from crucible_trader.benchmark_closes import with_benchmark_closes
 from crucible_trader.month_end_close import (
     CloseSource,
     close_key,
@@ -258,7 +261,7 @@ def file_statement(
             if store.exists(prior_key)
             else None
         )
-        source = closes or panel_close_source(store)
+        source = with_benchmark_closes(store, closes or panel_close_source(store))
         statement = build_statement(
             close,
             prior,
