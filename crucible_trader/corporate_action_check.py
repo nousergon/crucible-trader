@@ -2,10 +2,11 @@
 
 `alpha-engine-config-I13197`: the back office control standard's row
 "Three-way check" (nous-ergon-ops `plans/2026-11-02-back-office-implementation.md`;
-1g, `-I13128`, reads both sources). Polygon's daily scan (:mod:`crucible_trader.corporate_action_feed`)
-is the independent source the ledger books from; IB's own word is the second
-source; the ledger (:mod:`crucible_trader.ledger`) is the book of record. Each
-share-affecting action is compared across all three, and a disagreement is a
+1g, `-I13128`, reads both sources). Polygon's daily scan
+(:mod:`crucible_trader.corporate_action_feed`) is the independent source the
+ledger books from; IB's own word is the second source; the ledger
+(:mod:`crucible_trader.ledger`) is the book of record. Each share-affecting
+action is compared across all three, and a disagreement is a
 `corporate_action_source_mismatch` finding of its own: filed as an
 ``exception.v1`` record, proposed, queued, aged and paged like every other
 finding. It is never resolved by preferring one source.
