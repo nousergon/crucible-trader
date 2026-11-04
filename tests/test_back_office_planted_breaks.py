@@ -9,7 +9,9 @@ Every plant here is a KNOWN error injected into a synthetic November book run
 through the real job body (:func:`reconcile_cycle`, steps 5 to 5g) over a local
 store, never the live books. Each plant names the control that must catch it,
 and :func:`test_every_planted_break_is_caught` reports caught / planted, which
-must be 1. The second half plants breaks with an ANSWER KEY and has a reviewer
+must be 1. The plants reach the close (an unpriced holding), the statement (an
+unpriced benchmark) and the bill (a publisher that overbills, caught by 5g's
+rebuild from raw). The second half plants breaks with an ANSWER KEY and has a reviewer
 who decides by the key alone: where the key and the proposer differ, the
 scorer must show the disagreement (agreement below 1) -- a scorer that always
 reads 1.0 proves nothing.
@@ -186,6 +188,10 @@ class Plant:
     pages: bool = False
     close_line: str | None = None
     statement_benchmark_missing: str | None = None
+    #: A publisher defect: the statement filed in 5f bills this many cents more
+    #: adviser fee than its inputs give. Caught by 5g's rebuild-from-raw.
+    publisher_fee_error_cents: int = 0
+    rebuild_break: str | None = None
 
 
 PLANTS = (
@@ -228,7 +234,27 @@ PLANTS = (
         closes=closes_without(DAYS[2], "SPY"),
         statement_benchmark_missing="SPY",
     ),
+    # The bill: the publisher overbills one cent of adviser fee. The statement
+    # is filed as published; the monthly rebuild from raw must disagree with it
+    # (`alpha-engine-config-I13129` 1h, the plan's "plants to the bill").
+    Plant("fee_bill", publisher_fee_error_cents=1, rebuild_break="fee_bill"),
 )
+
+
+def arm(monkeypatch: pytest.MonkeyPatch, plant: Plant) -> None:
+    """Install ``plant``'s price gap and publisher defect, if it has them."""
+    use_closes(monkeypatch, plant.closes or closes_without("", ""))
+    if plant.publisher_fee_error_cents:
+        honest = performance_statement.build_statement
+
+        def overbilling(*args: object, **kwargs: object) -> dict[str, object]:
+            statement = honest(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+            bill = statement["simulated_fee_bill"]
+            bill["adviser_fee_cents"] += plant.publisher_fee_error_cents  # pyright: ignore
+            return statement
+
+        # The PUBLISHER's binding only: month_rebuild imported its own.
+        monkeypatch.setattr(performance_statement, "build_statement", overbilling)
 
 
 def run_month(store: LocalStore, plant: Plant) -> dict[str, Run]:
@@ -272,13 +298,22 @@ def caught(store: LocalStore, plant: Plant, runs: Mapping[str, Run]) -> list[str
             row = read(store, statement_key(T, "2026-11"))["benchmarks"][symbol]
             if row["return"] is not None or statement["status"] != "WATCH":
                 misses.append(f"statement benchmark {symbol}")
+        rebuild = metric(runs[CLOSE_RUN].ctx, "month_rebuild")
+        if plant.rebuild_break is None:
+            if rebuild["status"] != "OK":
+                misses.append(f"rebuild: {rebuild['status_reason']}")
+        else:
+            document = read(store, month_rebuild.rebuild_key(T, "2026-11"))
+            if rebuild["status"] != "FAIL" or [b["document"] for b in document["breaks"]] != [
+                plant.rebuild_break
+            ]:
+                misses.append(f"rebuild {plant.rebuild_break}")
     return misses
 
 
 @pytest.mark.parametrize("plant", PLANTS, ids=[p.name for p in PLANTS])
 def test_each_planted_break_is_caught_by_its_control(store, monkeypatch, plant):
-    if plant.closes is not None:
-        use_closes(monkeypatch, plant.closes)
+    arm(monkeypatch, plant)
     assert caught(store, plant, run_month(store, plant)) == [], plant.name
 
 
@@ -296,7 +331,8 @@ def test_every_planted_break_is_caught(tmp_path, monkeypatch):
     hits = 0
     for i, plant in enumerate(PLANTS):
         store = LocalStore(tmp_path / str(i))
-        use_closes(monkeypatch, plant.closes or closes_without("", ""))
+        monkeypatch.undo()
+        arm(monkeypatch, plant)
         monkeypatch.setattr(
             ledger, "_panel_closes", lambda _s: lambda _d, names: dict.fromkeys(names, 1.0)
         )
