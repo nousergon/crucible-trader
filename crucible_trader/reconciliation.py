@@ -46,6 +46,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal
 
 from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.corporate_action_check import (
+    MISMATCH_CLASS,
+    check_document,
+    dividend_rows,
+    share_rows,
+)
 
 RECONCILIATION_SCHEMA_VERSION = "broker_reconciliation.v1"
 
@@ -86,6 +92,7 @@ DiscrepancyClass = Literal[
     "cash_delta",
     "corporate_action",
     "unhandled_corporate_action",
+    "corporate_action_source_mismatch",
     "corporate_action_check_incomplete",
     "no_anchor",
     "stale_anchor",
@@ -218,6 +225,13 @@ class ReconciliationInputs:
     #: Dividends paid on an EARLIER pay date that the broker had not applied
     #: (:class:`OwedDividend`); a credit today is matched against these.
     owed_dividends: tuple[OwedDividend, ...] = ()
+    #: The ledger's share counts at the end of the previous session: the third
+    #: leg of the corporate-action check (:mod:`crucible_trader.corporate_action_check`).
+    #: ``None`` when the ledger was not supplied or not readable; that leg is
+    #: then recorded as unavailable and the other two are still compared.
+    ledger_positions: Mapping[str, int] | None = None
+    #: Where ``ledger_positions`` came from, or why it is absent.
+    ledger_source: str = "unavailable: not supplied"
 
     def __post_init__(self) -> None:
         if self.broker.trading_day != self.trading_day:
@@ -290,6 +304,9 @@ class ReconciliationResult:
     #: Written for traceability only: the carry itself re-reads each dividend's
     #: originating day (`dividend_entitlements.owed_dividends`), not this field.
     dividends_owed: tuple[OwedDividend, ...] = ()
+    #: The three-way corporate-action check (Polygon, IB, ledger) for the day;
+    #: ``None`` when there was no anchor to compare from.
+    corporate_action_check: Mapping[str, Any] | None = None  # pyright: ignore[reportExplicitAny]
 
     @property
     def match_rate(self) -> float | None:
@@ -325,6 +342,9 @@ class ReconciliationResult:
             "dividend_credits": [d.to_document() for d in self.dividend_credits],
             "dividends_unpaid": [d.to_document() for d in self.dividends_unpaid],
             "dividends_owed": [d.to_document() for d in self.dividends_owed],
+            "corporate_action_check": (
+                None if self.corporate_action_check is None else dict(self.corporate_action_check)
+            ),
         }
 
 
@@ -444,13 +464,29 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         if value != 0:
             expected[ticker] = value
 
+    # The three-way check (Polygon, IB, ledger), before the share findings: a
+    # split IB applied differently from Polygon is a source mismatch, not a
+    # plain share_delta, and one disagreement is ONE finding.
+    shares_check = share_rows(
+        anchor=anchor,
+        broker=broker,
+        net_fills=fills,
+        actions=actions,
+        resolved=inputs.corporate_actions.resolved,
+        ledger=inputs.ledger_positions,
+        handled_kinds=HANDLED_ACTION_KINDS,
+    )
+    mismatched = {r["instrument"]: r for r in shares_check if r["status"] == "mismatch"}
+
     for ticker in universe:
         want, have = expected.get(ticker, 0), broker.get(ticker, 0)
         if want == have:
             continue
         delta = have - want
         unapplied = anchor.get(ticker, 0) + fills.get(ticker, 0)
-        if ratio_of[ticker] != 1.0 and have == unapplied:
+        if ratio_of[ticker] != 1.0 and have != unapplied and ticker in mismatched:
+            findings.append(_mismatch(mismatched[ticker], side="broker"))
+        elif ratio_of[ticker] != 1.0 and have == unapplied:
             findings.append(
                 Discrepancy(
                     "corporate_action",
@@ -475,6 +511,12 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
                     "broker share count differs from anchor + fills + applied actions",
                 )
             )
+
+    # Ledger-only disagreements: IB agrees with Polygon, so the loop above
+    # raised nothing for the instrument, and the ledger's book would diverge.
+    for row in shares_check:
+        if row["status"] == "mismatch" and row["ib_shares"] == row["polygon_shares"]:
+            findings.append(_mismatch(row, side="ledger"))
 
     n_expected, n_broker = len(expected), len(broker)
     if n_expected != n_broker:
@@ -581,6 +623,15 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         rounded_to_broker = round(residual, 2) + 0.0  # + 0.0: never -0.0
 
     resolved_rows = [t for t in universe if t in inputs.corporate_actions.resolved]
+    check = check_document(
+        shares_check,
+        dividend_rows(
+            dividends,
+            unpaid=(u.ticker for u in unpaid_today),
+            cash_break=any(f.klass == "cash_delta" for f in findings),
+        ),
+        ledger_source=inputs.ledger_source,
+    )
     return _result(
         inputs,
         broker,
@@ -595,6 +646,7 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         dividend_credits=credits,
         dividends_unpaid=tuple(unpaid_today),
         dividends_owed=tuple(o for o in inputs.owed_dividends if o.key not in credited),
+        corporate_action_check=check,
     )
 
 
@@ -611,6 +663,7 @@ def _result(
     dividend_credits: tuple[OwedDividend, ...] = (),
     dividends_unpaid: tuple[OwedDividend, ...] = (),
     dividends_owed: tuple[OwedDividend, ...] = (),
+    corporate_action_check: Mapping[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
 ) -> ReconciliationResult:
     order = {klass: i for i, klass in enumerate(DISCREPANCY_CLASSES)}
     return ReconciliationResult(
@@ -641,6 +694,22 @@ def _result(
         dividend_credits=dividend_credits,
         dividends_unpaid=dividends_unpaid,
         dividends_owed=dividends_owed,
+        corporate_action_check=corporate_action_check,
+    )
+
+
+def _mismatch(row: Mapping[str, Any], *, side: str) -> Discrepancy:  # pyright: ignore[reportExplicitAny]
+    """A three-way row whose sources disagree, as its own finding: expected is
+    Polygon's share change, actual is IB's."""
+    polygon_shares, ib_shares = int(row["polygon_shares"]), int(row["ib_shares"])
+    return Discrepancy(
+        MISMATCH_CLASS,
+        str(row["instrument"]),
+        float(polygon_shares),
+        float(ib_shares),
+        float(ib_shares - polygon_shares),
+        side,
+        str(row["detail"]),
     )
 
 
