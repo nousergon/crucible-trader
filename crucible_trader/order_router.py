@@ -411,10 +411,19 @@ def plan_orders(
             continue
         notional = abs(delta) * price
         if notional > max_order_notional_usd:
-            raise RiskCapExceededError(
-                f"{symbol}: {abs(delta)} shares at {price} is ${notional:,.2f}, over the "
-                f"per-order cap ${max_order_notional_usd:,.2f}"
+            # Clipped to the cap, not refused: the cap bounds one order, and an
+            # order cut to it trades less than the book asks, never more. The
+            # 2026-11-04 rerun refused the whole book over PLTR at $287k.
+            clipped = math.floor(max_order_notional_usd / price)
+            print(
+                f"order_router: {symbol} {abs(delta)} shares at {price} is ${notional:,.2f}, "
+                f"over the per-order cap ${max_order_notional_usd:,.2f}; clipped to {clipped}",
+                file=sys.stderr,
             )
+            if clipped == 0:
+                continue
+            delta = clipped if delta > 0 else -clipped
+            notional = clipped * price
         session_notional += notional
         side = "buy" if delta > 0 else "sell"
         order = PlannedOrder(

@@ -287,8 +287,8 @@ class TestSimulatedFills:
         assert simulated_fills_key(DAY) == f"trader/simulated_fills/{DAY}.json"
 
     def test_the_prod_caps_refuse_the_whole_plan(self, store) -> None:
-        router = _router(store, _config(max_order_notional_usd=1_000.0))
-        with pytest.raises(RiskCapExceededError, match="per-order cap"):
+        router = _router(store, _config(max_session_notional_usd=1_000.0))
+        with pytest.raises(RiskCapExceededError, match="per-session cap"):
             router.batches(_book())
         assert router.records == ()
 
