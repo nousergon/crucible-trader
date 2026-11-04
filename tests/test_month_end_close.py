@@ -185,6 +185,8 @@ class TestClose:
             "realised_cents": 800,  # 4 AAA sold for $48 net of nothing, cost $40
             "unrealised_change_cents": 600 + 500,
             "dividends_cents": 0,
+            "interest_cents": 0,
+            "interest_first_recorded_cents": 0,
             "declared_cash_flows_cents": 0,
             "commissions_cents": -200,
             "suspense_cents": 0,
