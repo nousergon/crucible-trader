@@ -38,6 +38,9 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    reviewer decision, agreement per class and ruleset version, and the
    undecided queue oldest first with its age (`alpha-engine-config-I13120`,
    back office 1c) -- same contract as 5c (see :func:`file_exception_score`).
+   A queue item older than 3 trading days makes its ``exception_queue_overdue``
+   row FAIL, which the crucible ``alerts.sweep`` pages on
+   (`alpha-engine-config-I13129`); it never changes step 6's verdict.
    It runs after 5f, so the proposals a refused close files are in the same
    day's queue (`alpha-engine-config-I13121`);
 5f. close the previous month when it is not closed yet
@@ -639,6 +642,18 @@ def file_exception_proposals(
 #: The MetricRecord that says whether step 5e filed the day's score.
 EXCEPTION_SCORE_METRIC = "exception_score_filed"
 
+#: The MetricRecord that says whether any queue item is past the age limit
+#: (`alpha-engine-config-I13129`: "anything older than 3 trading days pages").
+#: FAIL while one is; the crucible ``alerts.sweep`` reads it from this job's
+#: manifest and pages (``crucible.alerts.evaluate_overdue_breaks``). It is a
+#: row of its own, never a raise, so a reviewer backlog never becomes a failed
+#: reconcile: "the broker disagrees" and "a person has not decided yet" stay
+#: two different pages.
+EXCEPTION_OVERDUE_METRIC = "exception_queue_overdue"
+
+#: How many overdue items the overdue row's reason names, oldest first.
+_OVERDUE_NAMED = 5
+
 
 def file_exception_score(ctx: RunContext, *, now: str) -> None:
     """Step 5e: file the back office's score and queue for the day. Never raises.
@@ -656,7 +671,11 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
     :data:`~crucible_trader.exception_decision.SCORE_CURRENT_KEY` (the review
     page's read), plus one
     ``exception_score_filed`` MetricRecord whose status is WATCH while any
-    queue item is past the age limit.
+    queue item is past the age limit. When the score is filed it also records
+    ``exception_queue_overdue`` (:data:`EXCEPTION_OVERDUE_METRIC`): the
+    overdue count, FAIL while it is above zero, naming the oldest items. That
+    row is the page signal (`alpha-engine-config-I13129`); the WATCH stays as
+    it was, because the sweep reads it from a trader pinned before this row.
 
     It runs every day, breaks or not, because a queue item ages on a clean day
     too. Shadow like 5c: ANY failure is logged and swallowed and reported as
@@ -665,6 +684,7 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
     """
     day = ctx.trading_day.isoformat()
     key = SCORES_PREFIX  # the metric's source path until the day's key is built
+    overdue_row: dict[str, object] | None = None
     try:
         key = exception_score_key(day)
         document = score(
@@ -690,6 +710,7 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
             f"agreement {totals['agreement']} over {totals['agree']} agreed and "
             f"{totals['correct']} corrected"
         )
+        overdue_row = _overdue_metric(document, day=day, key=key, now=now)
     except Exception as exc:  # noqa: BLE001 - see docstring: shadow, must never reach the job
         _LOG.warning("exception score for %s was NOT filed", day, exc_info=True)
         status, value = "FAIL", None
@@ -713,6 +734,45 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
         )
     except Exception:  # noqa: BLE001 - see docstring
         _LOG.warning("exception score metric for %s was NOT recorded", day, exc_info=True)
+    if overdue_row is not None:
+        try:
+            ctx.record_metric(overdue_row)
+        except Exception:  # noqa: BLE001 - see docstring
+            _LOG.warning("exception overdue metric for %s was NOT recorded", day, exc_info=True)
+
+
+def _overdue_metric(
+    document: Mapping[str, object], *, day: str, key: str, now: str
+) -> dict[str, object]:
+    """The ``exception_queue_overdue`` row for a filed score (see step 5e)."""
+    queue = cast("list[Mapping[str, object]]", document["queue"])
+    overdue = [q for q in queue if q["overdue"] is True]
+    limit = document["age_limit_trading_days"]
+    if overdue:
+        named = "; ".join(
+            f"{q['proposal_id']} ({q['trading_day']}, {q['age_trading_days']} trading days)"
+            for q in overdue[:_OVERDUE_NAMED]
+        )
+        more = len(overdue) - _OVERDUE_NAMED
+        reason = (
+            f"{len(overdue)} back-office queue items on {day} are older than {limit} "
+            f"trading days with no decision, oldest first: {named}"
+            + (f"; and {more} more" if more > 0 else "")
+        )
+    else:
+        reason = f"no back-office queue item on {day} is older than {limit} trading days"
+    return {
+        "name": EXCEPTION_OVERDUE_METRIC,
+        "module": "crucible_trader.exception_decision",
+        "metric_type": "operational",
+        "value": float(len(overdue)),
+        "unit": "count",
+        "n_floor": 0,
+        "status": "FAIL" if overdue else "OK",
+        "status_reason": reason,
+        "source_path": key,
+        "last_updated_utc": now,
+    }
 
 
 def page_text(result: ReconciliationResult) -> str:

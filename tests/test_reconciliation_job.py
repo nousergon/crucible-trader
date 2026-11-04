@@ -28,6 +28,7 @@ from crucible_trader.order_intent_reconciliation import BrokerExecution, BrokerO
 from crucible_trader.reconciliation import CorporateActionSet, Fill, reconcile
 from crucible_trader.reconciliation_control import ReconciliationVoidError
 from crucible_trader.reconciliation_job import (
+    EXCEPTION_OVERDUE_METRIC,
     EXCEPTION_PROPOSALS_METRIC,
     EXCEPTION_RECORDS_METRIC,
     EXCEPTION_SCORE_METRIC,
@@ -529,7 +530,7 @@ class TestExceptionProposals:
             o for o in base_ctx.outputs if o["key"] not in derived
         ]
         assert not failing.exists(proposals_key)
-        skip = {EXCEPTION_PROPOSALS_METRIC, EXCEPTION_SCORE_METRIC}
+        skip = {EXCEPTION_PROPOSALS_METRIC, EXCEPTION_SCORE_METRIC, EXCEPTION_OVERDUE_METRIC}
         others = [m for m in ctx.metrics if m["name"] not in skip]
         assert others == [m for m in base_ctx.metrics if m["name"] not in skip]
         # The failure is logged and reported, never raised.
@@ -699,6 +700,9 @@ class TestExceptionScore:
         (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
         MetricRecordRow.model_validate(metric)
         assert metric["status"] == "OK" and metric["value"] == 0.0
+        (overdue,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_OVERDUE_METRIC]
+        MetricRecordRow.model_validate(overdue)
+        assert overdue["status"] == "OK" and overdue["value"] == 0.0
 
     def test_a_break_is_queued_and_a_decision_scores_it(self, store, tmp_path):
         from crucible_trader.exception_decision import decide, record_decision
@@ -735,6 +739,11 @@ class TestExceptionScore:
         file_exception_score(ctx, now="2026-09-18T21:00:00Z")
         (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
         assert metric["status"] == "WATCH" and "1 overdue" in metric["status_reason"]
+        # alpha-engine-config-I13129: the overdue row is the page signal.
+        (overdue,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_OVERDUE_METRIC]
+        MetricRecordRow.model_validate(overdue)
+        assert overdue["status"] == "FAIL" and overdue["value"] == 1.0
+        assert "(2026-09-11, 5 trading days)" in overdue["status_reason"]
         assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
         # A re-run of an EARLIER day files its own score and leaves `current` alone.
         earlier = ctx_for(store)
@@ -758,6 +767,52 @@ class TestExceptionScore:
         (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
         MetricRecordRow.model_validate(metric)
         assert metric["status"] == "FAIL" and metric["value"] is None
+        # No score, no overdue reading: the FAIL above is the only row.
+        assert EXCEPTION_OVERDUE_METRIC not in [m["name"] for m in ctx.metrics]
+
+    def test_more_overdue_items_than_the_reason_names_are_counted(self):
+        from crucible_trader.reconciliation_job import _overdue_metric
+
+        queue = [
+            {
+                "proposal_id": f"p{i}",
+                "trading_day": "2026-09-01",
+                "age_trading_days": 9,
+                "overdue": True,
+            }
+            for i in range(7)
+        ] + [
+            {
+                "proposal_id": "new",
+                "trading_day": "2026-09-11",
+                "age_trading_days": 0,
+                "overdue": False,
+            }
+        ]
+        row = _overdue_metric(
+            {"queue": queue, "age_limit_trading_days": 3}, day="2026-09-11", key="k", now="t"
+        )
+        assert row["status"] == "FAIL" and row["value"] == 7.0
+        assert "p4 (" in row["status_reason"] and "p5 (" not in row["status_reason"]
+        assert row["status_reason"].endswith("; and 2 more")
+
+    def test_a_failing_overdue_metric_write_is_swallowed(self, store, monkeypatch, caplog):
+        import crucible_trader.reconciliation_job as job
+
+        ctx = ctx_for(store)
+        record_metric = ctx.record_metric
+
+        def picky(metric):
+            if metric["name"] == EXCEPTION_OVERDUE_METRIC:
+                raise ValueError("metric store down")
+            record_metric(metric)
+
+        monkeypatch.setattr(ctx, "record_metric", picky)
+        with caplog.at_level("WARNING", logger=job.__name__):
+            page = TestExceptionRecords()._discrepant(store, ctx)
+        assert "share_delta: AAA" in page
+        assert "overdue metric for 2026-09-11 was NOT recorded" in caplog.text
+        assert EXCEPTION_SCORE_METRIC in [m["name"] for m in ctx.metrics]
 
     def test_a_failing_metric_write_is_swallowed_too(self, store, monkeypatch, caplog):
         import crucible_trader.reconciliation_job as job
