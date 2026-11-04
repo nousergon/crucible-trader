@@ -56,6 +56,10 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    (:func:`crucible_trader.month_rebuild.verify_month_rebuild`, back office 1h,
    `alpha-engine-config-I13129`). A difference is a break and a FAIL metric;
    it never raises;
+5h. last, put every books record the cycle wrote under COMPLIANCE Object Lock
+   retention (:func:`crucible_trader.books_retention.lock_cycle_books`,
+   `alpha-engine-config-I13191`). A refused lock is a FAIL metric; it never
+   raises;
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
    :func:`paging_decision`). Either makes the manifest `status: failed`, which
@@ -95,6 +99,7 @@ from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
 
+from crucible_trader.books_retention import lock_cycle_books
 from crucible_trader.broker_statement import (
     BROKER_STATEMENT_SCHEMA_VERSION,
     BrokerStatement,
@@ -417,6 +422,10 @@ def reconcile_cycle(
         # Step 5e runs LAST: after 5c and 5f, so today's proposals and a
         # refused close's proposals are both in the queue it files.
         file_exception_score(ctx, now=now)
+        # Step 5h, after every write above: WORM retention on the books
+        # records this cycle wrote (alpha-engine-config-I13191). Never raises
+        # and never changes a payload, so the decision and page are unchanged.
+        lock_cycle_books(ctx, now=now)
 
     if not verdict.passed:
         raise ReconciliationVoidError(verdict.reason())

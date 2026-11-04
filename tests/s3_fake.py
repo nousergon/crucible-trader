@@ -22,6 +22,7 @@ class FakeS3:
     def __init__(self, now: Callable[[], dt.datetime]) -> None:
         self.objects: dict[str, bytes] = {}
         self.modified: dict[str, dt.datetime] = {}
+        self.retention: dict[str, dict[str, Any]] = {}
         self.now = now
 
     def _etag(self, key: str) -> str:
@@ -38,6 +39,12 @@ class FakeS3:
         self.objects[key] = kw["Body"]
         self.modified[key] = self.now()
         return {"ETag": f'"{self._etag(key)}"'}
+
+    def put_object_retention(self, **kw: Any) -> dict[str, Any]:
+        if kw["Key"] not in self.objects:
+            raise self._error("NoSuchKey")
+        self.retention[kw["Key"]] = kw["Retention"]
+        return {}
 
     def get_object(self, **kw: Any) -> dict[str, Any]:
         if kw["Key"] not in self.objects:
