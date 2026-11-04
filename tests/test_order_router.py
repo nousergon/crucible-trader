@@ -591,9 +591,20 @@ def _plan(
     )
 
 
-def test_an_order_over_the_per_order_cap_refuses_the_whole_plan() -> None:
-    with pytest.raises(RiskCapExceededError, match="per-order cap"):
-        _plan(_book(), order_cap=20_000.0)
+def test_an_order_over_the_per_order_cap_is_clipped_to_the_cap(capsys) -> None:
+    sells, buys = _plan(_book(), order_cap=20_000.0)
+    quantities = {order.decision.symbol: order.decision.quantity for order in buys}
+    assert sells == () and quantities == {"AAA": 200, "BBB": 400}
+    assert "AAA 300 shares at 100.0 is $30,000.00, over the per-order cap" in (
+        capsys.readouterr().err
+    )
+
+
+def test_a_sell_over_the_cap_is_clipped_and_a_cap_below_one_share_skips_the_name() -> None:
+    sells, buys = _plan(_book({"AAA": 0.0}), positions={"AAA": 300}, order_cap=20_000.0)
+    ((sell,), ()) = (sells, buys)
+    assert sell.decision.side == "sell" and sell.decision.quantity == 200
+    assert _plan(_book({"AAA": 0.3}), order_cap=50.0) == ((), ())
 
 
 def test_a_plan_over_the_per_session_cap_is_refused() -> None:
@@ -644,12 +655,21 @@ def test_an_undeclared_foreign_name_is_still_refused_beside_an_inherited_one() -
 
 
 def test_inherited_sells_count_against_the_caps() -> None:
-    with pytest.raises(RiskCapExceededError, match="ZZZ"):
+    sells, _ = _plan(
+        _book(),
+        positions={"ZZZ": 1_000},
+        quote={**PRICES, "ZZZ": 100.0}.get,
+        inherited=frozenset({"ZZZ"}),
+    )
+    (sell,) = sells
+    assert sell.decision.quantity == 500  # clipped to the $50k per-order cap
+    with pytest.raises(RiskCapExceededError, match="per-session cap"):
         _plan(
             _book(),
             positions={"ZZZ": 1_000},
             quote={**PRICES, "ZZZ": 100.0}.get,
             inherited=frozenset({"ZZZ"}),
+            session_cap=90_000.0,
         )
 
 
