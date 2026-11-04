@@ -38,6 +38,7 @@ from typing import Any, cast
 from crucible.keys import trader_broker_statement_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
+from crucible_trader.benchmark_closes import with_benchmark_closes
 from crucible_trader.broker_statement import statement_from_document
 from crucible_trader.exception_record import PAPER_FUND_TENANT
 from crucible_trader.ledger import ledger_reconciliation_key, load_journals
@@ -52,6 +53,8 @@ from crucible_trader.month_end_close import (
     previous_month,
 )
 from crucible_trader.performance_statement import (
+    FEE_SCHEDULES,
+    SIMULATED_FEE_SCHEDULE,
     benchmark_returns,
     build_statement,
     statement_key,
@@ -60,6 +63,16 @@ from crucible_trader.performance_statement import (
 REBUILD_SCHEMA_VERSION = "month_rebuild.v1"
 REBUILD_METRIC = "month_rebuild"
 _FEE_BILL = "simulated_fee_bill"
+
+
+def _schedule_named_by(published: Mapping[str, object]) -> Mapping[str, object]:
+    """The registered schedule the published bill names, so a bill filed before
+    a schedule change still rebuilds under its own terms. An unknown or absent
+    id rebuilds under today's schedule, and the bill's ``schedule`` then differs:
+    a bill naming terms nobody registered is a break, never a match."""
+    bill = cast("Mapping[str, object]", published.get(_FEE_BILL) or {})
+    named = cast("Mapping[str, object]", bill.get("schedule") or {})
+    return FEE_SCHEDULES.get(str(named.get("schedule_id")), SIMULATED_FEE_SCHEDULE)
 
 
 def rebuild_key(tenant: str, month: str) -> str:
@@ -129,8 +142,11 @@ def rebuild_month(
             close,
             _read_json(store, statement_key(tenant, previous_month(month))),
             benchmark_returns(
-                closes, str(close["start_trading_day"]), str(close["last_trading_day"])
+                with_benchmark_closes(store, closes),
+                str(close["start_trading_day"]),
+                str(close["last_trading_day"]),
             ),
+            _schedule_named_by(published_statement),
         )
     except Exception as exc:  # noqa: BLE001 - a statement that no longer builds is the break
         why = f"does not rebuild: {type(exc).__name__}: {exc}"[:300]

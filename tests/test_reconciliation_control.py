@@ -58,7 +58,7 @@ class TestTheRealReconcilerPasses:
     def test_clean_live_book(self):
         verdict = run_control_arm(live_inputs())
         assert verdict.passed, verdict.reason()
-        assert verdict.n_detected == 3
+        assert verdict.n_detected == 4
         assert [o.plant.klass for o in verdict.outcomes] == list(PLANT_CLASSES)
 
     def test_dirty_live_book_still_detects_every_plant(self):
@@ -131,7 +131,14 @@ class TestABlindedReconcilerVoidsTheCycle:
             (lambda d: d.klass == "share_delta", ("share_delta",)),
             (lambda d: d.klass == "corporate_action", ("corporate_action",)),
             (lambda d: True, PLANT_CLASSES),  # v1's shape: never negative
-            (lambda d: d.instrument.startswith(PLANT_PREFIX), ("share_delta", "corporate_action")),
+            (
+                lambda d: d.klass == "corporate_action_source_mismatch",
+                ("corporate_action_source_mismatch",),
+            ),
+            (
+                lambda d: d.instrument.startswith(PLANT_PREFIX),
+                ("share_delta", "corporate_action", "corporate_action_source_mismatch"),
+            ),
         ],
     )
     def test_missed_class_is_named(self, blinding, missed):
@@ -170,7 +177,28 @@ class TestABlindedReconcilerVoidsTheCycle:
         verdict = run_control_arm(
             live_inputs(broker=real_break), reconciler=drops_real_when_planted
         )
-        assert verdict.missed == ("share_delta", "corporate_action")
+        assert verdict.missed == (
+            "share_delta",
+            "corporate_action",
+            "corporate_action_source_mismatch",
+        )
+
+    def test_a_source_mismatch_reported_as_a_plain_share_delta_is_missed(self):
+        def as_share_delta(inputs):
+            result = reconcile(inputs)
+            return dataclasses.replace(
+                result,
+                discrepancies=tuple(
+                    dataclasses.replace(d, klass="share_delta")
+                    if d.klass == "corporate_action_source_mismatch"
+                    else d
+                    for d in result.discrepancies
+                ),
+            )
+
+        assert run_control_arm(live_inputs(), reconciler=as_share_delta).missed == (
+            "corporate_action_source_mismatch",
+        )
 
     def test_wrong_delta_is_not_detection(self):
         def off_by_one(inputs):
