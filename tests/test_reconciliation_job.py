@@ -38,6 +38,7 @@ from crucible_trader.reconciliation_job import (
     EXCEPTION_RECORDS_METRIC,
     EXCEPTION_SCORE_METRIC,
     RECONCILE_JOB,
+    ExceptionFilingError,
     ReconciliationDiscrepancyError,
     latest_anchor,
     previous_trading_day,
@@ -692,6 +693,32 @@ class TestCashTiers:
         assert unpaged["value"] == pytest.approx(0.40)
         for metric in ctx.metrics:
             MetricRecordRow.model_validate(metric)
+
+    def test_a_low_band_gap_that_could_not_be_filed_pages(self, store):
+        """codex 185d9463: the queue is an unpaged gap's only record, so a gap
+        whose record was not written fails the run instead of succeeding."""
+        put_anchor(store, day="2026-11-03")
+        ctx = ctx_for(store, day=self.NOV)
+        ctx.store = _NoExceptionWrites(store)
+        with pytest.raises(ExceptionFilingError, match="in no queue") as raised:
+            reconcile_cycle(
+                ctx,
+                source=FixedSource({"AAA": 12}, 800.40),
+                fills=(Fill("AAA", 2, -200.0),),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+            )
+        assert "cash_delta" in str(raised.value) and "NOT filed" in str(raised.value)
+        assert isinstance(raised.value, ReconciliationDiscrepancyError)
+        # Every later step still ran: the reconciliation and the ledger are written.
+        written = [o["key"] for o in ctx.outputs]
+        assert reconciliation_key(self.NOV.isoformat()) in written
+        assert not store.exists(exceptions_key(self.NOV.isoformat()))
+
+    def test_a_filed_low_band_gap_still_succeeds(self, store):
+        ctx, result = self.run(store, 800.40)
+        assert not result.clean
+        assert {m["status"] for m in ctx.metrics if m["name"] == EXCEPTION_RECORDS_METRIC} == {"OK"}
 
     def test_exactly_one_dollar_does_not_page_and_a_cent_more_does(self, store, tmp_path):
         self.run(store, 801.00)

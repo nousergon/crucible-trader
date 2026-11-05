@@ -65,9 +65,10 @@ the harness's single manifest writer files `runs/trader.reconcile/{day}/run.json
    raises;
 6. raise :class:`ReconciliationVoidError` when a plant was missed, else
    :class:`ReconciliationDiscrepancyError` when any finding PAGES (see
-   :func:`paging_decision`). Either makes the manifest `status: failed`, which
-   is the page condition (§4.6), and the reason names every finding's
-   instrument, delta and side.
+   :func:`paging_decision`), else :class:`ExceptionFilingError` when an
+   unpaged break could not be filed in step 5b and so would sit in no queue.
+   Each makes the manifest `status: failed`, which is the page condition
+   (§4.6), and the reason names every finding's instrument, delta and side.
 
 **Cash tiers** (Brian, 2026-11-02, AI House thread; extends the 5-cent band of
 crucible-trader#66). A cash gap of 5 cents or less never becomes a finding: the
@@ -270,6 +271,12 @@ class ReconciliationDiscrepancyError(RuntimeError):
     """The broker disagrees with the expected book. A page, by manifest status."""
 
 
+class ExceptionFilingError(ReconciliationDiscrepancyError):
+    """A break that does not page on its own could not be filed as an
+    `exception.v1` record, so it would sit in no queue. A page, by manifest
+    status: the run's only remaining record of the break is the page."""
+
+
 def previous_trading_day(day: dt.date) -> dt.date:
     """The session before ``day`` on the NYSE calendar the harness uses."""
     candidate = day - dt.timedelta(days=1)
@@ -444,7 +451,22 @@ def reconcile_cycle(
         raise ReconciliationVoidError(verdict.reason())
     if decision.pages:
         raise ReconciliationDiscrepancyError(f"{page_text(result)} [{decision.reason}]")
+    if (unfiled := _unfiled_breaks(ctx)) is not None:
+        # An unpaged break rides only in the queue; with the queue's record
+        # unwritten it is in no queue and on no page (codex 185d9463).
+        raise ExceptionFilingError(
+            f"{page_text(result)} [{decision.reason}; but {unfiled}, so it is in no queue]"
+        )
     return result
+
+
+def _unfiled_breaks(ctx: RunContext) -> str | None:
+    """Step 5b's FAIL reason when it found breaks and could not file them,
+    else ``None``. Read from the metric 5b recorded, so 5b still never raises."""
+    for metric in ctx.metrics:
+        if metric.get("name") == EXCEPTION_RECORDS_METRIC and metric.get("status") == "FAIL":
+            return str(metric.get("status_reason"))
+    return None
 
 
 def ledger_leg(store: Store, day: str, account: str) -> tuple[dict[str, int] | None, str]:
@@ -565,6 +587,9 @@ def file_exception_records(
     because the alternative is worse: a raise here would replace step 6's page
     (whose reason names every finding) with a storage error, or fail a run the
     detectors passed. The page is the control; this record rides beside it.
+    Where the break does NOT page, the record is its only trace, so step 6
+    reads that FAIL metric and fails the run with :class:`ExceptionFilingError`
+    after every other step has run (codex 185d9463).
 
     Returns the day document it filed, for step 5c, or ``None`` when it filed
     nothing (a clean day, or a failure).

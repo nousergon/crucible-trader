@@ -19,7 +19,13 @@ from crucible.store import LocalStore, open_store
 from crucible_trader import back_office_dry_run
 from crucible_trader.back_office_dry_run import dry_run, load_fills, main
 from crucible_trader.broker_statement import BrokerStatement
-from crucible_trader.exception_decision import load_proposals
+from crucible_trader.exception_decision import (
+    decide,
+    load_decisions,
+    load_proposals,
+    record_decision,
+    score,
+)
 from crucible_trader.exception_proposal import close_proposals_key, exception_proposals_key
 from crucible_trader.exception_record import PAPER_FUND_TENANT
 from crucible_trader.ledger import journal_key
@@ -108,6 +114,62 @@ class TestDryRun:
         queued = load_proposals(LocalStore(out / "store"))
         assert len(queued) == summary["score_totals"]["proposals"] > 0
         assert "2026-09:" in capsys.readouterr().err
+
+    def test_the_out_tree_carries_the_review_evidence_the_score_read(self, root, tmp_path):
+        """codex 00e291d3: the score reads proposals and decisions the store
+        already held, so the exported tree must hold them too, or a re-score
+        from it differs from the summary's."""
+        first = tmp_path / "first"
+        assert (
+            main(["--store", str(root), "--month", "2026-09", "--out", str(first), "--now", NOW])
+            == 0
+        )
+        # The store already holds an earlier filing of a proposal and a
+        # reviewer's decision on it, as the live store does once review starts.
+        earlier = exception_proposals_key("2026-08-31")
+        (root / earlier).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(first / "store" / exception_proposals_key(BROKEN), root / earlier)
+        proposal = load_proposals(LocalStore(first / "store"))[0]
+        decided = record_decision(
+            LocalStore(root),
+            decide(proposal, verdict="agree", decided_by="brian", decided_at=NOW),
+        )
+
+        out = tmp_path / "out"
+        assert (
+            main(["--store", str(root), "--month", "2026-09", "--out", str(out), "--now", NOW]) == 0
+        )
+        summary = json.loads((out / "summary.json").read_text())
+        assert summary["review_evidence_keys"] == sorted([earlier, decided])
+        assert summary["score_totals"]["agree"] == 1
+        tree = LocalStore(out / "store")
+        assert (out / "store" / decided).is_file() and (out / "store" / earlier).is_file()
+        rescored = score(
+            load_proposals(tree, until=summary["close_run_day"]),
+            load_decisions(tree),
+            as_of=summary["close_run_day"],
+            generated_at=NOW,
+        )
+        assert rescored["totals"] == summary["score_totals"]
+
+    def test_review_evidence_skips_what_the_run_wrote_and_what_the_score_did_not_read(self, root):
+        store = LocalStore(root)
+        for key in (
+            exception_proposals_key("2026-09-09"),
+            exception_proposals_key("2026-10-02"),
+            "trader/exception_proposals/notes.txt",
+            "trader/exception_decisions/2026-09-09/readme.txt",
+        ):
+            store.put_bytes(key, b"{}")
+        assert back_office_dry_run.review_evidence_keys(
+            store, until="2026-10-01", written=[exception_proposals_key("2026-09-10")]
+        ) == [exception_proposals_key("2026-09-09")]
+        assert (
+            back_office_dry_run.review_evidence_keys(
+                store, until="2026-10-01", written=[exception_proposals_key("2026-09-09")]
+            )
+            == []
+        )
 
     def test_a_day_that_cannot_export_is_listed_and_the_run_goes_on(self, root):
         (root / "runs" / "trader.reconcile" / LATER / "run.json").unlink()
