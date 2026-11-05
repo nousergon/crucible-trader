@@ -100,7 +100,7 @@ from typing import Any, cast
 from crucible.calendar import is_trading_day
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext, run_job
-from crucible.store import Store
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
 from crucible_trader.benchmark_closes import capture_benchmark_closes
 from crucible_trader.books_retention import lock_cycle_books
@@ -731,13 +731,23 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
         )
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         ctx.record_output(key, payload, SCORE_SCHEMA_VERSION)
-        current: dict[str, object] = (
-            json.loads(ctx.store.get_bytes(SCORE_CURRENT_KEY).decode("utf-8"))
-            if ctx.store.exists(SCORE_CURRENT_KEY)
-            else {}
-        )
-        if str(current.get("trading_day", "")) <= day:
-            ctx.record_output(SCORE_CURRENT_KEY, payload, SCORE_SCHEMA_VERSION)
+        # Compare-and-swap, re-reading on a lost race: a read-then-write let
+        # an earlier day's rerun overwrite a later day's score published
+        # between the two (codex 458b09f0e5dafeb6).
+        for _ in range(3):
+            version = ctx.store.etag(SCORE_CURRENT_KEY)
+            current: dict[str, object] = (
+                json.loads(ctx.store.get_bytes(SCORE_CURRENT_KEY).decode("utf-8"))
+                if version != ETAG_ABSENT
+                else {}
+            )
+            if str(current.get("trading_day", "")) > day:
+                break
+            try:
+                ctx.record_output_cas(SCORE_CURRENT_KEY, version, payload, SCORE_SCHEMA_VERSION)
+                break
+            except PointerConflictError:
+                continue
         totals = cast("Mapping[str, object]", document["totals"])
         overdue = cast("int", totals["overdue"])
         status, value = ("WATCH" if overdue else "OK"), float(cast("int", totals["queue"]))

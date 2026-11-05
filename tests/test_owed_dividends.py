@@ -58,6 +58,22 @@ def run(broker_cash, owed=(), day=DAY, actions=(), resolved=("AAA",)):
     return inputs, reconcile(inputs)
 
 
+def test_a_genesis_day_keeps_its_declared_owed_dividends_outstanding():
+    # codex 621a3efb97c2c2e2: with no anchor the result dropped them to [].
+    inputs = ReconciliationInputs(
+        trading_day=DAY,
+        broker=BrokerStatement("DU1", DAY, {"AAA": 10}, 1_000.0),
+        anchor=None,
+        corporate_actions=CorporateActionSet(frozenset({"AAA"}), ()),
+        previous_trading_day=PREV,
+        genesis=True,
+        owed_dividends=(MU, SPY),
+    )
+    result = reconcile(inputs)
+    assert result.dividends_owed == (MU, SPY)
+    assert {r["ticker"] for r in result.to_document()["dividends_owed"]} == {"MU", "SPY"}
+
+
 class TestLateCredit:
     def test_a_credit_equal_to_what_was_owed_is_explained(self):
         _, result = run(1_000.0 + 11.85 + 18.89, owed=(MU, SPY))
