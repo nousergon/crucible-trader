@@ -87,6 +87,7 @@ from crucible_trader.ledger import (
     INTEREST_FIRST_RECORDED,
     INTEREST_INCOME,
     INTEREST_RECEIVABLE,
+    LEDGER_JOURNAL_PREFIX,
     OPENING,
     RECEIVABLE,
     RECONCILIATION_ADJUSTMENTS,
@@ -548,6 +549,25 @@ def _read_json(store: Store, key: str) -> dict[str, Any] | None:  # pyright: ign
     return cast("dict[str, Any]", json.loads(store.get_bytes(key).decode("utf-8")))  # pyright: ignore[reportExplicitAny]
 
 
+def _month_to_close(store: Store, tenant: str, day: str) -> str:
+    """The oldest month before ``day``'s that has journals and no finished
+    close, else the month before ``day``'s. Months close in order, so a month
+    still refused when the calendar moves on is retried before the next one
+    (codex 9270d56e) instead of the next one refusing on it forever."""
+    prefix = f"{LEDGER_JOURNAL_PREFIX}{tenant}/"
+    months = sorted(
+        {
+            k[len(prefix) : len(prefix) + 7]
+            for k in store.list_keys(prefix)
+            if k.endswith(".json") and k[len(prefix) : len(prefix) + 7] < day[:7]
+        }
+    )
+    for candidate in months:
+        if not store.exists(close_key(tenant, candidate)):
+            return candidate
+    return previous_month(day[:7])
+
+
 def close_prior_month(
     ctx: Any,  # pyright: ignore[reportExplicitAny]  # crucible.runner.RunContext
     *,
@@ -558,14 +578,15 @@ def close_prior_month(
     closes: CloseSource | None = None,
     after_close: Callable[[Mapping[str, object]], object] | None = None,
 ) -> dict[str, object] | None:
-    """Step 5f of `trader.reconcile`: close the month before ``day``'s month
-    when it is not closed yet, then hand the finished close to ``after_close``
+    """Step 5f of `trader.reconcile`: close the oldest unclosed month before
+    ``day``'s month (normally the month before it), then hand the finished close to ``after_close``
     (1f's statement). NEVER raises; returns the close document, or ``None``
     when there was nothing to do or it failed."""
     month = previous_month(day[:7])
     key = None
     try:
         store = ctx.store
+        month = _month_to_close(store, tenant, day)
         key = close_key(tenant, month)
         finished = _read_json(store, key)
         if finished is None:

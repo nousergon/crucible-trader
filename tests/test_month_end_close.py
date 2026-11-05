@@ -53,7 +53,12 @@ from crucible_trader.month_end_close import (
     panel_close_source,
     previous_month,
 )
-from crucible_trader.month_rebuild import REBUILD_METRIC, rebuild_key, verify_month_rebuild
+from crucible_trader.month_rebuild import (
+    REBUILD_METRIC,
+    _compare,  # pyright: ignore[reportPrivateUsage]
+    rebuild_key,
+    verify_month_rebuild,
+)
 from crucible_trader.performance_statement import (
     FEE_SCHEDULES,
     SIMULATED_FEE_SCHEDULE,
@@ -497,11 +502,32 @@ class TestClose:
         assert "proposals NOT filed (ValueError: proposer down)" in ctx.metrics[0]["status_reason"]
         assert load_proposals(store) == []
 
-    def test_a_month_before_an_unclosed_month_is_refused_and_nothing_raises(self, store):
-        november(store)
-        ctx, out = run(store, "2027-01-04")  # December's close, with November open
-        assert out is None and ctx.metrics[0]["status"] == "FAIL"
-        assert "close in order" in ctx.metrics[0]["status_reason"]
+    def test_the_oldest_unclosed_month_is_retried_before_advancing(self, store):
+        # codex 9270d56e: November refused on 12-01 used to stay open forever,
+        # because 2027-01-04 only ever attempted December (and refused on November).
+        november(store, ib_cash_end=946.5)
+        _, refused = run(store)
+        assert refused is not None and refused["status"] == "refused"
+        ctx, out = run(store, "2027-01-04")
+        assert out is not None and out["month"] == "2026-11"
+        assert "2026-11 close" in ctx.metrics[0]["status_reason"]
+
+    def test_a_month_before_an_unclosed_month_is_refused_and_nothing_raises(self):
+        with pytest.raises(CloseError, match="close in order"):
+            close_month(
+                CloseInputs(
+                    tenant=T,
+                    account="DU1",
+                    month="2026-12",
+                    run_day="2027-01-04",
+                    journals={"2026-11-25": ()},
+                    statement=None,
+                    view=None,
+                    prior=None,
+                    closes=closes,
+                    detected_at=NOW,
+                )
+            )
 
     def test_an_empty_ledger_has_nothing_to_close(self, store):
         ctx, out = run(store)
@@ -852,3 +878,13 @@ class TestRebuildFromRaw:
         assert verify_month_rebuild(ctx, day="2026-12-02", account="DU1", now=NOW) is None
         assert ctx.metrics[0]["status"] == "FAIL"
         assert "rebuild NOT run" in ctx.metrics[0]["status_reason"]
+
+
+def test_a_missing_field_does_not_match_an_explicit_null():
+    # codex 165efe5b: {} and {"x": None} used to compare equal.
+    assert _compare("k", {"a": 1}, {"a": 1, "x": None}) == {
+        "key": "k",
+        "matches": False,
+        "differs": ["x"],
+    }
+    assert _compare("k", {"a": None}, {"a": None})["matches"] is True

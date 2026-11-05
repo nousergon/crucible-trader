@@ -83,7 +83,11 @@ from crucible_trader.ledger import post_daily_ledger
 from crucible_trader.month_end_close import CloseSource, close_prior_month, month_trading_days
 from crucible_trader.performance_statement import file_statement
 from crucible_trader.reconciliation import CorporateActionSet, Fill
-from crucible_trader.reconciliation_job import RECONCILE_JOB, RECONCILIATION_PREFIX
+from crucible_trader.reconciliation_job import (
+    RECONCILE_JOB,
+    RECONCILIATION_PREFIX,
+    latest_anchor,
+)
 
 __all__ = ["dry_run", "load_fills", "main"]
 
@@ -193,9 +197,13 @@ def dry_run(
     # fill since that statement: a fill on a day with no reconciliation (or on
     # a day whose posting failed) is booked on the next posted day, not lost
     # into suspense (`alpha-engine-config-I13124`).
+    # The first stored day opens against the newest statement before it, as the
+    # job would (codex 36dcff7b); without one it opens from its own statement.
     ledger: list[dict[str, object]] = []
     anchor: BrokerStatement | None = None
     anchor_day: str | None = None
+    if (prior := latest_anchor(store, stored[0])) is not None:
+        anchor, anchor_day = prior[2], prior[2].trading_day
     booked_on: dict[str, str] = {}
     for day in stored:
         ctx = _ctx(store, day, now)
@@ -206,7 +214,6 @@ def dry_run(
         span = sorted(
             d for d in fills if d == day or (anchor_day is not None and anchor_day < d < day)
         )
-        booked_on.update({d: day for d in span if d != day})
         posting = post_daily_ledger(
             ctx,
             broker=broker,
@@ -222,6 +229,8 @@ def dry_run(
             for m in cast("list[dict[str, object]]", ctx.metrics)
         )
         if posting is not None:
+            # A carried fill is reported booked only once its posting succeeded (codex d8b42301).
+            booked_on.update({d: day for d in span if d != day})
             anchor, anchor_day = broker, day
 
     # 4: close the month as the next month's first run would.

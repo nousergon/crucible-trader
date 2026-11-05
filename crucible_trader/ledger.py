@@ -966,6 +966,16 @@ def load_journals(store: Store, tenant: str, *, before: str) -> dict[str, tuple[
     return journals
 
 
+def _later_journal_days(store: Store, tenant: str, day: str) -> list[str]:
+    """Stored journal days of ``tenant`` dated after ``day``, ascending."""
+    prefix = f"{LEDGER_JOURNAL_PREFIX}{tenant}/"
+    return sorted(
+        d
+        for k in store.list_keys(prefix)
+        if k.endswith(".json") and (d := k[len(prefix) : -len(".json")]) > day
+    )
+
+
 def ledger_from(journals: Mapping[str, Sequence[Entry]]) -> Ledger:
     """Replay ``journals`` in day order into a new ledger."""
     ledger = Ledger()
@@ -1009,6 +1019,11 @@ def post_daily_ledger(
                 "open month"
             )
         journals = load_journals(ctx.store, tenant, before=day)
+        if not ctx.store.exists(key) and (later := _later_journal_days(ctx.store, tenant, day)):
+            raise LedgerError(
+                f"journals after {day} already exist ({later[0]}); a day is never inserted "
+                "behind a later journal -- post a correction instead"
+            )
         ledger = ledger_from(journals)
         decisions, unreadable = _read_decisions(ctx.store)
         opening = _opening_statement(ctx.store, journals, tenant, broker.account)

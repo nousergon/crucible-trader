@@ -550,6 +550,24 @@ class TestRefusals:
         assert [e.kind for e in posting.entries] == ["opening_balance"]
 
 
+def test_a_day_is_not_inserted_behind_a_later_journal(store):
+    # codex 4249835a: posting PREV after DAY used to book a second
+    # opening_balance, and the replay double-counted the account.
+    post(store, stmt(DAY, {"AAA": 10}, 1_000.0), None)
+    ctx, result = post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+    assert result is None
+    assert not store.exists(journal_key(T, PREV))
+    assert [m["status"] for m in ctx.metrics] == ["FAIL"]
+    assert "journals after 2026-11-02 already exist" in str(ctx.metrics[0])
+
+
+def test_rerunning_an_already_written_day_behind_a_later_journal_still_succeeds(store):
+    post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+    post(store, stmt(DAY, {"AAA": 10}, 1_000.0), stmt(PREV, {"AAA": 10}, 1_000.0))
+    _, result = post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+    assert result is not None
+
+
 def test_a_journal_of_another_schema_is_refused(store):
     store.put_bytes(journal_key(T, DAY), json.dumps({"schema_version": "x"}).encode())
     with pytest.raises(LedgerError, match="journal 2026-11-03"):
