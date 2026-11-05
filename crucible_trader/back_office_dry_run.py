@@ -38,7 +38,9 @@ NOTHING it does reaches the store:
 (`crucible.store.capturing`): every write is recorded in memory and served
 back to the run's own reads, and the capturing store has no code path to the
 backend's write. At the end every captured object is copied to
-``OUT/store/<key>``, a local store tree, and ``OUT/summary.json`` says what
+``OUT/store/<key>``, a local store tree, with the proposals and decisions the
+store already held that step 5 scored (``review_evidence_keys``), so a re-score
+from the tree matches ``score_totals``; ``OUT/summary.json`` says what
 happened. Reviewer decisions can then be recorded against that tree without
 touching S3 and the score rebuilt from it:
 
@@ -56,7 +58,7 @@ import json
 import pathlib
 import sys
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, cast
 
 from crucible.calendar import is_trading_day
@@ -72,9 +74,15 @@ from crucible.store import (
 )
 
 from crucible_trader.broker_statement import BrokerStatement, statement_from_document
-from crucible_trader.exception_decision import load_decisions, load_proposals, score
+from crucible_trader.exception_decision import (
+    DECISIONS_PREFIX,
+    load_decisions,
+    load_proposals,
+    score,
+)
 from crucible_trader.exception_export import export_exceptions
 from crucible_trader.exception_proposal import (
+    PROPOSALS_PREFIX,
     exception_proposals_key,
     proposal_day_document,
     propose,
@@ -282,14 +290,39 @@ def dry_run(
         ],
         "score_totals": queue["totals"],
         "keys_written": sorted(capture.keys),
+        "review_evidence_keys": review_evidence_keys(store, until=run_day, written=capture.keys),
     }
 
 
+def review_evidence_keys(store: Store, *, until: str, written: Iterable[str]) -> list[str]:
+    """The stored proposal and decision files step 5 scored that this run did
+    not write itself: the review evidence the store already held.
+
+    The score reads every proposal filed up to ``until`` and every decision in
+    the store, not only the captured writes, so ``OUT/store`` must carry them
+    too or a re-score from it differs from ``score_totals`` (codex
+    00e291d3b6264e77). Same selection as
+    :func:`~crucible_trader.exception_decision.load_proposals` and
+    :func:`~crucible_trader.exception_decision.load_decisions`.
+    """
+    own = set(written)
+    proposals = [
+        key
+        for key in store.list_keys(PROPOSALS_PREFIX)
+        if key.endswith(".json") and key.removesuffix(".json").rsplit("/", 1)[-1] <= until
+    ]
+    decisions = [key for key in store.list_keys(DECISIONS_PREFIX) if key.endswith(".json")]
+    return sorted(set(proposals + decisions) - own)
+
+
 def write_out(store: Store, summary: Mapping[str, object], out: pathlib.Path) -> None:
-    """Copy every captured object to ``out/store/<key>`` and write the summary
-    and the score beside it."""
+    """Copy every captured object, and the review evidence the score read from
+    the store, to ``out/store/<key>`` and write the summary beside it."""
     tree = out / "store"
-    for key in cast("list[str]", summary["keys_written"]):
+    keys = cast("list[str]", summary["keys_written"]) + cast(
+        "list[str]", summary["review_evidence_keys"]
+    )
+    for key in keys:
         path = tree / key
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(store.get_bytes(key))
