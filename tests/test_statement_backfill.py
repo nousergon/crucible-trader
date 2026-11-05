@@ -1,0 +1,295 @@
+"""Backfill one missing reconcile day from an IB activity statement
+(alpha-engine-config-I13232): the statement parsed strictly, the real reconcile
+run against a capturing view, and a create-only, window-guarded apply."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import pathlib
+import re
+import runpy
+import sys
+
+import pytest
+from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
+from crucible.store import LocalStore
+
+from crucible_trader import statement_backfill
+from crucible_trader.broker_statement import BrokerStatement, BrokerStatementError
+from crucible_trader.ledger import journal_key
+from crucible_trader.reconciliation import CorporateActionSet, Fill
+from crucible_trader.statement_backfill import (
+    BackfillRefused,
+    FiledStatementSource,
+    apply_writes,
+    backfill_day,
+    main,
+    parse_activity_statement,
+)
+
+ANCHOR, DAY = "2026-09-08", "2026-09-09"
+#: Sunday 2026-11-08 02:00Z: outside the window. Monday 15:00Z is 10:00 ET, inside.
+OUTSIDE = dt.datetime(2026, 11, 8, 2, 0, tzinfo=dt.UTC)
+INSIDE = dt.datetime(2026, 11, 9, 15, 0, tzinfo=dt.UTC)
+CA = CorporateActionSet(frozenset({"AAA", "BBB"}))
+
+
+@pytest.fixture(autouse=True)
+def _code_sha(monkeypatch):
+    monkeypatch.setenv("CRUCIBLE_CODE_SHA", "0123456789abcdef0123456789abcdef01234567")
+
+
+def csv_text(
+    *,
+    period: str = "September 9, 2026",
+    account: str = "DU1234567",
+    positions: tuple[tuple[str, str, str], ...] = (("AAA", "USD", "10"),),
+    cash: tuple[tuple[str, str], ...] = (("Base Currency Summary", "1000"), ("USD", "1000")),
+    extra: str = "",
+) -> str:
+    lines = [
+        "Statement,Header,Field Name,Field Value",
+        "Statement,Data,BrokerName,Interactive Brokers LLC",
+        f'Statement,Data,Period,"{period}"',
+        "Account Information,Header,Field Name,Field Value",
+        f"Account Information,Data,Account,{account}",
+        "Account Information,Data,Base Currency,USD",
+        "Cash Report,Header,Currency Summary,Currency,Total,Securities,Futures",
+    ]
+    for currency, total in cash:
+        lines.append(f'Cash Report,Data,Starting Cash,{currency},"{total}",{total},0')
+        lines.append(f'Cash Report,Data,Ending Cash,{currency},"{total}",{total},0')
+    lines.append(
+        "Open Positions,Header,DataDiscriminator,Asset Category,Currency,Symbol,Quantity,Mult,"
+        "Cost Price,Close Price,Value"
+    )
+    for symbol, currency, qty in positions:
+        lines.append(f'Open Positions,Data,Summary,Stocks,{currency},{symbol},"{qty}",1,1,1,1')
+        lines.append(f'Open Positions,Data,Lot,Stocks,{currency},{symbol},"{qty}",1,1,1,1')
+    lines.append("Open Positions,Total,,Stocks,USD,,,,,,10")
+    return "\n".join(lines) + "\n" + extra
+
+
+# -- 1. the statement ---------------------------------------------------------------
+
+
+class TestParse:
+    def test_positions_and_ending_cash_become_a_v2_paper_statement(self):
+        st = parse_activity_statement(
+            csv_text(
+                positions=(("AAA", "USD", "1,200"), ("BBB", "USD", "-5")),
+                cash=(("USD", "-1,234.56"),),
+            ),
+            trading_day=DAY,
+        )
+        assert st == BrokerStatement("DU1234567", DAY, {"AAA": 1200, "BBB": -5}, -1234.56)
+        doc = st.to_document()
+        assert doc["schema_version"] == "broker_statement.v2" and doc["source"] == "ib_paper"
+        assert doc["accrued_cash_usd"] is None  # not recorded, never guessed
+
+    def test_a_bom_and_a_re_declared_header_are_read(self):
+        extra = (
+            "Open Positions,Header,DataDiscriminator,Asset Category,Currency,Symbol,Quantity\n"
+            "Open Positions,Data,Summary,Stocks,USD,BBB,3\n"
+        )
+        st = parse_activity_statement("﻿" + csv_text(extra=extra), trading_day=DAY)
+        assert st.positions == {"AAA": 10, "BBB": 3}
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"account": "U1234567"}, "not an IB paper account"),
+            ({"positions": (("AAA", "CAD", "10"),)}, "not USD"),
+            ({"cash": (("USD", "1"), ("EUR", "2"))}, "not USD"),
+            ({"cash": (("Base Currency Summary", "1"),)}, "exactly one USD Ending Cash"),
+            ({"period": "September 10, 2026"}, "not 2026-09-09"),
+            ({"period": "September 1, 2026 - September 9, 2026"}, "not one day"),
+            ({"positions": (("AAA", "USD", "10.5"),)}, "not whole shares"),
+            ({"positions": (("AAA", "USD", "10"), ("AAA", "USD", "2"))}, "appears twice"),
+            ({"positions": (("AAA", "USD", "0"),)}, "is zero"),
+        ],
+    )
+    def test_refuses_anything_that_is_not_one_paper_usd_day(self, kwargs, message):
+        with pytest.raises(BrokerStatementError, match=message):
+            parse_activity_statement(csv_text(**kwargs), trading_day=DAY)
+
+    def test_refuses_a_non_stock_position(self):
+        text = csv_text().replace(
+            "Summary,Stocks,USD,AAA", "Summary,Equity and Index Options,USD,AAA"
+        )
+        with pytest.raises(BrokerStatementError, match="only Stocks"):
+            parse_activity_statement(text, trading_day=DAY)
+
+    def test_the_source_answers_its_one_day_only(self):
+        src = FiledStatementSource(BrokerStatement("DU1", DAY, {}, 1.0))
+        assert src.read_statement(DAY).trading_day == DAY
+        with pytest.raises(BrokerStatementError, match="holds 2026-09-09 only"):
+            src.read_statement(ANCHOR)
+
+
+# -- 2 and 3. the captured cycle and the apply ------------------------------------------
+
+
+@pytest.fixture
+def root(tmp_path) -> pathlib.Path:
+    root = tmp_path / "store"
+    anchor = BrokerStatement("DU1", ANCHOR, {"AAA": 10}, 1_000.0)
+    LocalStore(root).put_bytes(
+        trader_broker_statement_key(ANCHOR), json.dumps(anchor.to_document()).encode()
+    )
+    return root
+
+
+def snapshot(root: pathlib.Path) -> dict[str, bytes]:
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def _statement(held: int = 10, cash: float = 1_000.0) -> BrokerStatement:
+    return BrokerStatement("DU1", DAY, {"AAA": held}, cash)
+
+
+class TestBackfill:
+    def test_the_dry_run_runs_the_real_reconcile_and_writes_nothing(self, root):
+        before = snapshot(root)
+        view, summary = backfill_day(LocalStore(root), _statement(), corporate_actions=CA)
+        assert snapshot(root) == before
+        assert summary["reconcile"] == "ok" and summary["has_reconciliation"]
+        keys = summary["keys_to_write"]
+        for key in (
+            trader_broker_statement_key(DAY),
+            trader_reconciliation_key(DAY),
+            f"runs/trader.reconcile/{DAY}/run.json",
+            journal_key("nous-ergon-paper", DAY),
+        ):
+            assert key in keys, key
+        # the live queue pointer is the latest live run's, never a backfill's
+        assert summary["keys_not_applied"] == ["trader/exception_scores/current.json"]
+        assert not any(k.endswith("/current.json") for k in keys)
+        doc = json.loads(view.get_bytes(trader_reconciliation_key(DAY)))
+        assert doc["discrepancies"] == []
+
+    def test_apply_writes_exactly_the_captured_objects_create_only(self, root):
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        written = apply_writes(backend, view, summary, now=OUTSIDE)
+        assert written == summary["keys_to_write"]
+        for key in written:
+            assert backend.get_bytes(key) == view.get_bytes(key)
+        assert not backend.exists("trader/exception_scores/current.json")
+        # the day is no longer missing, so a second backfill refuses up front
+        with pytest.raises(BackfillRefused, match="not a missing day"):
+            backfill_day(backend, _statement(), corporate_actions=CA)
+
+    def test_apply_refuses_before_the_first_write_if_any_key_exists(self, root):
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        taken = journal_key("nous-ergon-paper", DAY)
+        backend.put_bytes(taken, b"{}")
+        before = snapshot(root)
+        with pytest.raises(BackfillRefused, match="create-only"):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+        assert snapshot(root) == before
+
+    def test_apply_refuses_inside_the_trading_window(self, root):
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        before = snapshot(root)
+        with pytest.raises(BackfillRefused, match="09:00-16:30 ET"):
+            apply_writes(backend, view, summary, now=INSIDE)
+        assert snapshot(root) == before
+
+    def test_a_paging_day_is_reported_not_raised_and_still_applies(self, root):
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(held=11), corporate_actions=CA)
+        assert summary["reconcile"] == "failed"
+        assert "ReconciliationDiscrepancyError" in summary["error"]
+        assert summary["has_reconciliation"]
+        apply_writes(backend, view, summary, now=OUTSIDE)
+        manifest = json.loads(backend.get_bytes(f"runs/trader.reconcile/{DAY}/run.json"))
+        assert manifest["status"] == "failed" and manifest["run_mode"] == "replay"
+
+    def test_fills_reach_the_reconciler(self, root):
+        _, summary = backfill_day(
+            LocalStore(root),
+            _statement(held=12, cash=980.0),
+            fills=[Fill("AAA", 2, -20.0)],
+            corporate_actions=CA,
+        )
+        assert summary["reconcile"] == "ok" and summary["fills"] == 1
+
+    def test_a_cycle_that_wrote_no_reconciliation_applies_nothing(self, root):
+        def boom(*_a, **_k):
+            raise RuntimeError("broker unreadable")
+
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA, runner=boom)
+        assert summary["reconcile"] == "failed" and not summary["has_reconciliation"]
+        with pytest.raises(BackfillRefused, match="no reconciliation"):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+
+
+class TestCli:
+    def _args(self, root, tmp_path, *extra, text=None):
+        path = tmp_path / "stmt.csv"
+        path.write_text(text or csv_text(account="DU1"), encoding="utf-8")
+        return ["--store", str(root), "--day", DAY, "--statement", str(path), *extra]
+
+    def test_dry_run_by_default(self, root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        before = snapshot(root)
+        assert main(self._args(root, tmp_path)) == 0
+        assert snapshot(root) == before
+        out = json.loads(capsys.readouterr().out)
+        assert out["mode"] == "dry-run" and "written" not in out
+
+    def test_apply_writes_outside_the_window(self, root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        assert main(self._args(root, tmp_path, "--apply"), clock=lambda: OUTSIDE) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["written"] and LocalStore(root).exists(trader_reconciliation_key(DAY))
+
+    def test_a_bad_statement_is_a_no_go(self, root, tmp_path, capsys):
+        assert main(self._args(root, tmp_path, text=csv_text(account="U9"))) == 1
+        assert "NO-GO" in capsys.readouterr().err
+
+
+def test_nothing_on_the_trading_path_imports_the_backfill():
+    """Failure isolation: an operator command, never reachable from the trader."""
+    pkg = pathlib.Path(statement_backfill.__file__).parent
+    for path in pkg.glob("*.py"):
+        if path.name == "statement_backfill.py":
+            continue
+        assert not re.search(r"\bstatement_backfill\b", path.read_text(encoding="utf-8")), path.name
+
+
+class TestEdges:
+    @pytest.mark.parametrize(
+        ("text", "message"),
+        [
+            ("Notes\nX,Data,Field Name,Field Value\n", "Data row before its Header"),
+            (csv_text().replace("Account Information,Data,Account,DU1234567\n", ""), "'Account'"),
+            (csv_text().replace("Base Currency,USD", "Base Currency,EUR"), "base currency"),
+            (csv_text(positions=(("AAA", "USD", "ten"),)), "not a number"),
+        ],
+    )
+    def test_unreadable_statements_are_refused(self, text, message):
+        with pytest.raises(BrokerStatementError, match=message):
+            parse_activity_statement(text, trading_day=DAY)
+
+    def test_an_object_lock_write_cannot_be_replayed(self, root):
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        summary["locked_writes"] = ["trader/x.json"]
+        with pytest.raises(BackfillRefused, match="Object Lock"):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+
+    def test_module_entry_point(self, root, tmp_path, monkeypatch):
+        path = tmp_path / "stmt.csv"
+        path.write_text(csv_text(account="U9"), encoding="utf-8")
+        args = ["x", "--store", str(root), "--day", DAY, "--statement", str(path)]
+        monkeypatch.setattr(sys, "argv", args)
+        sys.modules.pop("crucible_trader.statement_backfill", None)
+        with pytest.raises(SystemExit) as exited:
+            runpy.run_module("crucible_trader.statement_backfill", run_name="__main__")
+        assert exited.value.code == 1
