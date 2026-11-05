@@ -13,6 +13,7 @@ from crucible_trader.order_intent import (
     ORDER_INTENT_SCHEMA_VERSION,
     OrderIntentConflictError,
     OrderIntentError,
+    bought_by_this_trader,
     claim_order_intent,
     order_intent_document,
     order_intent_key,
@@ -126,3 +127,68 @@ def test_a_document_missing_a_field_is_never_written(store) -> None:
     with pytest.raises(OrderIntentError):
         claim_order_intent(store, doc)
     assert read_order_intent(store, DAY, "AAA") is None
+
+
+# -- which held names this trader bought itself (alpha-engine-config-I13164) --------
+
+
+def _claim(store, day: str, symbol: str, side: str = "buy", account: str = "DU1") -> None:
+    claim_order_intent(
+        store,
+        _doc(
+            order_key=f"crucible-trader|{day}|{symbol}",
+            order_ref=f"crucible-trader|{day}|{symbol}|{side}|10|10.0|2026-09-08T13:30:00.000000Z",
+            trading_day=day,
+            symbol=symbol,
+            side=side,
+            account=account,
+        ),
+    )
+
+
+def test_a_name_whose_latest_intent_is_a_buy_is_owned(store) -> None:
+    _claim(store, "2026-09-03", "SNDK")
+    _claim(store, "2026-09-03", "PLTR")
+    owned = bought_by_this_trader(store, {"SNDK", "ZZZ"}, account="DU1", before=DAY)
+    assert owned == frozenset({"SNDK"})  # PLTR was not asked about; ZZZ was never bought
+
+
+def test_only_the_latest_intent_before_the_book_day_counts(store) -> None:
+    _claim(store, "2026-09-03", "AAA", side="buy")
+    _claim(store, "2026-09-04", "AAA", side="sell")
+    _claim(store, "2026-09-03", "BBB", side="sell")
+    _claim(store, "2026-09-04", "BBB", side="buy")
+    _claim(store, DAY, "CCC", side="buy")  # the book day itself is not "before" it
+    owned = bought_by_this_trader(store, {"AAA", "BBB", "CCC"}, account="DU1", before=DAY)
+    assert owned == frozenset({"BBB"})
+
+
+def test_a_buy_for_another_account_is_not_ownership(store) -> None:
+    _claim(store, "2026-09-03", "AAA", account="DU2")
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+def test_nothing_asked_reads_nothing(store) -> None:
+    store.put_bytes("trader/order_intents/garbage", b"x")  # never listed
+    assert bought_by_this_trader(store, set(), account="DU1", before=DAY) == frozenset()
+
+
+def test_an_unreadable_intent_for_a_wanted_name_is_refused_not_skipped(store) -> None:
+    store.put_bytes(order_intent_key("2026-09-03", "AAA"), b"not json")
+    with pytest.raises(OrderIntentError):
+        bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY)
+
+
+def test_a_stray_key_under_the_prefix_is_refused(store) -> None:
+    store.put_bytes("trader/order_intents/2026-09-03/AAA/x.json", b"{}")
+    with pytest.raises(OrderIntentError, match="not an intent key"):
+        bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY)
+
+
+def test_an_intent_listed_then_gone_is_refused_not_read_as_absent(tmp_path) -> None:
+    class ListsAGhost(LocalStore):
+        def list_keys(self, prefix: str = ""):
+            yield order_intent_key("2026-09-03", "AAA")
+
+    with pytest.raises(OrderIntentError, match="vanished"):
+        bought_by_this_trader(ListsAGhost(tmp_path), {"AAA"}, account="DU1", before=DAY)

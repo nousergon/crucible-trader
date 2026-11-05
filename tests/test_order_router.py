@@ -28,7 +28,12 @@ from crucible_trader.kill_switch import (
     TradingHaltedError,
     halt_document,
 )
-from crucible_trader.order_intent import order_intent_key, read_order_intent
+from crucible_trader.order_intent import (
+    claim_order_intent,
+    order_intent_document,
+    order_intent_key,
+    read_order_intent,
+)
 from crucible_trader.order_router import (
     ORDER_REF_PREFIX,
     PAPER_GATEWAY_PORT,
@@ -579,6 +584,7 @@ def _plan(
     order_cap=50_000.0,
     session_cap=100_000.0,
     inherited=frozenset(),
+    owned=frozenset(),
 ):
     return plan_orders(
         book,
@@ -588,6 +594,7 @@ def _plan(
         max_order_notional_usd=order_cap,
         max_session_notional_usd=session_cap,
         inherited=inherited,
+        owned=owned,
     )
 
 
@@ -642,6 +649,56 @@ def test_an_inherited_name_the_book_holds_is_sized_by_the_book() -> None:
     sells, buys = _plan(_book(), positions={"AAA": 400}, inherited=frozenset({"AAA"}))
     assert [(o.decision.symbol, o.decision.quantity) for o in sells] == [("AAA", 100)]
     assert {o.decision.symbol for o in buys} == {"BBB"}
+
+
+def test_a_name_this_trader_bought_and_the_book_dropped_is_sold_whole() -> None:
+    sells, buys = _plan(
+        _book(),
+        positions={"SNDK": 10},
+        quote={**PRICES, "SNDK": 1_000.0}.get,
+        owned=frozenset({"SNDK"}),
+    )
+    assert [(o.decision.symbol, o.decision.quantity) for o in sells] == [("SNDK", 10)]
+    assert {o.decision.symbol for o in buys} == {"AAA", "BBB"}
+
+
+def _own_intent(store, day: str, symbol: str, *, side: str = "buy", account: str = ACCOUNT):
+    claim_order_intent(
+        store,
+        order_intent_document(
+            order_key=order_key(day, symbol),
+            order_ref=f"{order_key(day, symbol)}|{side}|10|10.0|2026-09-04T13:00:00.000000Z",
+            trading_day=day,
+            symbol=symbol,
+            side=side,
+            quantity=10,
+            decision_price=10.0,
+            account=account,
+            intended_at=T0,
+        ),
+    )
+
+
+def test_the_router_sells_a_name_its_own_earlier_session_bought(store) -> None:
+    # 2026-11-04: the trader bought SNDK on the 11-03 book. SNDK is not one of
+    # v1's declared names, so a next book without it was refused whole
+    # (alpha-engine-config-I13164) instead of selling the trader's own holding.
+    _own_intent(store, "2026-09-04", "SNDK")
+    ib = RoutingIB(positions={"SNDK": 10}, prices={**PRICES, "SNDK": 1_000.0})
+    _route(_router(store, ib), _book())
+    placed = [(c.symbol, o.action, o.totalQuantity) for c, o in ib.order_calls]
+    assert placed == [("SNDK", "SELL", 10), ("AAA", "BUY", 300), ("BBB", "BUY", 400)]
+
+
+@pytest.mark.parametrize(
+    ("side", "account"), [("sell", ACCOUNT), ("buy", "DU2")], ids=["last-sold", "other-account"]
+)
+def test_a_held_name_this_trader_did_not_buy_is_still_refused(store, side, account) -> None:
+    _own_intent(store, "2026-09-04", "SNDK", side=side, account=account)
+    ib = RoutingIB(positions={"SNDK": 10}, prices={**PRICES, "SNDK": 1_000.0})
+    with pytest.raises(ForeignPositionError, match="SNDK"):
+        _route(_router(store, ib), _book())
+    assert ib.order_calls == []
 
 
 def test_an_undeclared_foreign_name_is_still_refused_beside_an_inherited_one() -> None:

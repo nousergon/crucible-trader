@@ -96,6 +96,7 @@ from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
 from crucible_trader.order_intent import (
     OrderIntentConflictError,
+    bought_by_this_trader,
     claim_order_intent,
     order_intent_document,
 )
@@ -362,16 +363,19 @@ def plan_orders(
     max_order_notional_usd: float,
     max_session_notional_usd: float,
     inherited: frozenset[str] = frozenset(),
+    owned: frozenset[str] = frozenset(),
 ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...]]:
     """(sells, buys) moving ``positions`` to ``book``, or a refusal. Sends nothing.
 
     Target shares are ``floor(weight * book notional / decision price)``; every
     cap is checked over the whole plan before it is returned. A held name in
-    ``inherited`` (`crucible_trader.inherited_positions`) that the book does
+    ``inherited`` (`crucible_trader.inherited_positions`) or in ``owned`` (a
+    name this trader bought itself,
+    `crucible_trader.order_intent.bought_by_this_trader`) that the book does
     not contain is planned to zero rather than refused.
     """
     weights = _tradable(book)
-    foreign = sorted(set(positions) - set(weights) - inherited)
+    foreign = sorted(set(positions) - set(weights) - inherited - owned)
     if foreign:
         raise ForeignPositionError(
             f"the account holds {foreign}, which the book for {book.trading_day} does not "
@@ -671,6 +675,16 @@ class PaperOrderRouter:
                 f"the book is for {book.trading_day}; this router was opened for {self._day}"
             )
         statement = IbPaperStatementSource(self._client).read_statement(self._day)
+        inherited = inherited_for(self._day)
+        # A held name the book dropped is this trader's to sell when it bought
+        # the name itself (its own order intent says so); only an undeclared
+        # name it never bought is foreign (alpha-engine-config-I13164).
+        owned = bought_by_this_trader(
+            self._store,
+            set(statement.positions) - set(_tradable(book)) - inherited,
+            account=self._config.account,  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
+            before=self._day,
+        )
         sells, buys = plan_orders(
             book,
             positions=statement.positions,
@@ -678,7 +692,8 @@ class PaperOrderRouter:
             clock=self._clock,
             max_order_notional_usd=self._config.max_order_notional_usd,  # type: ignore[arg-type]
             max_session_notional_usd=self._config.max_session_notional_usd,  # type: ignore[arg-type]
-            inherited=inherited_for(self._day),
+            inherited=inherited,
+            owned=owned,
         )
         self._planned = sells + buys
         # Sells first, so their proceeds are cash before the buys go out.
