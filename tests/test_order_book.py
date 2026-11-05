@@ -102,3 +102,32 @@ def test_a_failed_write_never_stops_the_session(tmp_path) -> None:
     assert (
         ctx.metrics[-1]["status"] == "FAIL" and "AccessDenied" in ctx.metrics[-1]["status_reason"]
     )
+
+
+def test_a_weight_moved_up_or_down_is_increase_or_reduce() -> None:
+    doc = order_book_document(
+        _book(), previous_weights={"AAA": 0.4, "CCC": 0.5}, written_at_utc="t"
+    )
+    actions = {r["ticker"]: r["action"] for r in doc["rows"]}
+    assert actions["AAA"] == "increase" and actions["CCC"] == "reduce"
+
+
+def test_a_refused_lock_is_a_fail_metric_but_the_book_stays_written(tmp_path, monkeypatch) -> None:
+    import crucible_trader.order_book as ob
+
+    monkeypatch.setattr(
+        ob, "lock_books_records", lambda store, keys, **k: ([], {keys[0]: "no lock"})
+    )
+    ctx = _Ctx(LocalStore(tmp_path))
+    assert record_order_book(ctx, _book(), previous_weights=None, now=NOW) is not None
+    assert ctx.metrics[-1]["status"] == "FAIL" and "no lock" in ctx.metrics[-1]["status_reason"]
+
+
+def test_a_metric_that_cannot_be_recorded_does_not_raise(tmp_path) -> None:
+    class NoMetrics(_Ctx):
+        def record_metric(self, metric) -> None:
+            raise RuntimeError("manifest closed")
+
+    assert record_order_book(
+        NoMetrics(LocalStore(tmp_path)), _book(), previous_weights=None, now=NOW
+    )
