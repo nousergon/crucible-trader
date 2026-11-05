@@ -361,6 +361,7 @@ def records_from_order_intent_reconciliation(
     day = _str(document, "trading_day")
     detected_at = _str(document, "generated_at")
     doc_key = order_intent_reconciliation_key(day)
+    book = _str(document, "book_day") if "book_day" in document else day
     records: list[ExceptionRecord] = []
     for row in _mapping_list(document, "rows"):
         klass = _str(row, "class")
@@ -377,7 +378,9 @@ def records_from_order_intent_reconciliation(
             side = None
         else:
             intended = _opt_float(row, "intended_quantity")
-            intent_record = order_intent_key(day, symbol)
+            # Intents are keyed by the book they were written for, which a v3
+            # document names; an older one reconciled its own day.
+            intent_record = order_intent_key(book, symbol)
             side = _str(row, "side")
         records.append(
             ExceptionRecord(

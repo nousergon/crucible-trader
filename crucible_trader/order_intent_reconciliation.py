@@ -75,7 +75,7 @@ __all__ = [
     "reconcile_order_intents",
 ]
 
-RECONCILIATION_SCHEMA_VERSION = "order_intent_reconciliation.v2"
+RECONCILIATION_SCHEMA_VERSION = "order_intent_reconciliation.v3"
 
 #: Where the daily job files the document. Beside the intents, and for the same
 #: reason (see :mod:`crucible_trader.order_intent`): a key in `crucible.keys`
@@ -274,13 +274,22 @@ def reconcile_order_intents(
     executions: Iterable[BrokerExecution],
     key_prefix: str,
     now: dt.datetime,
+    book_day: str | None = None,
 ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw JSON document
-    """The ``order_intent_reconciliation.v1`` document for one trading day.
+    """The ``order_intent_reconciliation`` document for one trading day.
 
     ``key_prefix`` is the router's own ``orderRef`` prefix (``crucible-trader``);
     broker records under any other prefix are not this router's and are ignored.
+
+    ``book_day`` is the BOOK the intents were written for, which keys both the
+    intents and their ``orderRef`` (`alpha-engine-config-I13261`). A session
+    trades the previous close's book, so the run for execution day ``trading_day``
+    reconciles ``book_day`` = the session before it. It defaults to
+    ``trading_day``; keyed to the execution day, the filter dropped every broker
+    record the day's session sent and the control never saw a v2 order.
     """
-    day_prefix = _REF_SEP.join((key_prefix, trading_day)) + _REF_SEP
+    book_day = trading_day if book_day is None else book_day
+    day_prefix = _REF_SEP.join((key_prefix, book_day)) + _REF_SEP
     by_key_orders: dict[str, list[BrokerOrder]] = {}
     for o in orders:
         if o.order_ref.startswith(day_prefix):
@@ -347,6 +356,7 @@ def reconcile_order_intents(
     return {
         "schema_version": RECONCILIATION_SCHEMA_VERSION,
         "trading_day": trading_day,
+        "book_day": book_day,
         "generated_at": now.astimezone(dt.UTC).strftime(_STAMP),
         "intents": sum(1 for r in rows if r["class"] != "orphan"),
         "counts": dict(sorted(counts.items())),
