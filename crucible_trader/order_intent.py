@@ -33,7 +33,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store
@@ -43,6 +43,7 @@ __all__ = [
     "ORDER_INTENT_SCHEMA_VERSION",
     "OrderIntentConflictError",
     "OrderIntentError",
+    "bought_by_this_trader",
     "claim_order_intent",
     "order_intent_document",
     "order_intent_key",
@@ -169,3 +170,46 @@ def claim_order_intent(store: Store, document: Mapping[str, Any]) -> str:  # pyr
         except (KeyError, OrderIntentError):
             existing = None
         raise OrderIntentConflictError(key, existing) from None
+
+
+def bought_by_this_trader(
+    store: Store, symbols: Iterable[str], *, account: str, before: str
+) -> frozenset[str]:
+    """Of ``symbols``, the names this trader itself bought into ``account``.
+
+    A name counts when its LATEST intent on a book day before ``before`` is a
+    ``buy`` for ``account``. The router's own position is not foreign to it: on
+    2026-11-04 the trader bought SNDK (book 2026-11-03), and SNDK is neither one
+    of v1's declared inherited names nor certain to be in the next book, so
+    :func:`~crucible_trader.order_router.plan_orders` would refuse the whole
+    next session over the trader's own holding (``ForeignPositionError``,
+    alpha-engine-config-I13164) the first time the champion rotated out of it.
+
+    Only ``symbols`` are read (one list of the prefix, then the newest intent
+    per wanted name), so the cost tracks the names the book dropped, not the
+    intent history. An intent that cannot be read raises
+    :class:`OrderIntentError`: a name is never called owned on a guess, and a
+    name never called owned stays refused.
+    """
+    wanted = set(symbols)
+    if not wanted:
+        return frozenset()
+    order_intent_key(before, "A")  # validates the day before any read
+    days_by_symbol: dict[str, list[str]] = {}
+    for key in store.list_keys(ORDER_INTENTS_PREFIX):
+        rest = key[len(ORDER_INTENTS_PREFIX) :]
+        day, sep, name = rest.partition("/")
+        if not sep or "/" in name or not name.endswith(".json"):
+            raise OrderIntentError(f"{key!r} is not an intent key under {ORDER_INTENTS_PREFIX!r}")
+        symbol = name[: -len(".json")]
+        if symbol in wanted and _ISO_DAY.match(day) and day < before:
+            days_by_symbol.setdefault(symbol, []).append(day)
+    owned: set[str] = set()
+    for symbol, days in days_by_symbol.items():
+        latest = max(days)
+        intent = read_order_intent(store, latest, symbol)
+        if intent is None:  # listed, then gone: never read as absent
+            raise OrderIntentError(f"intent for {latest}/{symbol} vanished while read")
+        if intent["side"] == "buy" and intent["account"] == account and intent["symbol"] == symbol:
+            owned.add(symbol)
+    return frozenset(owned)
