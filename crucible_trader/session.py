@@ -40,6 +40,7 @@ from crucible_trader.construction import TargetBook, construct_target_book
 from crucible_trader.contract import ResolvedContract, resolve
 from crucible_trader.hold_book import enforce_hold_book
 from crucible_trader.kill_switch import BrokerControl, assert_trading_permitted, utcnow
+from crucible_trader.order_book import record_order_book
 from crucible_trader.paper_smoke import RunningWheelMismatchError, running_wheel_disagreement
 
 SESSION_SCHEMA_VERSION = "trader_session.v1"
@@ -85,6 +86,14 @@ def session_cycle(
         feature_version=feature_version,
     )
     ctx.record_metric(book.metric)
+    # The day's order book, saved before any order is sent so the record of
+    # what was decided exists whatever the broker then does. Never raises.
+    record_order_book(
+        ctx,
+        book,
+        previous_weights=None if previous_weights is None else dict(previous_weights),
+        now=clock(),
+    )
 
     sent = 0
     for batch in router.batches(book):
