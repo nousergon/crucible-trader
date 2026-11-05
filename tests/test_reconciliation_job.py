@@ -751,6 +751,27 @@ class TestExceptionScore:
         assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
         assert [o["key"] for o in earlier.outputs] == [exception_score_key(DAY.isoformat())]
 
+    def test_a_later_score_published_mid_run_is_never_overwritten(self, store, monkeypatch):
+        # codex 458b09f0e5dafeb6: an earlier day's run read `current`, a later
+        # day's score landed, and the earlier run's write then replaced it.
+        from crucible_trader.reconciliation_job import file_exception_score
+
+        TestExceptionRecords()._discrepant(store, ctx_for(store))
+        later = json.dumps({"trading_day": "2026-09-18"}).encode()
+        real_get = store.get_bytes
+
+        def racing_get(key):
+            body = real_get(key)
+            if key == SCORE_CURRENT_KEY and json.loads(body)["trading_day"] != "2026-09-18":
+                store.put_bytes(SCORE_CURRENT_KEY, later)  # the later run wins the race
+            return body
+
+        file_exception_score(ctx_for(store), now="2026-09-18T22:00:00Z")  # seed current
+        monkeypatch.setattr(store, "get_bytes", racing_get)
+        file_exception_score(ctx_for(store), now="2026-09-18T22:05:00Z")
+        monkeypatch.undo()
+        assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
+
     def test_a_score_failure_leaves_the_reconcile_unchanged(self, store, monkeypatch, caplog):
         import crucible_trader.reconciliation_job as job
 

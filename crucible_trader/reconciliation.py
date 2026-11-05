@@ -391,7 +391,12 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
                     "reconciler has no such path.",
                 )
             )
-        return _result(inputs, broker, {}, None, findings)
+        # Nothing was credited without an anchor to reconcile cash against, so
+        # every declared owed dividend is still outstanding; dropping them here
+        # lost them from the day's record (codex 621a3efb97c2c2e2).
+        return _result(
+            inputs, broker, {}, None, findings, dividends_owed=tuple(inputs.owed_dividends)
+        )
 
     if (
         inputs.previous_trading_day is not None
