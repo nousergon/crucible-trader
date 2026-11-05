@@ -320,3 +320,29 @@ def test_an_intent_that_vanishes_while_read_is_refused(tmp_path) -> None:
     claim_order_intent(store, _intent("AAA"))
     with pytest.raises(OrderIntentError, match="vanished"):
         intents_for_day(store, DAY)
+
+
+def test_the_broker_filter_follows_the_book_day_not_the_run_day() -> None:
+    # alpha-engine-config-I13261: the run for execution day D reconciles the
+    # previous session's BOOK. Keyed to D, the filter dropped every record the
+    # session sent (they carry the book day) and the day read clean over them.
+    doc = reconcile_order_intents(
+        trading_day="2026-09-09",
+        book_day=DAY,
+        intents=[_intent("AAA")],
+        orders=[BrokerOrder(_ref("AAA"), "Filled"), BrokerOrder(_ref("ZZZ"), "Filled")],
+        executions=[_exe("AAA", 100, "e1")],
+        key_prefix=PREFIX,
+        now=NOW,
+    )
+    assert (
+        doc["schema_version"] == RECONCILIATION_SCHEMA_VERSION == "order_intent_reconciliation.v3"
+    )
+    assert (doc["trading_day"], doc["book_day"]) == ("2026-09-09", DAY)
+    assert _row(doc, "AAA")["class"] == "filled"
+    assert _row(doc, "ZZZ")["class"] == "orphan"
+    assert doc["intents"] == 1
+
+
+def test_without_a_book_day_the_run_day_is_the_book() -> None:
+    assert _run([])["book_day"] == DAY

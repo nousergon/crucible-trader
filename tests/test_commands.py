@@ -21,7 +21,11 @@ from crucible_trader.fire_drill import FIRE_DRILL_JOB, fire_drill_key
 from crucible_trader.kill_switch import KILL_SWITCH_JOB, kill_switch_event_key, read_state
 from crucible_trader.order_intent import claim_order_intent, order_intent_document
 from crucible_trader.order_intent_reconciliation import order_intent_reconciliation_key
-from crucible_trader.reconciliation_job import RECONCILE_JOB, ReconciliationDiscrepancyError
+from crucible_trader.reconciliation_job import (
+    RECONCILE_JOB,
+    ReconciliationDiscrepancyError,
+    previous_trading_day,
+)
 
 
 def _never_loaded():
@@ -403,15 +407,18 @@ class TestReconcileCommandOrderIntents:
     now the production caller of the intent reconciler. Planted through the
     real command, the real runner and the fake broker's own read surface."""
 
-    REF = f"crucible-trader|{DAY.isoformat()}|AAA|buy|4|10.0|2026-09-08T13:30:00.000000Z"
+    # The run for DAY reconciles the book DAY's session traded: the previous
+    # session's (alpha-engine-config-I13261). Intents and refs carry that book.
+    BOOK = previous_trading_day(DAY).isoformat()
+    REF = f"crucible-trader|{BOOK}|AAA|buy|4|10.0|2026-09-08T13:30:00.000000Z"
 
     def _claim(self, store, qty: int = 4) -> None:
         claim_order_intent(
             store,
             order_intent_document(
-                order_key=f"crucible-trader|{DAY.isoformat()}|AAA",
+                order_key=f"crucible-trader|{self.BOOK}|AAA",
                 order_ref=self.REF,
-                trading_day=DAY.isoformat(),
+                trading_day=self.BOOK,
                 symbol="AAA",
                 side="buy",
                 quantity=qty,

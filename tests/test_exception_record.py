@@ -223,6 +223,14 @@ class TestIntentConverter:
         assert doc["detected_at"] == "2026-10-30T20:45:01.123456Z"
         assert "ref-1" in doc["detail"] and "Filled" in doc["detail"]
 
+    def test_an_intent_break_points_at_the_intent_under_its_book_day(self):
+        # alpha-engine-config-I13261: a v3 document names the book its run read.
+        document = {**intent_document([INTENT_ROW]), "book_day": "2026-10-29"}
+        (record,) = records_from_order_intent_reconciliation(document)
+        assert record.expected_record == "trader/order_intents/2026-10-29/AAA.json"
+        (legacy,) = records_from_order_intent_reconciliation(intent_document([INTENT_ROW]))
+        assert legacy.expected_record == f"trader/order_intents/{DAY}/AAA.json"
+
     def test_an_orphan_has_no_intent_side(self):
         orphan = {
             "order_key": f"crucible-trader|{DAY}|BBB",

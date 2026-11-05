@@ -474,7 +474,8 @@ def reconcile_intents_step(
 
     `alpha-engine-config-I12558` (audit FIN-03): the intent reconciler had no
     production caller, so an intent whose submit was lost was discoverable by
-    nobody. This step reads every intent for the run's trading day, classifies
+    nobody. This step reads every intent for the book the run's trading day
+    traded (the previous session's, `alpha-engine-config-I13261`), classifies
     it against the broker's own records, and files the
     ``order_intent_reconciliation`` document at
     :func:`~crucible_trader.order_intent_reconciliation.order_intent_reconciliation_key`
@@ -490,10 +491,16 @@ def reconcile_intents_step(
     reconciliation that skipped it would report clean over it.
     """
     day = ctx.trading_day.isoformat()
+    # The run for execution day D reconciles the BOOK D's session traded: the
+    # previous session's (`alpha-engine-config-I13261`, the crucible-trader#93
+    # class). Each book maps to exactly one execution day, so no book is read
+    # twice or skipped; the document stays at D's key and names the book.
+    book = previous_trading_day(ctx.trading_day).isoformat()
     now = dt.datetime.now(dt.UTC)
     document = reconcile_order_intents(
         trading_day=day,
-        intents=intents_for_day(ctx.store, day),
+        book_day=book,
+        intents=intents_for_day(ctx.store, book),
         orders=orders,
         executions=executions,
         key_prefix=ORDER_REF_PREFIX,
@@ -517,10 +524,11 @@ def reconcile_intents_step(
             "n_floor": 0,
             "status": "OK" if document["clean"] else "FAIL",
             "status_reason": (
-                f"{document['intents']} intents on {day}, every one terminal or working "
+                f"{document['intents']} intents of the {book} book on {day}, every one "
+                "terminal or working "
                 "at the broker and none overfilled, mismatched or corrupt"
                 if document["clean"]
-                else f"{len(breaks)} order-intent breaks on {day}: "
+                else f"{len(breaks)} order-intent breaks on {day} ({book} book): "
                 + " | ".join(f"{k} {by_key[k]['class']}" for k in breaks)
             ),
             "source_path": key,

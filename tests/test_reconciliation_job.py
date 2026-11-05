@@ -24,7 +24,12 @@ from crucible_trader.exception_record import (
     validate_exception_day_document,
 )
 from crucible_trader.ledger import journal_key, ledger_reconciliation_key
-from crucible_trader.order_intent_reconciliation import BrokerExecution, BrokerOrder
+from crucible_trader.order_intent import claim_order_intent, order_intent_document
+from crucible_trader.order_intent_reconciliation import (
+    BrokerExecution,
+    BrokerOrder,
+    order_intent_reconciliation_key,
+)
 from crucible_trader.reconciliation import CorporateActionSet, Fill, reconcile
 from crucible_trader.reconciliation_control import ReconciliationVoidError
 from crucible_trader.reconciliation_job import (
@@ -412,9 +417,8 @@ class TestExceptionRecords:
     def test_order_intent_breaks_join_the_same_day_file(self, store):
         put_anchor(store)
         ctx = ctx_for(store)
-        orphan = BrokerOrder(
-            order_ref="crucible-trader|2026-09-11|ZZZ|buy|1|1.0|t", status="Filled"
-        )
+        # The run for DAY reconciles the PREV book: its orders carry PREV.
+        orphan = BrokerOrder(order_ref=f"crucible-trader|{PREV}|ZZZ|buy|1|1.0|t", status="Filled")
         reconcile_cycle(
             ctx,
             source=FixedSource({"AAA": 12}, 800.0),
@@ -425,6 +429,49 @@ class TestExceptionRecords:
         )
         (record,) = output(store, exceptions_key(DAY.isoformat()))["records"]
         assert record["class"] == "orphan" and record["instrument"] == "ZZZ"
+
+    def test_the_run_reconciles_the_book_its_session_traded(self, store):
+        """alpha-engine-config-I13261: the session on DAY trades the PREV book and
+        writes its intents (and orderRefs) under PREV. The run for DAY reads that
+        book, once, and never DAY's own book, which the next session trades."""
+        when = dt.datetime(2026, 9, 11, 14, 0, tzinfo=dt.UTC)
+
+        def claim(book, symbol):
+            ref = f"crucible-trader|{book}|{symbol}|buy|5|10.0|t"
+            claim_order_intent(
+                store,
+                order_intent_document(
+                    order_key=f"crucible-trader|{book}|{symbol}",
+                    order_ref=ref,
+                    trading_day=book,
+                    symbol=symbol,
+                    side="buy",
+                    quantity=5,
+                    decision_price=10.0,
+                    account="DU1",
+                    intended_at=when,
+                ),
+            )
+            return ref
+
+        ref = claim(PREV, "AAA")
+        claim(DAY.isoformat(), "BBB")  # tomorrow's session: not this run's
+        put_anchor(store)
+        reconcile_cycle(
+            ctx_for(store),
+            source=FixedSource({"AAA": 12}, 800.0),
+            fills=(Fill("AAA", 2, -200.0),),
+            cash_flows=(),
+            corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+            order_records=(
+                [BrokerOrder(order_ref=ref, status="Filled")],
+                [BrokerExecution(ref, 5.0, exec_id="e1", account="DU1", symbol="AAA", side="BOT")],
+            ),
+        )
+        document = output(store, order_intent_reconciliation_key(DAY.isoformat()))
+        assert (document["trading_day"], document["book_day"]) == (DAY.isoformat(), PREV)
+        assert document["intents"] == 1 and document["counts"] == {"filled": 1}
+        assert [r["symbol"] for r in document["rows"]] == ["AAA"]
 
     def test_a_raising_intent_step_still_files_the_broker_breaks(self, store, monkeypatch):
         import crucible_trader.reconciliation_job as job
