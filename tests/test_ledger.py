@@ -246,6 +246,28 @@ class TestOneEventOneEntry:
             and posting.document["dividends_receivable_cents"] == {}
         )
 
+    def test_two_dividends_on_one_ticker_and_day_are_two_events(self):
+        # codex d3c058f085a32ed0: an ordinary and a special dividend shared one
+        # entry ref, so the second append was refused as a duplicate.
+        anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
+        actions = CorporateActionSet(
+            frozenset({"AAA"}),
+            (
+                CorporateAction("AAA", "cash_dividend", amount_per_share=0.25, entitled_shares=10),
+                CorporateAction("AAA", "cash_dividend", amount_per_share=1.00, entitled_shares=10),
+            ),
+        )
+        broker = stmt(DAY, {"AAA": 10}, 1_012.5)
+        ledger = Ledger()
+        posting = book_day(ledger, day_inputs(broker, anchor, actions=actions))
+        assert [e.kind for e in posting.entries][1:] == [
+            "dividend_receivable",
+            "dividend_settlement",
+            "dividend_receivable",
+            "dividend_settlement",
+        ]
+        assert posting.document["clean"] is True
+
     def test_an_unpaid_dividend_stays_receivable_and_a_late_credit_settles_it(self):
         actions = CorporateActionSet(
             frozenset({"AAA"}),

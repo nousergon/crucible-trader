@@ -50,6 +50,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from typing import cast
 
 from crucible.keys import (
     manifest_key,
@@ -85,6 +86,8 @@ __all__ = [
     "exceptions_key",
     "records_from_broker_reconciliation",
     "records_from_order_intent_reconciliation",
+    "upgrade_legacy_day_document",
+    "upgrade_legacy_record",
     "validate_exception_day_document",
     "validate_exception_record",
 ]
@@ -422,6 +425,32 @@ def exception_day_document(
         "records": documents,
     }
     return document
+
+
+def upgrade_legacy_record(document: Mapping[str, object]) -> Mapping[str, object]:
+    """``document`` as a current record. A record written before ``tenant``
+    joined the field set (crucible-trader f3a918c9) is the first tenant's, the
+    only books there were, and its id is that tenant's digest unchanged (see
+    :func:`exception_id`), so it reads as :data:`PAPER_FUND_TENANT`. Anything
+    else is returned as it came; validation still decides (codex
+    d22b5328647cbb21)."""
+    if "tenant" in document:
+        return document
+    return {**document, "tenant": PAPER_FUND_TENANT}
+
+
+def upgrade_legacy_day_document(document: Mapping[str, object]) -> Mapping[str, object]:
+    """``document`` with every record passed through :func:`upgrade_legacy_record`."""
+    records = document.get("records")
+    if not isinstance(records, list):
+        return document
+    return {
+        **document,
+        "records": [
+            upgrade_legacy_record(cast("Mapping[str, object]", r)) if isinstance(r, Mapping) else r
+            for r in cast("list[object]", records)
+        ],
+    }
 
 
 def validate_exception_day_document(document: Mapping[str, object]) -> None:
