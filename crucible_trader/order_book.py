@@ -17,6 +17,8 @@ and cash sentinels included and labelled, with:
 * ``previous_weight`` / ``target_weight`` -- the book held into the session
   and the book the engine built, and ``target_notional_usd``;
 * ``alpha_rank`` -- 1 is the highest alpha among eligible names;
+* ``book_position`` -- the row's place, largest target first (positions,
+  then the rest by alpha rank), and the weights again in percent;
 * ``action`` -- what the book says about the name (see :func:`_action`).
 
 **Never raises into the session.** A book that cannot be written must not
@@ -120,6 +122,9 @@ def order_book_document(
                 "target_weight": target,
                 "weight_change": target - prior,
                 "target_notional_usd": round(target * book.portfolio_notional_usd, 2),
+                # The same weights in percent, for a reader (the console page).
+                "previous_weight_pct": round(prior * 100.0, 3),
+                "target_weight_pct": round(target * 100.0, 3),
                 "action": _action(
                     previous=prior,
                     target=target,
@@ -129,6 +134,8 @@ def order_book_document(
             }
         )
     rows.sort(key=lambda r: (-r["target_weight"], r["alpha_rank"] or 10**9, r["ticker"]))
+    for position, row in enumerate(rows, start=1):
+        row["book_position"] = position  # 1 is the largest target
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["action"]] = counts.get(r["action"], 0) + 1

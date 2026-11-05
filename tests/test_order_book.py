@@ -72,6 +72,7 @@ def test_every_name_is_a_row_with_what_the_book_does_with_it() -> None:
     }
     aaa = next(r for r in doc["rows"] if r["ticker"] == "AAA")
     assert aaa["target_notional_usd"] == 60_000.0 and aaa["alpha_rank"] == 1
+    assert aaa["target_weight_pct"] == 60.0 and aaa["book_position"] == 1
     assert doc["summary"]["positions"] == 2 and doc["previous_book"] == "given"
     assert [r["ticker"] for r in doc["rows"]][:2] == ["AAA", "CCC"]  # biggest target first
 
