@@ -80,6 +80,7 @@ import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
+from crucible.slots.strategy import CASH_TICKER
 from crucible.store import Store
 
 from crucible_trader.broker_session import GatewayAddress, connect, load_sdk
@@ -111,6 +112,7 @@ __all__ = [
     "UnknownOrderStateError",
     "assert_staging_never_routes",
     "build_router",
+    "held_weights",
     "is_staging",
     "open_paper_router",
     "plan_orders",
@@ -354,6 +356,48 @@ def _tradable(book: TargetBook) -> dict[str, float]:
     return {t: w for t, w in book.weights.items() if t not in sentinels}
 
 
+#: Float slack in the target-share floor (see `plan_orders`).
+_SHARE_EPSILON = 1e-6
+
+
+def held_weights(
+    positions: Mapping[str, int], *, quote: QuoteSource, portfolio_notional_usd: float
+) -> dict[str, float]:
+    """The book held into the session, as weights of the book notional.
+
+    Each held name is valued at the price the router will plan against, so a
+    name whose weight the engine leaves unchanged plans back to exactly the
+    shares held. Cash is the remainder; a book worth more than the notional is
+    scaled to it, all cash spent, since the engine takes weights that sum to one.
+
+    2026-11-05: every live session constructed from all cash, so the engine's
+    turnover budget measured each day against an empty book and never bound
+    (97% one-way on 11-03 and 11-04): PLTR was bought on 11-04 and sold whole
+    on 11-05. Raises `PriceUnavailableError` for a held name with no price: a
+    book valued on a partial price set is not the book held.
+    """
+    if portfolio_notional_usd <= 0:
+        raise RiskCapExceededError(f"book notional {portfolio_notional_usd!r} is not positive")
+    values: dict[str, float] = {}
+    for symbol, shares in sorted(positions.items()):
+        if shares == 0:
+            continue
+        if shares < 0:
+            raise RiskCapExceededError(f"the account is short {symbol}: the router is long only")
+        price = quote(symbol)
+        if price is None or not (math.isfinite(price) and price > 0):
+            raise PriceUnavailableError(
+                f"no usable price for held {symbol} ({price!r}); the book held into the "
+                "session cannot be valued on a partial price set"
+            )
+        values[symbol] = shares * price
+    gross = sum(values.values())
+    scale = 1.0 if gross <= portfolio_notional_usd else portfolio_notional_usd / gross
+    weights = {s: v * scale / portfolio_notional_usd for s, v in values.items()}
+    weights[CASH_TICKER] = max(0.0, 1.0 - sum(weights.values()))
+    return weights
+
+
 def plan_orders(
     book: TargetBook,
     *,
@@ -409,7 +453,10 @@ def plan_orders(
                 f"no usable decision price for {symbol} ({price!r}); the book is not traded "
                 "on a partial price set" + (f" [{detail}]" if detail else "")
             )
-        target = math.floor(weight * book.portfolio_notional_usd / price)
+        # The epsilon keeps a weight carried from the held shares at this same
+        # price (`held_weights`) mapping back to exactly those shares, not one
+        # fewer through float rounding.
+        target = math.floor(weight * book.portfolio_notional_usd / price + _SHARE_EPSILON)
         delta = target - held
         if delta == 0:
             continue
@@ -698,6 +745,13 @@ class PaperOrderRouter:
         self._planned = sells + buys
         # Sells first, so their proceeds are cash before the buys go out.
         return [batch for batch in (sells, buys) if batch]
+
+    def held_weights(self, portfolio_notional_usd: float) -> dict[str, float]:
+        """The account's positions as the book held into the session (`held_weights`)."""
+        statement = IbPaperStatementSource(self._client).read_statement(self._day)
+        return held_weights(
+            statement.positions, quote=self._quote, portfolio_notional_usd=portfolio_notional_usd
+        )
 
     def _known_refs(self) -> dict[str, str]:
         """Every order ref the broker knows under this router's prefix, by key."""

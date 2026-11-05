@@ -61,12 +61,13 @@ calls that could change the book -- `cancel_all`, `submit_close` -- are
 refused, so no session can cancel the v1 executor's stops on the shared paper
 account.
 
-**The book held into the session is all cash** (``previous_weights=None``)
-while every session is shadow: no order has ever left this trader, so its own
-book is empty. The IB paper account may hold positions -- the v1 executor
-trades it -- and those are not this trader's book. Deriving
-``previous_weights`` from the trader's own routed positions is part of turning
-routing on, not of this module.
+**The book held into the session is the account's positions** when routing
+is live (``_held_into_session``), valued as weights of the book notional, so
+the engine's turnover budget binds against what is actually held. Until
+2026-11-05 every session started from all cash, written when no order had ever
+left this trader; it survived routing going live on 11-03, and the budget then
+measured each day against an empty book (97% one-way turnover on 11-03 and
+11-04). A shadow or simulated session still starts from all cash.
 """
 
 from __future__ import annotations
@@ -81,13 +82,15 @@ from zoneinfo import ZoneInfo
 from crucible.calendar import is_trading_day
 from crucible.execution import EXECUTION_SHORTFALL_SCHEMA_VERSION, execution_shortfall_key
 from crucible.models import TraderEvidenceBench
+from crucible.portfolio import PortfolioParamsError, load_portfolio_params_from_store
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
 
 from crucible_trader.broker_session import GatewayAddress, OrderRefusedError, connect, load_sdk
-from crucible_trader.construction import TargetBook, construct_target_book
+from crucible_trader.construction import STRATEGY_SLOT, TargetBook, construct_target_book
 from crucible_trader.contract import (
     EVIDENCE_SCHEMA_VERSION,
+    ContractRefusal,
     ContractUnavailable,
     ResolvedContract,
     record_session,
@@ -178,6 +181,24 @@ def _file_shortfall(
     return document
 
 
+def _held_into_session(store: Store, router: object) -> dict[str, float] | None:
+    """The book held into the session, or None (all cash) for a router with no book.
+
+    A live router values the account's positions as weights of the S slot's book
+    notional (`order_router.held_weights`), so the engine's turnover budget and
+    cost model measure each day against the book actually held. A shadow or
+    simulated router holds nothing of its own and keeps the all-cash start.
+    """
+    held: Callable[[float], dict[str, float]] | None = getattr(router, "held_weights", None)
+    if held is None:
+        return None
+    try:
+        params = load_portfolio_params_from_store(STRATEGY_SLOT, store=store)
+    except PortfolioParamsError as exc:
+        raise ContractRefusal(f"the S slot's portfolio parameter set is unusable: {exc}") from exc
+    return held(float(params.book_notional_usd))
+
+
 def daily_session_cycle(
     ctx: RunContext,
     *,
@@ -215,7 +236,7 @@ def daily_session_cycle(
             broker=broker,
             router=router,
             installed_version=installed_version,
-            previous_weights=None,
+            previous_weights=_held_into_session(ctx.store, router),
             clock=clock,
             contract_resolver=capture,
             construct=construct or construct_target_book,

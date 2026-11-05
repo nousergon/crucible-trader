@@ -612,3 +612,60 @@ class TestTheProdPathIsUnchanged:
             assert evidence["session_modes"] == {BOUND: "shadow"}
             assert "fill_source" not in shortfall
             assert b"simulated" not in artifacts[TRADER_EVIDENCE_KEY]
+
+
+class HoldingRouter(LiveRouter):
+    """A live router whose account holds a book (2026-11-05: rebuilt from cash daily)."""
+
+    def __init__(self, held: dict[str, float]) -> None:
+        super().__init__()
+        self.held = held
+        self.notionals: list[float] = []
+
+    def held_weights(self, notional: float) -> dict[str, float]:
+        self.notionals.append(notional)
+        return self.held
+
+
+class TestTheBookHeldIntoTheSession:
+    def _capture(self):
+        seen: list[object] = []
+
+        def construct(store_, **kwargs):
+            seen.append(kwargs["previous_weights"])
+            return _construct(store_, **kwargs)
+
+        return seen, construct
+
+    def test_a_live_session_constructs_from_the_accounts_positions(
+        self, store, monkeypatch
+    ) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        monkeypatch.setattr(
+            module,
+            "load_portfolio_params_from_store",
+            lambda slot, *, store: SimpleNamespace(book_notional_usd=1_000_000.0),
+        )
+        seen, construct = self._capture()
+        router = HoldingRouter({"PLTR": 0.25, "__CASH__": 0.75})
+        _cycle(store, router, construct=construct)
+        assert seen == [{"PLTR": 0.25, "__CASH__": 0.75}]
+        assert router.notionals == [1_000_000.0]
+
+    def test_a_shadow_session_still_starts_from_cash(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        seen, construct = self._capture()
+        _cycle(store, ShadowRouter(), construct=construct)
+        assert seen == [None]
+
+    def test_an_unusable_parameter_set_refuses_the_session(self, store, monkeypatch) -> None:
+        from crucible.portfolio import PortfolioParamsError
+
+        _serveable(store, trading_day=DAY.isoformat())
+
+        def broken(slot, *, store):
+            raise PortfolioParamsError("no params")
+
+        monkeypatch.setattr(module, "load_portfolio_params_from_store", broken)
+        with pytest.raises(ContractRefusal, match="parameter set is unusable"):
+            _cycle(store, HoldingRouter({}))

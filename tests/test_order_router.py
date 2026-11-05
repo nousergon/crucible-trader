@@ -54,6 +54,7 @@ from crucible_trader.order_router import (
     ShadowRouter,
     UnknownOrderStateError,
     build_router,
+    held_weights,
     open_paper_router,
     order_key,
     parse_order_ref,
@@ -991,3 +992,45 @@ def test_an_order_the_broker_knows_is_adopted_whatever_the_intent_says(store) ->
     retry = _router(store, ib, fill_timeout_s=1.0)
     _route(retry, _book({"AAA": 0.1}))
     assert len(ib.order_calls) == 1 and retry.records[0].disposition == "adopted"
+
+
+# -- the book held into the session (2026-11-05: rebuilt from cash every day) ------------
+
+
+def test_held_positions_are_weights_of_the_book_notional_with_cash_the_rest() -> None:
+    weights = held_weights(
+        {"AAA": 300, "BBB": 0, "CCC": 100}, quote=PRICES.get, portfolio_notional_usd=100_000.0
+    )
+    assert weights == pytest.approx({"AAA": 0.3, "CCC": 0.02, "__CASH__": 0.68})
+
+
+def test_a_book_worth_more_than_the_notional_is_scaled_to_it() -> None:
+    weights = held_weights({"AAA": 1500}, quote=PRICES.get, portfolio_notional_usd=100_000.0)
+    assert weights == pytest.approx({"AAA": 1.0, "__CASH__": 0.0})
+
+
+def test_an_unchanged_carried_weight_plans_no_order() -> None:
+    """A weight valued at the router's own price maps back to exactly the shares held."""
+    positions = {"AAA": 333, "BBB": 77}
+    prices = {"AAA": 101.37, "BBB": 49.91}
+    held = held_weights(positions, quote=prices.get, portfolio_notional_usd=100_000.0)
+    book = _book({t: w for t, w in held.items() if t != "__CASH__"})
+    assert _plan(book, positions=positions, quote=prices.get) == ((), ())
+
+
+def test_a_held_name_without_a_price_refuses_to_value_the_book() -> None:
+    with pytest.raises(PriceUnavailableError, match="held ZZZ"):
+        held_weights({"ZZZ": 10}, quote=PRICES.get, portfolio_notional_usd=100_000.0)
+
+
+def test_a_short_or_a_non_positive_notional_is_refused() -> None:
+    with pytest.raises(RiskCapExceededError, match="short AAA"):
+        held_weights({"AAA": -5}, quote=PRICES.get, portfolio_notional_usd=100_000.0)
+    with pytest.raises(RiskCapExceededError, match="not positive"):
+        held_weights({"AAA": 5}, quote=PRICES.get, portfolio_notional_usd=0.0)
+
+
+def test_the_paper_router_values_the_accounts_positions(store) -> None:
+    ib = RoutingIB(positions={"AAA": 300, "CCC": 100})
+    weights = _router(store, ib, quote=PRICES.get).held_weights(100_000.0)
+    assert weights == pytest.approx({"AAA": 0.3, "CCC": 0.02, "__CASH__": 0.68})
