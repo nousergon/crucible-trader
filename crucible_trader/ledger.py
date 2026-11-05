@@ -563,6 +563,10 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         (str(u["ticker"]), str(u["pay_date"]))
         for u in _rows(inputs.reconciliation.get("dividends_unpaid"))
     }
+    # Two dividends on one ticker and day (an ordinary and a special) are two
+    # events: the first keeps the original ref, a later one takes a sequence
+    # suffix, so the second is not refused as a duplicate (codex d3c058f085a32ed0).
+    dividends_seen: dict[str, int] = {}
     for action in actions:
         if action.kind != "cash_dividend" or action.amount_per_share is None:
             continue
@@ -574,7 +578,9 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         cents = to_cents(Decimal(repr(action.amount_per_share)) * shares)
         if not cents:
             continue
-        ref = f"dividend/{action.ticker}/{day}"
+        seq = dividends_seen.get(action.ticker, 0) + 1
+        dividends_seen[action.ticker] = seq
+        ref = f"dividend/{action.ticker}/{day}" + (f"/{seq}" if seq > 1 else "")
         book(
             "dividend_receivable",
             ref,

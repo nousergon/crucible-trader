@@ -513,6 +513,18 @@ def _move(lots: dict[str, _Lot], ticker: str, p: Any, kind: str) -> int:  # pyri
         lot.cost_cents += (p.amount_cents + proceeds) if rest else 0
         lot.shares -= rest
         return proceeds - removed
+    if kind == "fill" and quantity > 0 and lot.shares < 0:
+        # Covering a short realises the credit received for the covered shares
+        # less what buying them back cost (codex 416432a9d79c6d39).
+        covered = min(quantity, -lot.shares)
+        credit = (-lot.cost_cents * covered) // -lot.shares
+        paid = p.amount_cents * covered // quantity
+        lot.cost_cents += credit
+        lot.shares += covered
+        rest = quantity - covered  # a buy past zero opens a long at its own price
+        lot.cost_cents += (p.amount_cents - paid) if rest else 0
+        lot.shares += rest
+        return credit - paid
     lot.shares += quantity
     lot.cost_cents += p.amount_cents
     return 0

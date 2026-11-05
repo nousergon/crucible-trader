@@ -21,6 +21,7 @@ from crucible_trader.exception_proposal import (
     proposals_from_store,
     propose,
     propose_day,
+    propose_records,
 )
 from crucible_trader.exception_record import (
     CLASSES_BY_SOURCE,
@@ -197,6 +198,21 @@ def test_a_proposal_carries_its_records_tenant():
     (theirs,) = propose_day(exception_day_document(DAY, raw), proposed_at=LATER)
     assert theirs.to_document()["tenant"] == "fund-b"
     assert theirs.proposal_id != mine.proposal_id
+
+
+def test_a_day_file_written_before_tenant_existed_still_reads():
+    # codex d22b5328647cbb21: a pre-tenant exception.v1 record failed the closed
+    # field set; it is the first tenant's, with the same id.
+    current = _day_file([finding("share_delta")])
+    legacy = {
+        **current,
+        "records": [{k: v for k, v in r.items() if k != "tenant"} for r in current["records"]],
+    }
+    (old,) = propose_day(legacy, proposed_at=LATER)
+    (new,) = propose_day(current, proposed_at=LATER)
+    assert old.to_document() == new.to_document()
+    (loose,) = propose_records(legacy["records"], proposed_at=LATER)
+    assert loose.to_document() == new.to_document()
 
 
 def test_the_day_file_and_its_key():

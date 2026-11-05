@@ -67,6 +67,8 @@ from crucible_trader.exception_record import (
     SOURCE_ORDER_INTENT_RECONCILIATION,
     ExceptionRecordError,
     exceptions_key,
+    upgrade_legacy_day_document,
+    upgrade_legacy_record,
     validate_exception_day_document,
     validate_exception_record,
 )
@@ -371,7 +373,9 @@ def propose(record: Mapping[str, object], *, proposed_at: str) -> Proposal:
 
 def propose_day(document: Mapping[str, object], *, proposed_at: str) -> list[Proposal]:
     """Proposals for every record in one `exception.v1` day file, in its order.
-    The file is validated first; an invalid one raises."""
+    The file is validated first; an invalid one raises. A record written before
+    ``tenant`` existed reads as the first tenant's (``upgrade_legacy_record``)."""
+    document = upgrade_legacy_day_document(document)
     validate_exception_day_document(document)
     records = cast("list[Mapping[str, object]]", document["records"])
     return [propose(r, proposed_at=proposed_at) for r in records]
@@ -381,6 +385,7 @@ def propose_records(records: Sequence[Mapping[str, object]], *, proposed_at: str
     """Proposals for loose `exception.v1` records (a refused close's
     ``exceptions``), in their order. Each record is validated first; an invalid
     one raises."""
+    records = [upgrade_legacy_record(r) for r in records]
     for record in records:
         validate_exception_record(record)
     return [propose(r, proposed_at=proposed_at) for r in records]

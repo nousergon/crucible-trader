@@ -586,6 +586,17 @@ class TestClose:
         realised = _move(lots, "AAA", Posting("assets:securities:AAA", -3_300, -3), "fill")
         assert realised == 2_200 - 2_000 and lots["AAA"] == _Lot(-1, -1_100)
 
+    def test_covering_part_of_a_short_realises_its_gain(self):
+        # codex 416432a9d79c6d39: short 10 at $100, cover 5 at $90 realises $50.
+        lots = {"AAA": _Lot(-10, -100_000)}
+        realised = _move(lots, "AAA", Posting("assets:securities:AAA", 45_000, 5), "fill")
+        assert realised == 50_000 - 45_000 and lots["AAA"] == _Lot(-5, -50_000)
+
+    def test_buying_past_a_short_opens_a_long_at_its_own_price(self):
+        lots = {"AAA": _Lot(-2, -20_000)}
+        realised = _move(lots, "AAA", Posting("assets:securities:AAA", 27_000, 3), "fill")
+        assert realised == 20_000 - 18_000 and lots["AAA"] == _Lot(1, 9_000)
+
     def test_the_panel_source_reads_close_raw_and_treats_a_bad_panel_as_missing(self, store):
         import pandas as pd
 
