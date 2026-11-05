@@ -131,6 +131,12 @@ class TargetBook:
     #: The ruled M bench the session's alpha was served under (key and digest),
     #: or ``None`` when the alpha is the M champion's own forecast.
     alpha_bench: TraderEvidenceBench | None = None
+    #: The session's per-name inputs behind the weights, for the order book
+    #: (`crucible_trader.order_book`): the alpha the engine was handed and
+    #: whether the name was eligible. ``None`` from a constructor that does
+    #: not carry them (test doubles).
+    alpha: dict[str, float] | None = None
+    eligible: dict[str, bool] | None = None
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -385,4 +391,12 @@ def construct_target_book(
         ),
         session_inputs_key=inputs.session_inputs_keys[0],
         alpha_bench=alpha_bench,
+        alpha={
+            t: float(a)
+            for t, a in zip(inputs.universe.tickers, inputs.sessions[0].alpha_hat, strict=True)
+        },
+        eligible={
+            t: bool(e)
+            for t, e in zip(inputs.universe.tickers, inputs.sessions[0].eligibility, strict=True)
+        },
     )

@@ -54,6 +54,10 @@ BOOKS_PREFIXES: tuple[str, ...] = (
     "trader/exceptions/",
     "trader/exception_proposals/",
     "trader/exception_scores/",
+    # The day's order book (`crucible_trader.order_book`): every name the
+    # champion considered and its target. Locked by the session that writes
+    # it, not by step 5h (alpha-engine-config order-book page, 2026-11-05).
+    "trader/order_books/",
 )
 
 #: The reviewers' decisions (1c/1d): the approvals the ledger's clearing
