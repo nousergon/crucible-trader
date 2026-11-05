@@ -163,6 +163,30 @@ class TestDryRun:
         assert unbooked["fills_booked_on_a_later_day"] == {}
         assert unbooked_gaps == [f"AAA@{LATER}"]
 
+    def test_the_first_stored_day_opens_from_the_statement_before_it(self, root):
+        # codex 36dcff7b: 09-09 opens from 09-08's statement, so its own fills
+        # are booked rather than read as already inside its closing statement.
+        store = open_store(str(root), dry_run=True)
+        dry_run(store, month="2026-09", now=NOW)
+        entries = json.loads(store.get_bytes(journal_key(T, CLEAN)))["entries"]
+        opening = [e for e in entries if e["kind"] == "opening_balance"]
+        assert [e["event_ref"] for e in opening] == [f"statement/{ANCHOR}"]
+
+    def test_a_carried_fill_whose_posting_failed_is_not_reported_booked(self, root, monkeypatch):
+        # codex d8b42301: booked_on is recorded only after post_daily_ledger succeeds.
+        (root / trader_reconciliation_key(BROKEN)).unlink()
+        real = back_office_dry_run.post_daily_ledger
+
+        def post_failing_on_later(ctx, **kw):
+            return None if kw["broker"].trading_day == LATER else real(ctx, **kw)
+
+        monkeypatch.setattr(back_office_dry_run, "post_daily_ledger", post_failing_on_later)
+        fill = Fill("AAA", 1, -10.0, commission_usd=1.0, exec_id="v1:t1")
+        summary = dry_run(
+            open_store(str(root), dry_run=True), month="2026-09", now=NOW, fills={BROKEN: [fill]}
+        )
+        assert summary["fills_booked_on_a_later_day"] == {}
+
 
 class TestRefusals:
     def test_a_bad_fill_line_names_its_line(self, tmp_path):

@@ -95,7 +95,8 @@ def _compare(
     key: str, published: Mapping[str, object], rebuilt: Mapping[str, object]
 ) -> dict[str, object]:
     a, b = _normal(published), _normal(rebuilt)
-    differs = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+    # A field absent on one side differs from an explicit null on the other (codex 165efe5b).
+    differs = sorted(k for k in set(a) | set(b) if k not in a or k not in b or a[k] != b[k])
     return {"key": key, "matches": not differs, "differs": differs}
 
 
