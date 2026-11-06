@@ -365,3 +365,80 @@ def test_module_runs_as_a_script(tmp_path, monkeypatch, capsys):
         runpy.run_module("crucible_trader.exception_decision", run_name="__main__")
     assert exited.value.code == 0
     assert json.loads(capsys.readouterr().out)["generated_at"].endswith("Z")
+
+
+def exception_record(n: int = 1, *, amount=107.69, unit="usd", tenant="nous-ergon-paper"):
+    return {
+        "schema_version": "exception.v1",
+        "exception_id": f"exc-{n}",
+        "tenant": tenant,
+        "trading_day": DAY,
+        "amount": amount,
+        "unit": unit,
+        "expected": {"record": f"trader/reconciliation/{DAY}.json", "value": 1.0},
+        "actual": {"record": f"trader/broker_statements/{DAY}.json", "value": 2.0},
+        "detected_by": {
+            "document_key": f"trader/reconciliation/{DAY}.json",
+            "manifest_key": f"runs/trader.reconcile/{DAY}/run.json",
+        },
+    }
+
+
+class TestQueueEvidence:
+    """alpha-engine-config-I13121: each queue item names its tier, expiry and
+    the source records its exception cites."""
+
+    @pytest.mark.parametrize(
+        ("amount", "unit", "tier"),
+        [
+            (0.05, "usd", "absorb"),
+            (-0.03, "usd", "absorb"),
+            (0.06, "usd", "review"),
+            (1.00, "usd", "review"),
+            (-1.01, "usd", "page"),
+            (107.69, "usd", "page"),
+            (3, "shares", None),
+            (None, "usd", None),
+            (True, "usd", None),
+            (float("nan"), "usd", None),
+        ],
+    )
+    def test_cash_tier_bands(self, amount, unit, tier):
+        assert ed.cash_tier(amount, unit) == tier
+
+    def test_a_queue_item_carries_tier_expiry_and_cited_records(self):
+        doc = score(
+            [proposal()], [], as_of=DAY, generated_at=AT, exceptions={"exc-1": exception_record()}
+        )
+        (item,) = doc["queue"]
+        assert item["amount"] == 107.69 and item["unit"] == "usd" and item["tier"] == "page"
+        assert item["expires"] == "2026-09-16"  # Fri + 3 trading days
+        # the reconciliation document is the expected side's record too: cited once
+        assert item["cited_records"] == [
+            {"role": "expected", "record": f"trader/reconciliation/{DAY}.json"},
+            {"role": "actual", "record": f"trader/broker_statements/{DAY}.json"},
+            {"role": "manifest", "record": f"runs/trader.reconcile/{DAY}/run.json"},
+        ]
+
+    def test_no_record_or_another_tenants_record_cites_nothing(self):
+        for exceptions in (None, {"exc-1": exception_record(tenant="someone-else")}):
+            (item,) = score([proposal()], [], as_of=DAY, generated_at=AT, exceptions=exceptions)[
+                "queue"
+            ]
+            assert (item["amount"], item["unit"], item["tier"], item["cited_records"]) == (
+                None,
+                None,
+                None,
+                [],
+            )
+            assert item["expires"] == "2026-09-16"
+
+    def test_load_exception_records_reads_existing_day_files_only(self, store):
+        document = {
+            "schema_version": "exception.v1",
+            "trading_day": DAY,
+            "records": [exception_record()],
+        }
+        store.put_bytes(f"trader/exceptions/{DAY}.json", json.dumps(document).encode())
+        found = ed.load_exception_records(store, [DAY, DAY, "2026-09-14"])
+        assert list(found) == ["exc-1"] and found["exc-1"]["amount"] == 107.69

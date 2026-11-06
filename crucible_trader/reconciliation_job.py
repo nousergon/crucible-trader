@@ -123,6 +123,7 @@ from crucible_trader.exception_decision import (
     SCORES_PREFIX,
     exception_score_key,
     load_decisions,
+    load_exception_records,
     load_proposals,
     score,
 )
@@ -756,11 +757,15 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
     overdue_row: dict[str, object] | None = None
     try:
         key = exception_score_key(day)
+        proposals = load_proposals(ctx.store, until=day)
         document = score(
-            load_proposals(ctx.store, until=day),
+            proposals,
             load_decisions(ctx.store),
             as_of=day,
             generated_at=now,
+            exceptions=load_exception_records(
+                ctx.store, (str(p["trading_day"]) for p in proposals)
+            ),
         )
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         ctx.record_output(key, payload, SCORE_SCHEMA_VERSION)
