@@ -483,3 +483,21 @@ class TestTheSimulatedBookIsCarried:
         )
         with pytest.raises(module.SimulatedBrokerError, match="long only"):
             _router(store)
+
+    def test_fills_that_would_leave_the_book_short_are_refused(self, store) -> None:
+        router = _router(store)
+        _run(router, _book())
+        buy = router.records[0]
+        sell = dataclasses.replace(
+            buy,
+            order=dataclasses.replace(
+                buy.order,
+                decision=dataclasses.replace(
+                    buy.order.decision, side="sell", quantity=buy.order.decision.quantity * 2
+                ),
+            ),
+        )
+        router._records.append(sell)  # noqa: SLF001
+        router._records.append(sell)  # noqa: SLF001
+        with pytest.raises(module.SimulatedBrokerError, match="short"):
+            router.closing_positions()
