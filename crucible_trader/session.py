@@ -111,4 +111,9 @@ def session_cycle(
         "s_champion": book.s_champion,
         "hold_decision": decision.decision,
         "batches_sent": sent,
+        # `alpha-engine-config-I13305`: what the book traded against the cap
+        # it was constructed under, recorded on the run by the daily session.
+        # Read leniently: a constructor double carries neither.
+        "turnover_one_way": getattr(book, "turnover_one_way_ratio", None),
+        "turnover_budget": getattr(book, "turnover_budget", None),
     }

@@ -125,6 +125,8 @@ def test_a_clear_session_constructs_and_sends_every_batch(store) -> None:
         "hold_decision": "proceed_signal_healthy",
         "batches_sent": 2,
         "alpha_bench": None,
+        "turnover_one_way": None,
+        "turnover_budget": None,
     }
     assert constructed[0]["trading_day"] == "2026-09-08" and constructed[0]["now"] == ib.clock()
     assert [m["name"] for m in ctx.metrics] == [

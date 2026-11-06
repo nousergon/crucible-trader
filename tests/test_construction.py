@@ -53,6 +53,7 @@ from crucible_trader.construction import (
     construct_target_book,
     held_tickers,
     initial_weights,
+    session_turnover_budget,
 )
 from crucible_trader.contract import ContractRefusal, ContractUnavailable
 
@@ -444,3 +445,34 @@ class TestARuledMBenchIsTheSessionsAlphaSource:
         world.record_session(world.arm_id)
         book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
         assert book.alpha_bench is None
+
+
+class TestTheSessionTurnoverBudget:
+    """alpha-engine-config-I13305: forced exits are forgiven, idle-cash deployment is not."""
+
+    def test_disabled_budget_is_none(self) -> None:
+        assert session_turnover_budget({"turnover_budget_discretionary": None}) is None
+
+    def test_a_rebuild_from_cash_is_held_to_the_discretionary_budget(self) -> None:
+        diagnostics = {
+            "turnover_budget_discretionary": 0.2,
+            "turnover_mandatory_floor_by_cause": {
+                "cash_sleeve_pin": 0.485,
+                "ineligibility_pin": 0.0,
+                "position_cap": 0.0,
+                "renormalization": 0.485,
+            },
+        }
+        assert session_turnover_budget(diagnostics) == pytest.approx(0.2)
+
+    def test_a_forced_exit_and_its_redeployment_are_forgiven(self) -> None:
+        diagnostics = {
+            "turnover_budget_discretionary": 0.2,
+            "turnover_mandatory_floor_by_cause": {
+                "cash_sleeve_pin": 0.0,
+                "ineligibility_pin": 0.234,
+                "position_cap": 0.01,
+                "renormalization": 0.244,
+            },
+        }
+        assert session_turnover_budget(diagnostics) == pytest.approx(0.2 + 2 * 0.244)

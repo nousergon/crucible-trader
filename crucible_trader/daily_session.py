@@ -109,11 +109,13 @@ from crucible_trader.settings import Settings
 from crucible_trader.simulated_broker import (
     FILL_SOURCE,
     SIMULATED_FILLS_SCHEMA_VERSION,
+    SIMULATED_POSITIONS_SCHEMA_VERSION,
     SIMULATED_SLIPPAGE_BPS,
     SimulatedFillRouter,
     StagingHoldControl,
     StagingSessionConfig,
     simulated_fills_key,
+    simulated_positions_key,
 )
 
 __all__ = [
@@ -186,8 +188,10 @@ def _held_into_session(store: Store, router: object) -> dict[str, float] | None:
 
     A live router values the account's positions as weights of the S slot's book
     notional (`order_router.held_weights`), so the engine's turnover budget and
-    cost model measure each day against the book actually held. A shadow or
-    simulated router holds nothing of its own and keeps the all-cash start.
+    cost model measure each day against the book actually held. The staging
+    simulated router answers the same way from its carried simulated book
+    (`alpha-engine-config-I13305`). A shadow router holds nothing of its own
+    and keeps the all-cash start.
     """
     held: Callable[[float], dict[str, float]] | None = getattr(router, "held_weights", None)
     if held is None:
@@ -276,6 +280,7 @@ def daily_session_cycle(
         environ=environ,
     )
     shortfall = _file_shortfall(ctx, router, champion=contract.arm_id, clock=clock)
+    _record_turnover(ctx, result)
     shadow_days = len(evidence.shadow_days())
     ctx.record_metric(
         _metric(
@@ -296,6 +301,34 @@ def daily_session_cycle(
         "trading_days": evidence.trading_days,
         "shadow_days": shadow_days,
     }
+
+
+#: The budget recorded when the S slot's parameter set disables the turnover
+#: budget: a long-only book can trade at most all of itself one way.
+UNBOUNDED_TURNOVER_BUDGET = 1.0
+
+
+def _record_turnover(ctx: RunContext, result: Mapping[str, object]) -> None:
+    """Put the session's turnover and its budget on the run record (I13305).
+
+    The staging soak gate grades ``turnover.breached`` on `trader.session`
+    records. The harness method is looked up rather than called directly: the
+    crucible that RUNS is the release wheel `trader/release_pin` names, which
+    moves only through the trader's own smoke and may predate
+    `RunContext.record_turnover`. A wheel without it files no turnover — the
+    gate then reads the day as unknown, never green — and the session itself
+    is untouched, because a missing telemetry method must never cost a trading
+    day.
+    """
+    record: Callable[..., None] | None = getattr(ctx, "record_turnover", None)
+    value = result.get("turnover_one_way")
+    if record is None or not isinstance(value, float):
+        return
+    budget = result.get("turnover_budget")
+    record(
+        value=value,
+        budget=float(budget) if isinstance(budget, (int, float)) else UNBOUNDED_TURNOVER_BUDGET,
+    )
 
 
 def run_daily_session(
@@ -389,6 +422,13 @@ def run_staging_session(
         )
         if not isinstance(router, SimulatedFillRouter) or result["outcome"] != "served":
             return result
+        # The closing simulated book, which tomorrow's session opens from
+        # (`alpha-engine-config-I13305`).
+        ctx.record_output(
+            simulated_positions_key(day),
+            router.simulated_positions_payload(trading_day=day, now=clock()),
+            SIMULATED_POSITIONS_SCHEMA_VERSION,
+        )
         key = simulated_fills_key(day)
         ctx.record_output(
             key,

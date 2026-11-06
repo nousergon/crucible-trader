@@ -69,7 +69,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from crucible.bench import SlotBenchError, active_bench
@@ -103,6 +103,7 @@ __all__ = [
     "STRATEGY_SLOT",
     "TargetBook",
     "construct_target_book",
+    "session_turnover_budget",
     "held_tickers",
     "initial_weights",
     "resolve_strategy_arm",
@@ -137,6 +138,10 @@ class TargetBook:
     #: not carry them (test doubles).
     alpha: dict[str, float] | None = None
     eligible: dict[str, bool] | None = None
+    #: The one-way turnover the session may trade before it counts as churn
+    #: (:func:`session_turnover_budget`). ``None`` when the parameter set
+    #: disables the budget, or from a test double (`alpha-engine-config-I13305`).
+    turnover_budget: float | None = None
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -317,6 +322,39 @@ def _previous_weights(
     return np.array([float(previous.get(t, 0.0)) for t in universe.tickers], dtype=np.float64)
 
 
+def session_turnover_budget(diagnostics: Mapping[str, object]) -> float | None:
+    """The turnover a session may trade before it counts as churn (I13305).
+
+    The discretionary budget (`max_daily_turnover` scaled by the conviction
+    gate) plus the trading an EXIT forces: a held name that went ineligible,
+    or sits above its cap, is sold, and the cash it frees is redeployed, so
+    each unit of forced selling is a unit of one-way turnover. Twice the
+    decomposition's one-sided sell figures, since the decomposition halves L1.
+
+    Deploying idle cash is deliberately NOT forgiven here, although the
+    construction's own effective cap forgives it (the cash sleeve is an
+    equality pin, `crucible.portfolio._mandatory_turnover_floor`): that is
+    exactly how a book rebuilt from cash every day (11-03 to 11-05, 97%
+    one-way) passed under a cap the engine raised to 0.97 to meet it. A
+    breach here means the book moved further than its budget and its forced
+    exits explain: a rebuild from cash, or a book the order caps kept from
+    reaching yesterday's target.
+
+    ``None`` when the parameter set disables the budget.
+    """
+    discretionary = diagnostics.get("turnover_budget_discretionary")
+    if not isinstance(discretionary, (int, float)):
+        return None
+    raw = diagnostics.get("turnover_mandatory_floor_by_cause")
+    by_cause: Mapping[str, float] = (
+        cast(Mapping[str, float], raw) if isinstance(raw, Mapping) else {}
+    )
+    forced = float(by_cause.get("ineligibility_pin", 0.0)) + float(
+        by_cause.get("position_cap", 0.0)
+    )
+    return float(discretionary) + 2.0 * forced
+
+
 def construct_target_book(
     store: Store,
     *,
@@ -372,6 +410,7 @@ def construct_target_book(
         w_initial=_previous_weights(inputs.universe, previous_weights, trading_day=trading_day),
     )
     (weights,) = constructed.weights
+    (diagnostics,) = constructed.diagnostics
     book = constructed.book
     assert book.cost_bps is not None  # construct_book always prices; a None is a harness defect
     return TargetBook(
@@ -382,6 +421,7 @@ def construct_target_book(
         universe=inputs.universe,
         weights={t: float(w) for t, w in zip(inputs.universe.tickers, weights, strict=True)},
         turnover_one_way_ratio=float(book.turnover[0]),
+        turnover_budget=session_turnover_budget(diagnostics),
         cost_bps=float(book.cost_bps[0]),
         portfolio_notional_usd=float(params.book_notional_usd),
         evidence=constructed.evidence,
