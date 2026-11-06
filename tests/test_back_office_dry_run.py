@@ -14,7 +14,7 @@ import sys
 
 import pytest
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
-from crucible.store import LocalStore, open_store
+from crucible.store import ETAG_ABSENT, LocalStore, open_store
 
 from crucible_trader import back_office_dry_run
 from crucible_trader.back_office_dry_run import dry_run, load_fills, main
@@ -272,6 +272,43 @@ class TestRefusals:
         (out / "old").write_text("x")
         with pytest.raises(SystemExit):
             main(["--store", str(root), "--month", "2026-09", "--out", str(out)])
+
+
+class TestJournalsAsOf:
+    """The store as the close run day saw it (`alpha-engine-config-I13124`)."""
+
+    def test_a_month_replays_into_a_store_whose_ledger_has_moved_on(self, root):
+        # As October is now: the live ledger opened on a later day, so the
+        # store already holds a journal dated after the month's close run day.
+        LocalStore(root).put_bytes(journal_key(T, "2026-10-02"), b"{}")
+        summary = dry_run(open_store(str(root), dry_run=True), month="2026-09", now=NOW)
+        assert {row["trading_day"] for row in summary["ledger"]} == {CLEAN, BROKEN, LATER}
+        assert not any("NOT posted" in str(row["reason"]) for row in summary["ledger"])
+        assert journal_key(T, LATER) in summary["keys_written"]
+        assert summary["close"] is not None
+        assert summary["close"]["status"] == "refused"  # no statement for 09-30, as without
+
+    def test_only_journals_after_the_day_are_hidden_and_writes_pass_through(self, tmp_path):
+        inner = LocalStore(tmp_path / "s")
+        on_day, after = journal_key(T, "2026-10-01"), journal_key(T, "2026-10-02")
+        other = trader_broker_statement_key("2026-10-02")
+        for key in (on_day, after, other):
+            inner.put_bytes(key, b"{}")
+        view = back_office_dry_run._JournalsAsOf(inner, "2026-10-01")
+        assert sorted(view.list_keys("trader/")) == sorted([on_day, other])
+        assert not view.exists(after)
+        assert view.exists(on_day)
+        assert view.etag(after) == ETAG_ABSENT
+        assert view.etag(on_day) == inner.etag(on_day)
+        with pytest.raises(KeyError):
+            view.get_bytes(after)
+        assert view.get_bytes(other) == b"{}"
+        key = journal_key(T, "2026-09-30")
+        view.put_bytes(key, b"[]")
+        assert inner.get_bytes(key) == b"[]"
+        assert view.compare_and_swap(key, inner.etag(key), b"[1]")
+        assert inner.get_bytes(key) == b"[1]"
+        assert view.presigned_url(key, 60) == inner.presigned_url(key, 60)
 
 
 def test_the_close_runs_on_the_next_months_first_trading_day():
