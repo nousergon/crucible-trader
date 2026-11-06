@@ -511,6 +511,9 @@ class TestClose:
         ctx, out = run(store, "2027-01-04")
         assert out is not None and out["month"] == "2026-11"
         assert "2026-11 close" in ctx.metrics[0]["status_reason"]
+        # codex 3aac006d90588adc: November is a month overdue on 2027-01-04;
+        # counting from January's first day read it as freshly refused.
+        assert ctx.metrics[0]["status"] == "FAIL"
 
     def test_a_month_before_an_unclosed_month_is_refused_and_nothing_raises(self):
         with pytest.raises(CloseError, match="close in order"):

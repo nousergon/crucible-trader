@@ -28,9 +28,10 @@ go unwritten because its lock could not be applied. A refused lock is a
 The cost is a window of seconds in which a fresh version is unlocked, during
 which the only identity that can write these prefixes holds no delete.
 
-Retention only ever extends: COMPLIANCE refuses a shorter date, and a re-run
-asks for the same date it asked for the first time (the date is derived from
-the record's trading year, not from the clock), so a re-run is idempotent.
+Retention only ever extends: COMPLIANCE refuses a shorter date. The date is
+derived from the record's trading year, or the year the run wrote it when that
+is later (a backfill or a rerun across New Year), so a re-run in the same year
+asks for the same date and a later one only extends it.
 """
 
 from __future__ import annotations
@@ -79,10 +80,16 @@ def is_books_key(key: str) -> bool:
     return key.startswith(BOOKS_PREFIXES)
 
 
-def retain_until(trading_day: dt.date) -> dt.datetime:
-    """Midnight UTC after the last day of ``trading_day``'s fiscal year plus
-    :data:`RETENTION_YEARS` (a 2026 record is kept through 2031-12-31)."""
-    return dt.datetime(trading_day.year + RETENTION_YEARS + 1, 1, 1, tzinfo=dt.UTC)
+def retain_until(trading_day: dt.date, *, written_on: dt.date | None = None) -> dt.datetime:
+    """Midnight UTC after the last day of the entry's fiscal year plus
+    :data:`RETENTION_YEARS` (a 2026 record is kept through 2031-12-31).
+
+    The entry's year is the later of ``trading_day``'s and ``written_on``'s:
+    Rule 204-2 counts from when the entry was MADE, so a backfill or rerun
+    written in a later year than the day it records must not get a short --
+    or already past -- date (codex 2c57f968e826feba)."""
+    year = max(trading_day.year, written_on.year if written_on is not None else 0)
+    return dt.datetime(year + RETENTION_YEARS + 1, 1, 1, tzinfo=dt.UTC)
 
 
 def lock_books_records(
@@ -91,6 +98,7 @@ def lock_books_records(
     *,
     trading_day: dt.date,
     prefixes: tuple[str, ...] = BOOKS_PREFIXES,
+    written_on: dt.date | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Apply COMPLIANCE retention to each key in ``keys`` under ``prefixes``
     (the trader's books by default).
@@ -110,7 +118,7 @@ def lock_books_records(
     try:
         if not isinstance(store, S3Store) or is_capturing(store):
             return locked, refused
-        until = retain_until(trading_day)
+        until = retain_until(trading_day, written_on=written_on)
         for key in dict.fromkeys(k for k in keys if k.startswith(prefixes)):
             try:
                 store.client.put_object_retention(
@@ -127,12 +135,25 @@ def lock_books_records(
     return locked, refused
 
 
+def _written_on(now: str) -> dt.date | None:
+    """The run's UTC date from its ``now`` stamp; ``None`` (trading year only)
+    when unparseable, so a malformed stamp never leaves the books unlocked."""
+    try:
+        return dt.datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(dt.UTC).date()
+    except ValueError:
+        return None
+
+
 def lock_cycle_books(ctx: Any, *, now: str) -> None:  # pyright: ignore[reportExplicitAny]  # crucible.runner.RunContext
     """Lock every books record this run wrote (``ctx.outputs``) and record the
     outcome as one metric. Never raises."""
     try:
         keys = [str(output["key"]) for output in ctx.outputs]
-        locked, refused = lock_books_records(ctx.store, keys, trading_day=ctx.trading_day)
+        written_on = _written_on(now)
+        until = retain_until(ctx.trading_day, written_on=written_on)
+        locked, refused = lock_books_records(
+            ctx.store, keys, trading_day=ctx.trading_day, written_on=written_on
+        )
         if not locked and not refused:
             return
         if refused:
@@ -145,7 +166,7 @@ def lock_cycle_books(ctx: Any, *, now: str) -> None:  # pyright: ignore[reportEx
             status = "OK"
             reason = (
                 f"{len(locked)} books record(s) under {RETENTION_MODE} retention until "
-                f"{retain_until(ctx.trading_day).date().isoformat()}"
+                f"{until.date().isoformat()}"
             )
         ctx.record_metric(
             {

@@ -786,6 +786,10 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
                 break
             except PointerConflictError:
                 continue
+        else:
+            # Three lost races: `current` was neither published nor found
+            # later, so the step did not do its job (codex 200669767300e21a).
+            raise PointerConflictError(f"{SCORE_CURRENT_KEY}: lost the race 3 times")
         totals = cast("Mapping[str, object]", document["totals"])
         overdue = cast("int", totals["overdue"])
         status, value = ("WATCH" if overdue else "OK"), float(cast("int", totals["queue"]))

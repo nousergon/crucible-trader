@@ -846,6 +846,24 @@ class TestExceptionScore:
         monkeypatch.undo()
         assert output(store, SCORE_CURRENT_KEY)["trading_day"] == "2026-09-18"
 
+    def test_exhausted_score_races_are_a_fail_not_a_filing(self, store, monkeypatch):
+        # codex 200669767300e21a: three lost compare-and-swaps fell through
+        # and the step reported the score filed although `current` was not.
+        from crucible.store import PointerConflictError
+
+        from crucible_trader.reconciliation_job import file_exception_score
+
+        TestExceptionRecords()._discrepant(store, ctx_for(store))
+        ctx = ctx_for(store)
+
+        def always_lose(*_a, **_k):
+            raise PointerConflictError("raced")
+
+        monkeypatch.setattr(ctx, "record_output_cas", always_lose)
+        file_exception_score(ctx, now="2026-09-11T22:05:00Z")
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
+        assert metric["status"] == "FAIL" and "lost the race 3 times" in metric["status_reason"]
+
     def test_a_score_failure_leaves_the_reconcile_unchanged(self, store, monkeypatch, caplog):
         import crucible_trader.reconciliation_job as job
 

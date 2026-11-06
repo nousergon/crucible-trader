@@ -608,7 +608,13 @@ def close_prior_month(
             key = cast("str", finished.pop("_key"))
             if finished["status"] != "closed":
                 n = len(cast("list[object]", finished["exceptions"]))
-                late = len(trading_days_between(f"{day[:7]}-01", day)) > GAP_EXPIRY_TRADING_DAYS
+                # Lateness runs from the end of the month being CLOSED, not the
+                # run day's month: an older month retried later is already
+                # overdue (codex 3aac006d90588adc).
+                due_from = (_month_start(month) + dt.timedelta(days=31)).replace(day=1)
+                late = (
+                    len(trading_days_between(due_from.isoformat(), day)) > GAP_EXPIRY_TRADING_DAYS
+                )
                 filed = _file_proposals(ctx, finished, tenant=tenant, month=month, day=day, now=now)
                 _metric(
                     ctx,

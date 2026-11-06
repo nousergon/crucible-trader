@@ -57,6 +57,8 @@ from zoneinfo import ZoneInfo
 
 from crucible.keys import trader_reconciliation_key
 from crucible.store import (
+    ETAG_ABSENT,
+    PointerConflictError,
     Store,
     capture_ledger_of,
     capturing,
@@ -70,6 +72,8 @@ from crucible_trader.broker_statement import (
     BrokerStatement,
     BrokerStatementError,
 )
+from crucible_trader.exception_record import PAPER_FUND_TENANT
+from crucible_trader.ledger import journal_key, ledger_reconciliation_key
 from crucible_trader.reconcile_entrypoint import live_corporate_action_source
 from crucible_trader.reconciliation import Fill
 from crucible_trader.reconciliation_job import run_reconciliation
@@ -290,6 +294,10 @@ def backfill_day(
         "keys_not_applied": [k for k in keys if k.rsplit("/", 1)[-1] in LIVE_POINTERS],
         "locked_writes": sorted({w.key for w in writes if w.object_lock_mode}),
         "has_reconciliation": trader_reconciliation_key(day) in keys,
+        # The day's journal and its ledger view: a cycle whose ledger posting
+        # was refused wrote a reconciliation but no books (codex 29e6af2958a0c547).
+        "has_ledger": journal_key(PAPER_FUND_TENANT, day) in keys
+        and ledger_reconciliation_key(PAPER_FUND_TENANT, day) in keys,
     }
     return view, summary
 
@@ -342,7 +350,8 @@ def apply_writes(
     """Copy the captured objects to ``backend``, create-only, then put the
     books among them under WORM retention exactly as the live cycle's step 5h
     does (:func:`crucible_trader.books_retention.lock_books_records`, same
-    prefixes, same date from the day's trading year). Every refusal is checked
+    prefixes, same date from the later of the day's trading year and the
+    apply's year). Every refusal is checked
     before the first write. A refused lock never unwinds the writes; it is
     recorded in ``summary["lock_refused"]`` (``summary["locked"]`` lists the
     keys locked)."""
@@ -355,6 +364,11 @@ def apply_writes(
         raise BackfillRefused(
             f"the cycle wrote no reconciliation ({summary['error']}); nothing to apply"
         )
+    if not summary.get("has_ledger"):
+        raise BackfillRefused(
+            f"the cycle wrote no journal and ledger view for {summary['trading_day']} "
+            f"({summary['error']}); nothing to apply"
+        )
     if summary["locked_writes"]:
         raise BackfillRefused(f"Object Lock writes cannot be replayed: {summary['locked_writes']}")
     keys = cast("list[str]", summary["keys_to_write"])
@@ -362,9 +376,18 @@ def apply_writes(
     if existing:
         raise BackfillRefused(f"create-only: {len(existing)} key(s) already exist: {existing}")
     for key in keys:
-        backend.put_bytes(key, view.get_bytes(key))
+        # Create-only at the write itself: the scan above refuses before any
+        # write, but a writer landing between the scan and this put must not
+        # be overwritten (codex 9b1df526e391319d).
+        try:
+            backend.compare_and_swap(key, ETAG_ABSENT, view.get_bytes(key))
+        except PointerConflictError:
+            raise BackfillRefused(f"create-only: {key} was written during the apply") from None
     locked, refused = lock_books_records(
-        backend, keys, trading_day=dt.date.fromisoformat(str(summary["trading_day"]))
+        backend,
+        keys,
+        trading_day=dt.date.fromisoformat(str(summary["trading_day"])),
+        written_on=now.astimezone(dt.UTC).date(),
     )
     summary["locked"], summary["lock_refused"] = locked, refused
     return keys
