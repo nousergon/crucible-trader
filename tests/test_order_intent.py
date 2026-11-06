@@ -12,6 +12,7 @@ from crucible.store import LocalStore
 
 from crucible_trader.execution_shortfall import (
     Fill,
+    build_no_orders_document,
     build_shortfall_document,
     decide,
     write_shortfall_document,
@@ -212,6 +213,15 @@ def test_filled_shares_net_across_days_before_the_book_day(store) -> None:
     _session(store, DAY, ("CCC", "buy", 10, 10))
     owned = bought_by_this_trader(store, {"AAA", "BBB", "CCC"}, account="DU1", before=DAY)
     assert owned == frozenset({"BBB"})  # AAA was sold whole
+
+
+def test_a_session_record_without_fills_counts_a_buy_as_nothing_filled(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    write_shortfall_document(
+        store,
+        build_no_orders_document(trading_day="2026-09-03", champion="c", reason="r", now=WHEN),
+    )
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
 
 
 def test_a_sell_with_no_fill_on_record_is_refused_not_read_as_unfilled(store) -> None:
