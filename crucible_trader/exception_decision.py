@@ -396,21 +396,27 @@ def _sub(record: Mapping[str, object], name: str, field: str) -> object:
 
 def _evidence(record: Mapping[str, object] | None) -> dict[str, object]:
     """The queue item's view of its exception record: the amount and unit, the
-    cash tier, and the source records it cites (expected side, actual side, the
-    reconciliation document and the run manifest), each once."""
+    cash tier, and the source records it cites, each once and named by its role
+    (``expected``, ``actual``, ``document``: the reconciliation that found it,
+    ``manifest``: that run's manifest), as ``{"role", "record"}`` items so a
+    reader can show which side each key is."""
     if record is None:
         return {"amount": None, "unit": None, "tier": None, "cited_records": []}
-    cited = (
-        _sub(record, "expected", "record"),
-        _sub(record, "actual", "record"),
-        _sub(record, "detected_by", "document_key"),
-        _sub(record, "detected_by", "manifest_key"),
-    )
+    cited: list[dict[str, object]] = []
+    for role, name, field in (
+        ("expected", "expected", "record"),
+        ("actual", "actual", "record"),
+        ("document", "detected_by", "document_key"),
+        ("manifest", "detected_by", "manifest_key"),
+    ):
+        key = _sub(record, name, field)
+        if isinstance(key, str) and key and all(c["record"] != key for c in cited):
+            cited.append({"role": role, "record": key})
     return {
         "amount": record.get("amount"),
         "unit": record.get("unit"),
         "tier": cash_tier(record.get("amount"), record.get("unit")),
-        "cited_records": list(dict.fromkeys(c for c in cited if isinstance(c, str) and c)),
+        "cited_records": cited,
     }
 
 

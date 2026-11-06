@@ -413,10 +413,11 @@ class TestQueueEvidence:
         (item,) = doc["queue"]
         assert item["amount"] == 107.69 and item["unit"] == "usd" and item["tier"] == "page"
         assert item["expires"] == "2026-09-16"  # Fri + 3 trading days
+        # the reconciliation document is the expected side's record too: cited once
         assert item["cited_records"] == [
-            f"trader/reconciliation/{DAY}.json",
-            f"trader/broker_statements/{DAY}.json",
-            f"runs/trader.reconcile/{DAY}/run.json",
+            {"role": "expected", "record": f"trader/reconciliation/{DAY}.json"},
+            {"role": "actual", "record": f"trader/broker_statements/{DAY}.json"},
+            {"role": "manifest", "record": f"runs/trader.reconcile/{DAY}/run.json"},
         ]
 
     def test_no_record_or_another_tenants_record_cites_nothing(self):
