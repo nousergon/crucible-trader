@@ -51,6 +51,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import pathlib
 import re
 import sys
@@ -73,6 +74,8 @@ from crucible_trader.exception_proposal import (
     PROPOSALS_PREFIX,
     PROPOSER,
 )
+from crucible_trader.exception_record import exceptions_key, upgrade_legacy_day_document
+from crucible_trader.reconciliation import CASH_PAGE_THRESHOLD_USD, CASH_TOLERANCE_USD
 
 __all__ = [
     "AGE_LIMIT_TRADING_DAYS",
@@ -86,9 +89,11 @@ __all__ = [
     "DecisionError",
     "decide",
     "decision_key",
+    "cash_tier",
     "effective_decisions",
     "exception_score_key",
     "load_decisions",
+    "load_exception_records",
     "load_proposals",
     "main",
     "record_decision",
@@ -335,6 +340,80 @@ def load_proposals(store: Store, *, until: str | None = None) -> list[dict[str, 
     return out
 
 
+def load_exception_records(store: Store, days: Iterable[str]) -> dict[str, Mapping[str, object]]:
+    """Exception id -> its stored ``exception.v1`` record, for each of ``days``
+    whose day file exists (`alpha-engine-config-I13121`: the review queue shows
+    each item's amount, tier and cited source records). A missing day file is
+    no records, never an error; the first record seen for an id is kept."""
+    out: dict[str, Mapping[str, object]] = {}
+    for day in sorted(set(days)):
+        key = exceptions_key(day)
+        if not store.exists(key):
+            continue
+        document = upgrade_legacy_day_document(_json_object(store, key))
+        records = document.get("records")
+        for record in cast("list[object]", records) if isinstance(records, list) else []:
+            if isinstance(record, Mapping):
+                found = cast("Mapping[str, object]", record)
+                if isinstance(found.get("exception_id"), str):
+                    out.setdefault(cast("str", found["exception_id"]), found)
+    return out
+
+
+def cash_tier(amount: object, unit: object) -> str | None:
+    """The cash tier of a difference of ``amount`` dollars (Brian 2026-10-28 and
+    2026-11-02, the reconciler's own bands): at most
+    :data:`~crucible_trader.reconciliation.CASH_TOLERANCE_USD` is ``absorb``
+    (rounded to the broker), up to
+    :data:`~crucible_trader.reconciliation.CASH_PAGE_THRESHOLD_USD` is
+    ``review``, above it ``page``. Shares have no band, so anything that is not
+    a finite dollar amount has no tier (``None``)."""
+    if unit != "usd" or isinstance(amount, bool) or not isinstance(amount, int | float):
+        return None
+    if not math.isfinite(amount):
+        return None
+    size = round(abs(amount), 6)
+    if size <= CASH_TOLERANCE_USD:
+        return "absorb"
+    return "review" if size <= CASH_PAGE_THRESHOLD_USD else "page"
+
+
+def _expires(day: str) -> str:
+    """The last trading day a queue item from ``day`` is not yet overdue: its
+    age reaches :data:`AGE_LIMIT_TRADING_DAYS` that day and passes it the next
+    (the same day as the ledger's gap ``expires``)."""
+    current, left = dt.date.fromisoformat(day), AGE_LIMIT_TRADING_DAYS
+    while left:
+        current += dt.timedelta(days=1)
+        left -= 1 if is_trading_day(current) else 0
+    return current.isoformat()
+
+
+def _sub(record: Mapping[str, object], name: str, field: str) -> object:
+    value = record.get(name)
+    return cast("Mapping[str, object]", value).get(field) if isinstance(value, Mapping) else None
+
+
+def _evidence(record: Mapping[str, object] | None) -> dict[str, object]:
+    """The queue item's view of its exception record: the amount and unit, the
+    cash tier, and the source records it cites (expected side, actual side, the
+    reconciliation document and the run manifest), each once."""
+    if record is None:
+        return {"amount": None, "unit": None, "tier": None, "cited_records": []}
+    cited = (
+        _sub(record, "expected", "record"),
+        _sub(record, "actual", "record"),
+        _sub(record, "detected_by", "document_key"),
+        _sub(record, "detected_by", "manifest_key"),
+    )
+    return {
+        "amount": record.get("amount"),
+        "unit": record.get("unit"),
+        "tier": cash_tier(record.get("amount"), record.get("unit")),
+        "cited_records": list(dict.fromkeys(c for c in cited if isinstance(c, str) and c)),
+    }
+
+
 def load_decisions(store: Store, *, prefix: str = DECISIONS_PREFIX) -> list[dict[str, object]]:
     """Every stored decision under ``prefix``, each validated."""
     out: list[dict[str, object]] = []
@@ -417,11 +496,19 @@ def score(
     *,
     as_of: str,
     generated_at: str,
+    exceptions: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """The `exception_score.v1` document over every proposal up to ``as_of``.
 
     Decisions about proposals not among ``proposals`` are counted as
     ``orphan_decisions`` and score nothing.
+
+    Each queue item carries ``expires`` (:func:`_expires`) and, from its
+    exception record in ``exceptions`` (:func:`load_exception_records`) when
+    that record is the same tenant's, ``amount``, ``unit``, ``tier``
+    (:func:`cash_tier`) and ``cited_records``; with no such record those are
+    null and an empty list (a month-end close line has none under
+    ``trader/exceptions/``).
     """
     _day(as_of)
     effective = effective_decisions(decisions)
@@ -462,6 +549,9 @@ def score(
             calls.setdefault(group_key, []).append((cast("str", decision["decided_at"]), verdict))
             continue
         age = _age(cast("str", proposal["trading_day"]), as_of)
+        record = (exceptions or {}).get(cast("str", proposal["exception_id"]))
+        if record is not None and record.get("tenant") != proposal["tenant"]:
+            record = None
         queue.append(
             {
                 **{f: proposal[f] for f in _PROPOSAL_FIELDS},
@@ -474,6 +564,8 @@ def score(
                 "standing_decision_id": decision["decision_id"] if decision is not None else None,
                 "age_trading_days": age,
                 "overdue": age > AGE_LIMIT_TRADING_DAYS,
+                "expires": _expires(cast("str", proposal["trading_day"])),
+                **_evidence(record),
             }
         )
     classes: list[dict[str, object]] = []
