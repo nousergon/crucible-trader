@@ -269,7 +269,9 @@ def caught(store: LocalStore, plant: Plant, runs: Mapping[str, Run]) -> list[str
     if plant.record_class is not None:
         found = [r for r in records(store, day) if r["class"] == plant.record_class]
         proposals = read(store, exception_proposals_key(day))["proposals"] if found else []
-        if not found or {p["exception_id"] for p in proposals} < {r["exception_id"] for r in found}:
+        if not found or not {r["exception_id"] for r in found} <= {
+            p["exception_id"] for p in proposals
+        }:
             misses.append(f"record/proposal {plant.record_class}")
     if plant.ledger_gap is not None and not [
         e for e in load_journals(store, T, before=DAYS[2])[day] if e.kind == plant.ledger_gap

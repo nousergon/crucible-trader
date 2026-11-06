@@ -175,6 +175,9 @@ def build_statement(
         schedule.get("partial_period") == "calendar_days"
         and close.get("opened_in_month")
         and close.get("start_trading_day") != close.get("first_trading_day")
+        # An opening valued at the prior month's last statement is open from
+        # this month's first day: the whole month is billed (aec#13237).
+        and str(close.get("start_trading_day"))[:7] == month
     ):
         billed_days = days_in_month - int(str(close["start_trading_day"])[8:10]) + 1
     adviser = _cents(

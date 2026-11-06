@@ -759,14 +759,16 @@ def _interest_posted(inputs: ReconciliationInputs, expected_cash: float) -> floa
 
 def _mismatch(row: Mapping[str, Any], *, side: str) -> Discrepancy:  # pyright: ignore[reportExplicitAny]
     """A three-way row whose sources disagree, as its own finding: expected is
-    Polygon's share change, actual is IB's."""
-    polygon_shares, ib_shares = int(row["polygon_shares"]), int(row["ib_shares"])
+    Polygon's share change, actual is the disagreeing side's (IB's, or the
+    ledger's on a ledger-only finding, where IB matches Polygon)."""
+    polygon_shares = int(row["polygon_shares"])
+    actual = int(row["ledger_shares"] if side == "ledger" else row["ib_shares"])
     return Discrepancy(
         MISMATCH_CLASS,
         str(row["instrument"]),
         float(polygon_shares),
-        float(ib_shares),
-        float(ib_shares - polygon_shares),
+        float(actual),
+        float(actual - polygon_shares),
         side,
         str(row["detail"]),
     )

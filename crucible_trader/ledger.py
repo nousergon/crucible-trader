@@ -99,9 +99,10 @@ says it arrived (``dividends_unpaid`` / ``dividend_credits``). Valuation entries
 includes interest accrued and not yet posted to cash (``accrued_cash_usd``,
 ``AccruedCash``); GIPS needs it accrued and Rule 1 wants it as its own entry.
 Each day whose statement records an accrual, the ledger moves
-:data:`INTEREST_RECEIVABLE` to IB's figure: a rise is an ``interest_accrual``
-entry against :data:`INTEREST_INCOME`, a fall is an ``interest_settlement``
-entry into cash (a fall is IB posting the interest; the posted amount itself has
+:data:`INTEREST_RECEIVABLE` to IB's figure: a move away from zero is an
+``interest_accrual`` entry against :data:`INTEREST_INCOME` (IB's figure is
+negative for debit interest), a move toward zero is an ``interest_settlement``
+entry into cash (IB posting the interest; the posted amount itself has
 no source yet, so any difference from IB's cash is that day's ordinary cash
 gap). The accrual the book OPENED with is opening equity, not income: the first
 time the receivable is booked, the opening statement's accrual is its own
@@ -109,8 +110,9 @@ time the receivable is booked, the opening statement's accrual is its own
 did not record an accrual (``broker_statement.v1``), how much of the first
 recorded balance predates the opening is a genuine data gap: the balance is
 booked once to :data:`INTEREST_FIRST_RECORDED`, its own account and its own
-line in the close, never folded into the month's interest income. A statement
-that records no accrual books nothing; the receivable stands.
+line in the close, never folded into the month's interest income. A recorded
+zero is a baseline like any other (a zero entry). A statement that records no
+accrual books nothing; the receivable stands.
 
 **Failure isolation.** :func:`post_daily_ledger` NEVER raises: the trader's
 reconcile job decides and pages exactly as before; this step rides beside it
@@ -651,7 +653,7 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         "known_deltas": [
             "dividend receivable recognised on the pay date, not the ex-date",
             "no daily valuation entry (Rule 7) yet",
-            "interest posted to cash is inferred from a fall in IB's accrual; the posted "
+            "interest posted to cash is inferred from IB's accrual moving toward zero; the posted "
             "amount has no source, so a difference is that day's cash gap",
         ],
     }
@@ -678,46 +680,58 @@ def _book_interest(
     )
     if not established:
         if opened_with is None or opened_with.accrued_cash_usd is None:
-            if target:
-                book(
-                    "interest_accrual",
-                    f"accrual/first-recorded/{day}",
-                    [
-                        Posting(INTEREST_RECEIVABLE, target),
-                        Posting(INTEREST_FIRST_RECORDED, -target),
-                    ],
-                    source="ib_statement",
-                    opening_accrual="not recorded by the opening statement",
-                    period="unknown: some of it may predate the opening",
-                )
-            return
-        at_opening = to_cents(opened_with.accrued_cash_usd)
-        if at_opening:
+            # A recorded zero is a baseline too: booked (at zero) so the
+            # account is established and a later balance accrues as income.
             book(
                 "interest_accrual",
-                f"accrual/opening/{opened_with.trading_day}",
-                [Posting(INTEREST_RECEIVABLE, at_opening), Posting(OPENING, -at_opening)],
+                f"accrual/first-recorded/{day}",
+                [
+                    Posting(INTEREST_RECEIVABLE, target),
+                    Posting(INTEREST_FIRST_RECORDED, -target),
+                ],
                 source="ib_statement",
-                statement_day=opened_with.trading_day,
-                basis="accrued before the book opened: opening equity, not income",
+                opening_accrual="not recorded by the opening statement",
+                period="unknown: some of it may predate the opening",
             )
-    change = target - ledger.cents(tenant, account, INTEREST_RECEIVABLE)
-    if change > 0:
+            return
+        at_opening = to_cents(opened_with.accrued_cash_usd)
+        book(
+            "interest_accrual",
+            f"accrual/opening/{opened_with.trading_day}",
+            [Posting(INTEREST_RECEIVABLE, at_opening), Posting(OPENING, -at_opening)],
+            source="ib_statement",
+            statement_day=opened_with.trading_day,
+            basis="accrued before the book opened: opening equity, not income",
+        )
+    held = ledger.cents(tenant, account, INTEREST_RECEIVABLE)
+    # A move TOWARD zero is a posting to cash; a move away from zero accrues.
+    # IB's AccruedCash is negative for debit interest, so a falling negative
+    # balance is more interest owed, not a settlement; a move across zero
+    # settles the old balance and accrues the new one.
+    settled = (
+        held - max(target, 0)
+        if held > 0 and target < held
+        else held - min(target, 0)
+        if held < 0 and target > held
+        else 0
+    )
+    if settled:
+        book(
+            "interest_settlement",
+            f"accrual/{day}",
+            [Posting(CASH, settled), Posting(INTEREST_RECEIVABLE, -settled)],
+            source="ib_statement",
+            accrued_cents=target,
+            inferred="a move of IB's accrual toward zero is a posting to cash",
+        )
+    change = target - held + settled
+    if change:
         book(
             "interest_accrual",
             f"accrual/{day}",
             [Posting(INTEREST_RECEIVABLE, change), Posting(INTEREST_INCOME, -change)],
             source="ib_statement",
             accrued_cents=target,
-        )
-    elif change < 0:
-        book(
-            "interest_settlement",
-            f"accrual/{day}",
-            [Posting(CASH, -change), Posting(INTEREST_RECEIVABLE, change)],
-            source="ib_statement",
-            accrued_cents=target,
-            inferred="a fall in IB's accrual is a posting to cash",
         )
 
 
@@ -1329,7 +1343,7 @@ def run_checks(
     # that day's end (alpha-engine-config-I13129 settled-close completeness).
     span = trading_days_between(days[0], day) if days else [day]
     prev = span[-2] if len(span) > 1 else None
-    held: list[str] = []
+    held_after: dict[str, list[str]] = {}
 
     # Roll-forward, today, and rebuild-from-raw: each earlier day of the open
     # month rebuilt from its journals must equal the view published for it.
@@ -1350,7 +1364,7 @@ def run_checks(
         for entry in journals[d]:
             replay.append(entry)
         if prev is not None and d <= prev:
-            held = sorted(replay.positions(tenant, account))
+            held_after[d] = sorted(replay.positions(tenant, account))
         if month_start <= d < day:
             key = ledger_reconciliation_key(tenant, d)
             if not store.exists(key):
@@ -1370,22 +1384,28 @@ def run_checks(
     # Completeness: from the open month's start (or the first journal), every
     # trading day has a journal, a published view and an IB statement.
     first = max(month_start, days[0]) if days else day
-    # ...and every name held at the end of the PREVIOUS trading day has its
-    # settled close. The day's own price panel is compiled after this job runs
-    # (data/<day>/panel.parquet lands ~02:20Z the next morning), so each run
-    # checks the day before; the first trading day of a month leaves the last
-    # day of the prior month to the month-end close (`close_input_missing`).
+    # ...and every name held at the end of each open-month trading day up to
+    # the PREVIOUS one has its settled close. The day's own price panel is
+    # compiled after this job runs (data/<day>/panel.parquet lands ~02:20Z the
+    # next morning), so each run checks through the day before, and re-checks
+    # every earlier day so an unresolved gap stays a break (aec#13237); the
+    # first trading day of a month leaves the last day of the prior month to
+    # the month-end close (`close_input_missing`).
     closes_day: str | None = None
-    close_gaps: list[str] = []
+    close_gaps: dict[str, list[str]] = {}
     if closes is not None and prev is not None and prev >= first:
         closes_day = prev
-        have: set[str] = set()
-        if held:
+        held: list[str] = []
+        for d in trading_days_between(days[0], prev):
+            held = held_after.get(d, held)
+            if d < first or not held:
+                continue
+            have: set[str]
             try:
-                have = set(closes(prev, held))
+                have = set(closes(d, held))
             except Exception:  # noqa: BLE001 - an unreadable panel is a missing close, never a raise
                 have = set()
-        close_gaps = [f"close:{t}" for t in held if t not in have]
+            close_gaps[d] = [f"close:{t}" for t in held if t not in have]
     missing: list[dict[str, object]] = []
     for d in trading_days_between(first, day):
         lacking = [
@@ -1397,7 +1417,7 @@ def run_checks(
                 ("reconciliation", d == day or store.exists(trader_reconciliation_key(d))),
             )
             if not present
-        ] + (close_gaps if d == closes_day else [])
+        ] + close_gaps.get(d, [])
         if lacking:
             missing.append({"day": d, "missing": lacking})
             breaks.append({"check": "completeness", "day": d, "detail": f"missing {lacking}"})
