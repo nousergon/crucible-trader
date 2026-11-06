@@ -65,9 +65,17 @@ and has no statement to read: a hold-book halt in staging FAILS the run instead
 of engaging the store's kill switch, because there is no broker book to
 measure. A halted day is not a served day either way.
 
-**Declared scope:** the simulated book starts every session all cash
-(``positions={}``), matching the daily session's ``previous_weights=None``; a
-simulated position is not carried into the next day.
+**The simulated book is carried across days** (`alpha-engine-config-I13305`).
+Until 2026-11-06 it started every session all cash, the defect prod had until
+crucible-trader#121: an engine that measures its turnover budget against an
+empty book never binds, and staging could not see the churn it existed to
+catch. A served simulated session now files its closing positions at
+:func:`simulated_positions_key` (the opening positions plus every simulated
+fill), and the next session opens from the newest such document filed for an
+EARLIER trading day: the router plans against those shares and hands the
+daily session the same :func:`~crucible_trader.order_router.held_weights`
+prod derives from the broker statement. No document at all is inception (all
+cash), recorded as such in the next document's ``carried_from``.
 """
 
 from __future__ import annotations
@@ -103,6 +111,7 @@ from crucible_trader.order_router import (
     StagingRoutingRefusedError,
     _positive_float,  # pyright: ignore[reportPrivateUsage]  # the paper router's own cap parse, not a second one
     assert_staging_never_routes,
+    held_weights,
     is_staging,
     plan_orders,
 )
@@ -111,6 +120,7 @@ __all__ = [
     "FILL_SOURCE",
     "SIMULATED_FILLS_SCHEMA_VERSION",
     "SIMULATED_FILLS_VAR",
+    "SIMULATED_POSITIONS_SCHEMA_VERSION",
     "PanelCloseSource",
     "SimulatedBrokerError",
     "SimulatedFillRouter",
@@ -119,6 +129,7 @@ __all__ = [
     "StagingSessionConfig",
     "assert_registry_forbids_routing",
     "simulated_fills_key",
+    "simulated_positions_key",
 ]
 
 #: The staging-only switch. Unset or ``off``: a staging session is shadow.
@@ -152,6 +163,50 @@ class SimulatedBrokerError(RoutingRefusedError):
 def simulated_fills_key(trading_day: str) -> str:
     """The session's simulated fills, beside its shortfall document."""
     return f"trader/simulated_fills/{trading_day}.json"
+
+
+SIMULATED_POSITIONS_SCHEMA_VERSION = "trader_simulated_positions.v1"
+SIMULATED_POSITIONS_PREFIX = "trader/simulated_positions/"
+
+
+def simulated_positions_key(trading_day: str) -> str:
+    """The simulated book's closing positions for a served staging session."""
+    return f"{SIMULATED_POSITIONS_PREFIX}{trading_day}.json"
+
+
+def opening_positions(store: Store, trading_day: str) -> tuple[dict[str, int], str | None]:
+    """``(positions, carried_from)``: the newest closing positions filed before ``trading_day``.
+
+    ``({}, None)`` when none was ever filed: the inception book, all cash. A
+    document for ``trading_day`` itself or later is never read, so a re-run
+    of a session opens from the same book its first run did.
+    """
+    days = sorted(
+        key[len(SIMULATED_POSITIONS_PREFIX) : -len(".json")]
+        for key in store.list_keys(SIMULATED_POSITIONS_PREFIX)
+        if key.endswith(".json")
+    )
+    earlier = [d for d in days if d < trading_day]
+    if not earlier:
+        return {}, None
+    day = earlier[-1]
+    document = cast(dict[str, object], json.loads(store.get_bytes(simulated_positions_key(day))))
+    if document.get("schema_version") != SIMULATED_POSITIONS_SCHEMA_VERSION:
+        raise SimulatedBrokerError(
+            f"{simulated_positions_key(day)} is {document.get('schema_version')!r}, not "
+            f"{SIMULATED_POSITIONS_SCHEMA_VERSION!r}; the book it carries cannot be read"
+        )
+    raw = cast(dict[str, object], document.get("positions") or {})
+    positions: dict[str, int] = {}
+    for symbol, shares in raw.items():
+        if not isinstance(shares, int) or isinstance(shares, bool) or shares < 0:
+            raise SimulatedBrokerError(
+                f"{simulated_positions_key(day)} holds {shares!r} shares of {symbol}; a "
+                "simulated book is long only, in whole shares"
+            )
+        if shares:
+            positions[str(symbol)] = shares
+    return positions, day
 
 
 class RoutingRegistry(Protocol):
@@ -347,6 +402,51 @@ class SimulatedFillRouter:
         self._closes = PanelCloseSource(store, trading_day)
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
+        self._opening, self._carried_from = opening_positions(store, trading_day)
+
+    @property
+    def opening(self) -> dict[str, int]:
+        """The simulated book held into the session, in shares."""
+        return dict(self._opening)
+
+    def held_weights(self, portfolio_notional_usd: float) -> dict[str, float]:
+        """The carried simulated book as weights, valued at the session's closes.
+
+        The same :func:`~crucible_trader.order_router.held_weights` the paper
+        router applies to the broker statement, so staging constructs against
+        the book semantics prod does.
+        """
+        return held_weights(
+            self._opening, quote=self._closes, portfolio_notional_usd=portfolio_notional_usd
+        )
+
+    def closing_positions(self) -> dict[str, int]:
+        """The opening book plus every simulated fill. Names sold to zero drop out."""
+        book = dict(self._opening)
+        for record in self._records:
+            decision = record.order.decision
+            filled = round(record.filled_quantity)
+            signed = filled if decision.side == "buy" else -filled
+            book[decision.symbol] = book.get(decision.symbol, 0) + signed
+        short = sorted(s for s, n in book.items() if n < 0)
+        if short:
+            raise SimulatedBrokerError(
+                f"the simulated fills leave {short} short; the plan sold more than was held"
+            )
+        return {s: n for s, n in sorted(book.items()) if n}
+
+    def simulated_positions_payload(self, *, trading_day: str, now: dt.datetime) -> bytes:
+        """The closing simulated book, which the next session opens from."""
+        document = {
+            "schema_version": SIMULATED_POSITIONS_SCHEMA_VERSION,
+            "environment": "staging",
+            "trading_day": trading_day,
+            "generated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "carried_from": self._carried_from,
+            "opening": dict(sorted(self._opening.items())),
+            "positions": self.closing_positions(),
+        }
+        return json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
 
     @property
     def records(self) -> tuple[ExecutionRecord, ...]:
@@ -362,7 +462,7 @@ class SimulatedFillRouter:
         assert order_cap is not None and session_cap is not None  # __post_init__ refuses None
         sells, buys = plan_orders(
             book,
-            positions={},
+            positions=self._opening,
             quote=self._closes,
             clock=self._clock,
             max_order_notional_usd=order_cap,

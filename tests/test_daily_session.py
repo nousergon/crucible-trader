@@ -55,6 +55,7 @@ from crucible_trader.simulated_broker import (
     SimulatedFillsRefusedError,
     StagingSessionConfig,
     simulated_fills_key,
+    simulated_positions_key,
 )
 
 DAY = dt.date(2026, 9, 11)
@@ -411,6 +412,11 @@ def _simulated_world(store, monkeypatch) -> None:
         },
     )
     monkeypatch.setattr(module, "construct_target_book", lambda store_, **kw: book)
+    monkeypatch.setattr(
+        module,
+        "load_portfolio_params_from_store",
+        lambda slot, *, store: SimpleNamespace(book_notional_usd=1_000_000.0),
+    )
 
 
 class TestAStagingSession:
@@ -534,7 +540,12 @@ class TestAStagingSession:
         }
         assert not store.exists(simulated_fills_key(BOUND))
 
-    def test_a_held_staging_day_files_no_fills(self, store) -> None:
+    def test_a_held_staging_day_files_no_fills(self, store, monkeypatch) -> None:
+        monkeypatch.setattr(
+            module,
+            "load_portfolio_params_from_store",
+            lambda slot, *, store: SimpleNamespace(book_notional_usd=1_000_000.0),
+        )
         config = StagingSessionConfig.from_env(_staging_env(store))
         assert config is not None
         ctx = run_staging_session(
@@ -546,6 +557,7 @@ class TestAStagingSession:
         assert ctx.metrics[-1]["value"] == 0.0
         assert not store.exists(simulated_fills_key(BOUND))
         assert not store.exists(TRADER_EVIDENCE_KEY)
+        assert not store.exists(simulated_positions_key(BOUND))
 
 
 class TestTheProdPathIsUnchanged:
@@ -669,3 +681,50 @@ class TestTheBookHeldIntoTheSession:
         monkeypatch.setattr(module, "load_portfolio_params_from_store", broken)
         with pytest.raises(ContractRefusal, match="parameter set is unusable"):
             _cycle(store, HoldingRouter({}))
+
+
+class TestTheSessionRecordsItsTurnover:
+    """alpha-engine-config-I13305: the run record carries the book's turnover
+    against its budget, through the harness's own `record_turnover`."""
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, float]] = []
+
+        def record_turnover(self, *, value: float, budget: float) -> None:
+            self.calls.append({"value": value, "budget": budget})
+
+    def test_the_constructed_turnover_and_cap_are_recorded(self) -> None:
+        ctx = self._Ctx()
+        module._record_turnover(ctx, {"turnover_one_way": 0.18, "turnover_budget": 0.2})
+        assert ctx.calls == [{"value": 0.18, "budget": 0.2}]
+
+    def test_a_disabled_budget_is_recorded_as_the_whole_book(self) -> None:
+        ctx = self._Ctx()
+        module._record_turnover(ctx, {"turnover_one_way": 0.4, "turnover_budget": None})
+        assert ctx.calls == [{"value": 0.4, "budget": module.UNBOUNDED_TURNOVER_BUDGET}]
+
+    def test_a_harness_without_the_method_files_nothing_and_does_not_fail(self) -> None:
+        module._record_turnover(SimpleNamespace(), {"turnover_one_way": 0.4})
+
+    def test_a_book_with_no_turnover_records_nothing(self) -> None:
+        ctx = self._Ctx()
+        module._record_turnover(ctx, {"turnover_one_way": None})
+        assert ctx.calls == []
+
+    def test_a_simulated_session_files_its_closing_book(self, store, monkeypatch) -> None:
+        _simulated_world(store, monkeypatch)
+        env = _staging_env(store)
+        config = StagingSessionConfig.from_env(env)
+        assert config is not None
+        run_staging_session(
+            store,
+            config=config,
+            installed_version=VERSION,
+            clock=lambda: NOW,
+            run_mode="live",
+            environ=env,
+        )
+        document = json.loads(store.get_bytes(simulated_positions_key(BOUND)))
+        assert document["carried_from"] is None
+        assert document["positions"] == {"AAA": 300, "BBB": 400}

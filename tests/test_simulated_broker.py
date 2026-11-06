@@ -396,3 +396,90 @@ class TestTheStagingHoldControl:
             control.submit_close("AAA", 10)
         with pytest.raises(SimulatedBrokerError, match="no broker statement"):
             control.statement(DAY)
+
+
+class TestTheSimulatedBookIsCarried:
+    """alpha-engine-config-I13305: staging opens each session from the simulated
+    book the last served session closed on, not from cash."""
+
+    NEXT = "2026-09-09"
+
+    def _close(self, router: SimulatedFillRouter) -> None:
+        store_key = module.simulated_positions_key(router._day)  # noqa: SLF001
+        router._store.put_bytes(  # noqa: SLF001
+            store_key,
+            router.simulated_positions_payload(trading_day=router._day, now=NOW),  # noqa: SLF001
+        )
+
+    def test_with_no_earlier_book_the_session_opens_all_cash(self, store) -> None:
+        router = _router(store)
+        assert router.opening == {}
+        assert router.held_weights(100_000.0) == {"__CASH__": 1.0}
+
+    def test_the_closing_book_is_the_opening_plus_the_fills(self, store) -> None:
+        router = _router(store)
+        _run(router, _book())
+        assert router.closing_positions() == {"AAA": 300, "BBB": 400}
+        document = json.loads(router.simulated_positions_payload(trading_day=DAY, now=NOW))
+        assert document["schema_version"] == module.SIMULATED_POSITIONS_SCHEMA_VERSION
+        assert document["carried_from"] is None
+        assert document["positions"] == {"AAA": 300, "BBB": 400}
+
+    def test_the_next_session_opens_from_it_and_trades_only_the_difference(self, store) -> None:
+        first = _router(store)
+        _run(first, _book())
+        self._close(first)
+
+        write_panel(store, day=self.NEXT)
+        second = SimulatedFillRouter(
+            _config(), store=store, trading_day=self.NEXT, clock=lambda: NOW
+        )
+        assert second.opening == {"AAA": 300, "BBB": 400}
+        held = second.held_weights(100_000.0)
+        assert held["AAA"] == pytest.approx(0.3) and held["BBB"] == pytest.approx(0.2)
+        # Same target as yesterday: nothing to trade.
+        assert second.batches(_book(day=self.NEXT)) == []
+        # Trim AAA to 0.2: one sell of 100 shares, BBB untouched.
+        (sells,) = second.batches(_book({"AAA": 0.2, "BBB": 0.2, "CCC": 0.0}, day=self.NEXT))
+        assert [(o.decision.symbol, o.decision.side, o.decision.quantity) for o in sells] == [
+            ("AAA", "sell", 100)
+        ]
+        _run(second, _book({"AAA": 0.2, "BBB": 0.2, "CCC": 0.0}, day=self.NEXT))
+        document = json.loads(second.simulated_positions_payload(trading_day=self.NEXT, now=NOW))
+        assert document["carried_from"] == DAY
+        assert document["positions"] == {"AAA": 200, "BBB": 400}
+
+    def test_a_book_filed_for_the_same_day_or_later_is_never_read(self, store) -> None:
+        later = SimulatedFillRouter(
+            _config(), store=store, trading_day=self.NEXT, clock=lambda: NOW
+        )
+        write_panel(store, day=self.NEXT)
+        _run(later, _book(day=self.NEXT))
+        self._close(later)
+        same = _router(store)
+        _run(same, _book())
+        self._close(same)
+        # A re-run of DAY opens from what DAY's first run opened from: nothing.
+        assert _router(store).opening == {}
+
+    def test_an_unreadable_book_is_refused(self, store) -> None:
+        store.put_bytes(
+            module.simulated_positions_key("2026-09-04"),
+            json.dumps({"schema_version": "other", "positions": {}}).encode(),
+        )
+        with pytest.raises(module.SimulatedBrokerError, match="cannot be read"):
+            _router(store)
+
+    @pytest.mark.parametrize("shares", [-5, 1.5, True])
+    def test_a_short_or_fractional_book_is_refused(self, store, shares) -> None:
+        store.put_bytes(
+            module.simulated_positions_key("2026-09-04"),
+            json.dumps(
+                {
+                    "schema_version": module.SIMULATED_POSITIONS_SCHEMA_VERSION,
+                    "positions": {"AAA": shares},
+                }
+            ).encode(),
+        )
+        with pytest.raises(module.SimulatedBrokerError, match="long only"):
+            _router(store)
