@@ -7,8 +7,16 @@ import datetime as dt
 import json
 
 import pytest
+from crucible.execution import execution_shortfall_key
 from crucible.store import LocalStore
 
+from crucible_trader.execution_shortfall import (
+    Fill,
+    build_no_orders_document,
+    build_shortfall_document,
+    decide,
+    write_shortfall_document,
+)
 from crucible_trader.order_intent import (
     ORDER_INTENT_SCHEMA_VERSION,
     OrderIntentConflictError,
@@ -132,7 +140,9 @@ def test_a_document_missing_a_field_is_never_written(store) -> None:
 # -- which held names this trader bought itself (alpha-engine-config-I13164) --------
 
 
-def _claim(store, day: str, symbol: str, side: str = "buy", account: str = "DU1") -> None:
+def _claim(
+    store, day: str, symbol: str, side: str = "buy", account: str = "DU1", quantity: int = 10
+) -> None:
     claim_order_intent(
         store,
         _doc(
@@ -142,25 +152,91 @@ def _claim(store, day: str, symbol: str, side: str = "buy", account: str = "DU1"
             symbol=symbol,
             side=side,
             account=account,
+            quantity=quantity,
         ),
     )
 
 
-def test_a_name_whose_latest_intent_is_a_buy_is_owned(store) -> None:
+def _session(store, day: str, *orders: tuple[str, str, int, int]) -> None:
+    """The session record for book ``day``: (symbol, side, intended, filled) per order."""
+    fills = [
+        Fill(
+            order_id=f"crucible-trader|{day}|{symbol}",
+            decision=decide(symbol, side, intended, price=10.0, now=WHEN),  # type: ignore[arg-type]
+            submitted_at=WHEN,
+            filled_quantity=filled,
+            fill_price=10.0 if filled else None,
+        )
+        for symbol, side, intended, filled in orders
+    ]
+    write_shortfall_document(
+        store, build_shortfall_document(trading_day=day, champion="c", fills=fills, now=WHEN)
+    )
+
+
+def test_a_sell_that_left_shares_held_does_not_revoke_ownership(store) -> None:
+    """Codex bf44c6c0: a trim, or a partly filled sell, leaves the trader's own shares."""
+    _claim(store, "2026-09-03", "AAA")
+    _claim(store, "2026-09-03", "BBB")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 10), ("BBB", "buy", 10, 10))
+    _claim(store, "2026-09-04", "AAA", side="sell", quantity=4)
+    _claim(store, "2026-09-04", "BBB", side="sell")
+    _session(store, "2026-09-04", ("AAA", "sell", 4, 4), ("BBB", "sell", 10, 3))
+    owned = bought_by_this_trader(store, {"AAA", "BBB"}, account="DU1", before=DAY)
+    assert owned == frozenset({"AAA", "BBB"})
+
+
+def test_a_buy_that_never_filled_is_not_ownership(store) -> None:
+    """Codex af59f570: an intent is written BEFORE the submit; it is not a holding."""
+    _claim(store, "2026-09-03", "AAA")  # the broker closed it with nothing filled
+    _claim(store, "2026-09-03", "BBB")  # written, then the submit never reached the broker
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 0))
+    assert bought_by_this_trader(store, {"AAA", "BBB"}, account="DU1", before=DAY) == frozenset()
+
+
+def test_a_name_whose_buy_filled_is_owned(store) -> None:
     _claim(store, "2026-09-03", "SNDK")
     _claim(store, "2026-09-03", "PLTR")
+    _session(store, "2026-09-03", ("SNDK", "buy", 10, 10), ("PLTR", "buy", 10, 10))
     owned = bought_by_this_trader(store, {"SNDK", "ZZZ"}, account="DU1", before=DAY)
     assert owned == frozenset({"SNDK"})  # PLTR was not asked about; ZZZ was never bought
 
 
-def test_only_the_latest_intent_before_the_book_day_counts(store) -> None:
+def test_filled_shares_net_across_days_before_the_book_day(store) -> None:
     _claim(store, "2026-09-03", "AAA", side="buy")
+    _claim(store, "2026-09-03", "BBB", side="buy", quantity=5)
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 10), ("BBB", "buy", 5, 5))
     _claim(store, "2026-09-04", "AAA", side="sell")
-    _claim(store, "2026-09-03", "BBB", side="sell")
     _claim(store, "2026-09-04", "BBB", side="buy")
+    _session(store, "2026-09-04", ("AAA", "sell", 10, 10), ("BBB", "buy", 10, 10))
     _claim(store, DAY, "CCC", side="buy")  # the book day itself is not "before" it
+    _session(store, DAY, ("CCC", "buy", 10, 10))
     owned = bought_by_this_trader(store, {"AAA", "BBB", "CCC"}, account="DU1", before=DAY)
-    assert owned == frozenset({"BBB"})
+    assert owned == frozenset({"BBB"})  # AAA was sold whole
+
+
+def test_a_session_record_without_fills_counts_a_buy_as_nothing_filled(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    write_shortfall_document(
+        store,
+        build_no_orders_document(trading_day="2026-09-03", champion="c", reason="r", now=WHEN),
+    )
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+def test_a_sell_with_no_fill_on_record_is_refused_not_read_as_unfilled(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 10))
+    _claim(store, "2026-09-04", "AAA", side="sell")  # the session filed no record
+    with pytest.raises(OrderIntentError, match="no fill on record"):
+        bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY)
+
+
+def test_an_unreadable_session_record_is_refused_not_skipped(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    store.put_bytes(execution_shortfall_key("2026-09-03"), b"not json")
+    with pytest.raises(OrderIntentError, match="not a readable session record"):
+        bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY)
 
 
 def test_a_buy_for_another_account_is_not_ownership(store) -> None:

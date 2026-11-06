@@ -723,9 +723,9 @@ class PaperOrderRouter:
             )
         statement = IbPaperStatementSource(self._client).read_statement(self._day)
         inherited = inherited_for(self._day)
-        # A held name the book dropped is this trader's to sell when it bought
-        # the name itself (its own order intent says so); only an undeclared
-        # name it never bought is foreign (alpha-engine-config-I13164).
+        # A held name the book dropped is this trader's to sell when its own
+        # filled orders still leave it shares (I13237: an intent alone is not a
+        # holding); only an undeclared name it never bought is foreign (I13164).
         owned = bought_by_this_trader(
             self._store,
             set(statement.positions) - set(_tradable(book)) - inherited,

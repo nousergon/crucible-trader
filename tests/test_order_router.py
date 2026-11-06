@@ -22,6 +22,12 @@ from ib_fakes import T0, FakeClock, FakeIB, FakeSdk, ctx_for
 
 from crucible_trader.broker_session import GatewayAddress, OrderRefusedError
 from crucible_trader.construction import TargetBook
+from crucible_trader.execution_shortfall import (
+    Fill,
+    build_shortfall_document,
+    decide,
+    write_shortfall_document,
+)
 from crucible_trader.kill_switch import (
     KILL_SWITCH_KEY,
     IbBrokerControl,
@@ -663,7 +669,10 @@ def test_a_name_this_trader_bought_and_the_book_dropped_is_sold_whole() -> None:
     assert {o.decision.symbol for o in buys} == {"AAA", "BBB"}
 
 
-def _own_intent(store, day: str, symbol: str, *, side: str = "buy", account: str = ACCOUNT):
+def _own_intent(
+    store, day: str, symbol: str, *, side: str = "buy", account: str = ACCOUNT, filled: int = 10
+):
+    """An intent for ``day`` and that session's record of what it filled."""
     claim_order_intent(
         store,
         order_intent_document(
@@ -678,6 +687,16 @@ def _own_intent(store, day: str, symbol: str, *, side: str = "buy", account: str
             intended_at=T0,
         ),
     )
+    fill = Fill(
+        order_id=order_key(day, symbol),
+        decision=decide(symbol, side, 10, price=10.0, now=T0),  # type: ignore[arg-type]
+        submitted_at=T0,
+        filled_quantity=filled,
+        fill_price=10.0 if filled else None,
+    )
+    write_shortfall_document(
+        store, build_shortfall_document(trading_day=day, champion="c", fills=[fill], now=T0)
+    )
 
 
 def test_the_router_sells_a_name_its_own_earlier_session_bought(store) -> None:
@@ -691,11 +710,29 @@ def test_the_router_sells_a_name_its_own_earlier_session_bought(store) -> None:
     assert placed == [("SNDK", "SELL", 10), ("AAA", "BUY", 300), ("BBB", "BUY", 400)]
 
 
+def test_the_router_still_sells_its_own_name_after_a_partly_filled_sell(store) -> None:
+    # alpha-engine-config-I13237 (Codex bf44c6c0): the latest intent being a
+    # sell does not make the shares it left behind foreign.
+    _own_intent(store, "2026-09-03", "SNDK")
+    _own_intent(store, "2026-09-04", "SNDK", side="sell", filled=4)
+    ib = RoutingIB(positions={"SNDK": 6}, prices={**PRICES, "SNDK": 1_000.0})
+    _route(_router(store, ib), _book())
+    placed = [(c.symbol, o.action, o.totalQuantity) for c, o in ib.order_calls]
+    assert placed[0] == ("SNDK", "SELL", 6)
+
+
 @pytest.mark.parametrize(
-    ("side", "account"), [("sell", ACCOUNT), ("buy", "DU2")], ids=["last-sold", "other-account"]
+    "intents",
+    [
+        [("2026-09-03", "buy", ACCOUNT, 10), ("2026-09-04", "sell", ACCOUNT, 10)],
+        [("2026-09-04", "buy", "DU2", 10)],
+        [("2026-09-04", "buy", ACCOUNT, 0)],  # Codex af59f570: an intent is not a fill
+    ],
+    ids=["sold-whole", "other-account", "buy-never-filled"],
 )
-def test_a_held_name_this_trader_did_not_buy_is_still_refused(store, side, account) -> None:
-    _own_intent(store, "2026-09-04", "SNDK", side=side, account=account)
+def test_a_held_name_this_trader_does_not_hold_is_still_refused(store, intents) -> None:
+    for day, side, account, filled in intents:
+        _own_intent(store, day, "SNDK", side=side, account=account, filled=filled)
     ib = RoutingIB(positions={"SNDK": 10}, prices={**PRICES, "SNDK": 1_000.0})
     with pytest.raises(ForeignPositionError, match="SNDK"):
         _route(_router(store, ib), _book())
