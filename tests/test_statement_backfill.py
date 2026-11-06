@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import runpy
+import shutil
 import sys
 
 import pytest
@@ -355,3 +356,121 @@ class TestRetention:
         out = json.loads(capsys.readouterr().out)
         assert backend.exists(trader_reconciliation_key(DAY))
         assert out["locked"] == [] and trader_reconciliation_key(DAY) in out["lock_refused"]
+
+
+# -- the close rehearsal: backfilled days and the month's close in one capture ----
+
+LATER = "2026-09-10"
+
+
+@pytest.fixture
+def gap_root(root) -> pathlib.Path:
+    """ANCHOR and LATER reconciled, DAY between them missing, as 10-14 is."""
+    from crucible_trader.reconciliation_job import (
+        ReconciliationDiscrepancyError,
+        run_reconciliation,
+    )
+
+    later = BrokerStatement("DU1", LATER, {"AAA": 10}, 1_000.0)
+    # the live run that day paged stale_anchor (DAY was never reconciled), but filed
+    with pytest.raises(ReconciliationDiscrepancyError, match="stale_anchor"):
+        run_reconciliation(
+            LocalStore(root),
+            statement_backfill.FiledStatementSource(later),
+            trading_day=dt.date.fromisoformat(LATER),
+            fills=(),
+            cash_flows=(),
+            corporate_actions=CA,
+            run_mode="replay",
+        )
+    assert LocalStore(root).exists(trader_reconciliation_key(LATER))
+    # As October is: reconciled, but before the ledger and the exception files.
+    for prefix in ("ledger", "exceptions", "exception_proposals", "exception_scores"):
+        shutil.rmtree(root / "trader" / prefix, ignore_errors=True)
+    return root
+
+
+def _mentions(summary, day):
+    close = summary["close"] or {}
+    return [
+        e
+        for e in close.get("exceptions", [])
+        if e["class"] == "close_input_missing" and day in str(e["detail"])
+    ]
+
+
+class TestRehearseClose:
+    def test_the_close_sees_the_backfilled_day_and_nothing_is_written(self, gap_root):
+        from crucible.store import capturing
+
+        from crucible_trader.back_office_dry_run import dry_run
+
+        before = snapshot(gap_root)
+        baseline = dry_run(
+            capturing(LocalStore(gap_root)), month="2026-09", now="2026-11-03T05:30:00Z"
+        )
+        assert DAY in baseline["days_without_reconciliation"]
+        view, summary = statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [_statement()],
+            month="2026-09",
+            now="2026-11-03T05:30:00Z",
+            corporate_actions=CA,
+        )
+        assert snapshot(gap_root) == before
+        assert summary["backfill"][0]["has_reconciliation"]
+        assert DAY in summary["days_with_reconciliation"]
+        # the four inputs the close's completeness check reads for a day
+        for key in (
+            trader_broker_statement_key(DAY),
+            trader_reconciliation_key(DAY),
+            journal_key("nous-ergon-paper", DAY),
+            f"trader/ledger/reconciliation/nous-ergon-paper/{DAY}.json",
+        ):
+            assert key in summary["keys_written"] and view.exists(key), key
+        posted = {row["trading_day"]: row["status"] for row in summary["ledger"]}
+        assert DAY not in {row["trading_day"] for row in baseline["ledger"]}
+        assert posted[DAY] == "OK"
+        assert not _mentions(summary, DAY)
+
+    def test_cli_close_writes_only_to_out(self, gap_root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        before = snapshot(gap_root)
+        out = tmp_path / "out"
+        args = ["--store", str(gap_root), "--day", DAY, "--statement", str(stmt)]
+        assert (
+            main([*args, "--close", "2026-09", "--out", str(out), "--now", "2026-11-03T05:30:00Z"])
+            == 0
+        )
+        assert snapshot(gap_root) == before
+        summary = json.loads((out / "summary.json").read_text())
+        assert summary["backfill"][0]["trading_day"] == DAY
+        assert (out / "store" / trader_reconciliation_key(DAY)).exists()
+        assert "close_input_missing line(s)" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("extra", "message"),
+        [
+            (("--close", "2026-09", "--apply"), "dry run"),
+            (("--close", "2026-09"), "needs --out"),
+            (("--day", "2026-09-10"), "one --statement per --day"),
+        ],
+    )
+    def test_cli_close_refusals(self, gap_root, tmp_path, capsys, extra, message):
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        args = ["--store", str(gap_root), "--day", DAY, "--statement", str(stmt), *extra]
+        with pytest.raises(SystemExit):
+            main(args)
+        assert message in capsys.readouterr().err
+
+    def test_two_days_without_close_is_refused(self, gap_root, tmp_path, capsys):
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        args = ["--store", str(gap_root)]
+        args += ["--day", DAY, "--statement", str(stmt)] * 2
+        with pytest.raises(SystemExit):
+            main(args)
+        assert "needs --close" in capsys.readouterr().err

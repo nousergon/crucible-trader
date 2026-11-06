@@ -63,7 +63,7 @@ from crucible.store import (
     open_store,
 )
 
-from crucible_trader.back_office_dry_run import load_fills
+from crucible_trader.back_office_dry_run import dry_run, load_fills, write_out
 from crucible_trader.books_retention import lock_books_records
 from crucible_trader.broker_statement import (
     PAPER_ACCOUNT_PREFIX,
@@ -81,6 +81,7 @@ __all__ = [
     "backfill_day",
     "main",
     "parse_activity_statement",
+    "rehearse_close",
 ]
 
 SUMMARY_SCHEMA_VERSION = "statement_backfill.v1"
@@ -243,13 +244,21 @@ def backfill_day(
 ) -> tuple[Store, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
     """Run the real reconcile for ``statement``'s day against a capturing view
     of ``backend``. Returns that view (holding the captured objects) and the
-    summary. Writes nothing to ``backend``."""
+    summary. Writes nothing to ``backend``.
+
+    A ``backend`` that is already capturing is used as the view itself, so
+    several days and then the month's close can run in ONE capture and see
+    each other's writes (:func:`rehearse_close`). Wrapping it again would not:
+    `crucible.store.capturing` starts a fresh overlay over the same backend,
+    so the inner capture's writes are invisible to the outer one."""
     day = statement.trading_day
     if backend.exists(trader_reconciliation_key(day)):
         raise BackfillRefused(
             f"{trader_reconciliation_key(day)} already exists: {day} is not a missing day"
         )
-    view = capturing(backend)
+    shared = capture_ledger_of(backend)
+    view = backend if shared is not None else capturing(backend)
+    start = len(shared.writes) if shared is not None else 0
     outcome, error = "ok", None
     try:
         runner(
@@ -266,7 +275,7 @@ def backfill_day(
     except Exception as exc:  # noqa: BLE001 - a paging day is an outcome, not a crash
         outcome, error = "failed", f"{type(exc).__name__}: {exc}"
     ledger = capture_ledger_of(view)
-    writes = ledger.writes if ledger is not None else ()
+    writes = ledger.writes[start:] if ledger is not None else ()
     keys = list(dict.fromkeys(w.key for w in writes))
     summary: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]
         "schema_version": SUMMARY_SCHEMA_VERSION,
@@ -282,6 +291,36 @@ def backfill_day(
         "locked_writes": sorted({w.key for w in writes if w.object_lock_mode}),
         "has_reconciliation": trader_reconciliation_key(day) in keys,
     }
+    return view, summary
+
+
+def rehearse_close(
+    backend: Store,
+    statements: Sequence[BrokerStatement],
+    *,
+    month: str,
+    now: str,
+    fills: Mapping[str, Sequence[Fill]] | None = None,
+    corporate_actions: Any = None,  # pyright: ignore[reportExplicitAny]
+) -> tuple[Store, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
+    """Backfill every statement's day, in date order, then run the month's
+    back-office dry run, all in one capture of ``backend``. This is the proof
+    the close needs BEFORE ``--apply`` makes the books permanent: the close
+    reads the backfilled days exactly as it would after the apply. Writes
+    nothing to ``backend``."""
+    view = capturing(backend)
+    by_day = fills or {}
+    days = [
+        backfill_day(
+            view,
+            statement,
+            fills=by_day.get(statement.trading_day, ()),
+            corporate_actions=corporate_actions,
+        )[1]
+        for statement in sorted(statements, key=lambda s: s.trading_day)
+    ]
+    summary = dry_run(view, month=month, now=now, fills=by_day)
+    summary["backfill"] = days
     return view, summary
 
 
@@ -346,20 +385,43 @@ def main(
         "Dry run unless --apply.",
     )
     parser.add_argument("--store", default=None, help="store URI (default: $CRUCIBLE_STORE)")
-    parser.add_argument("--day", required=True, help="YYYY-MM-DD, the missing trading day")
     parser.add_argument(
-        "--statement", required=True, type=pathlib.Path, help="IB activity statement CSV"
+        "--day",
+        required=True,
+        action="append",
+        help="YYYY-MM-DD, the missing trading day (repeat with --close, one per --statement)",
+    )
+    parser.add_argument(
+        "--statement",
+        required=True,
+        action="append",
+        type=pathlib.Path,
+        help="IB activity statement CSV, in --day order",
     )
     parser.add_argument("--fills", default=None, type=pathlib.Path, help="fills as JSON lines")
     parser.add_argument(
         "--apply", action="store_true", help="write the captured objects, create-only"
     )
+    parser.add_argument(
+        "--close",
+        default=None,
+        metavar="YYYY-MM",
+        help="dry-run this month's close over the backfilled days (needs --out; no --apply)",
+    )
+    parser.add_argument("--out", default=None, type=pathlib.Path, help="local directory")
+    parser.add_argument("--now", default=None, help="stamp for every close record")
     args = parser.parse_args(argv)
-    day = cast("str", args.day)
+    days = cast("list[str]", args.day)
+    paths = cast("list[pathlib.Path]", args.statement)
+    if len(days) != len(paths):
+        parser.error("give one --statement per --day")
+    if args.close is not None:
+        return _rehearse(parser, args, days, paths, opener)
+    if len(days) != 1:
+        parser.error("more than one --day needs --close")
+    day = days[0]
     try:
-        statement = parse_activity_statement(
-            cast("pathlib.Path", args.statement).read_text(encoding="utf-8"), trading_day=day
-        )
+        statement = parse_activity_statement(paths[0].read_text(encoding="utf-8"), trading_day=day)
         fills = load_fills(cast("pathlib.Path | None", args.fills)).get(day, [])
         backend = opener(cast("str | None", args.store))
         view, summary = backfill_day(backend, statement, fills=fills)
@@ -380,6 +442,48 @@ def main(
         f"{day}: reconcile {summary['reconcile']}; {len(summary['keys_to_write'])} key(s) "
         + ("written" if args.apply else "would be written (dry run; re-run with --apply)")
         + "\n"
+    )
+    return 0
+
+
+def _rehearse(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    days: Sequence[str],
+    paths: Sequence[pathlib.Path],
+    opener: Callable[[str | None], Store],
+) -> int:
+    if args.apply:
+        parser.error("--close is a dry run; --apply one --day at a time")
+    out = cast("pathlib.Path | None", args.out)
+    if out is None:
+        parser.error("--close needs --out")
+    if out.exists() and any(out.iterdir()):
+        parser.error(f"--out {out} is not empty; a dry run never mixes with an earlier one")
+    month = cast("str", args.close)
+    now = cast("str | None", args.now) or dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        statements = [
+            parse_activity_statement(p.read_text(encoding="utf-8"), trading_day=d)
+            for d, p in zip(days, paths, strict=True)
+        ]
+        fills = load_fills(cast("pathlib.Path | None", args.fills))
+        view, summary = rehearse_close(
+            opener(cast("str | None", args.store)), statements, month=month, now=now, fills=fills
+        )
+    except (BackfillRefused, BrokerStatementError, OSError, ValueError) as exc:
+        sys.stderr.write(f"NO-GO: {exc}\n")
+        return 1
+    out.mkdir(parents=True, exist_ok=True)
+    write_out(view, summary, out)
+    close = cast("Mapping[str, Any] | None", summary["close"])  # pyright: ignore[reportExplicitAny]
+    missing = [
+        e for e in (close or {}).get("exceptions", []) if e["class"] == "close_input_missing"
+    ]
+    sys.stderr.write(
+        f"{month}: backfilled {', '.join(sorted(days))} (dry run); "
+        f"close {close['status'] if close else 'not attempted'}, "
+        f"{len(missing)} close_input_missing line(s); wrote {out}\n"
     )
     return 0
 
