@@ -58,7 +58,7 @@ import json
 import pathlib
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any, cast
 
 from crucible.calendar import is_trading_day
@@ -68,6 +68,7 @@ from crucible.keys import (
 )
 from crucible.runner import RunContext
 from crucible.store import (
+    ETAG_ABSENT,
     Store,
     capture_ledger_of,
     open_store,
@@ -87,7 +88,7 @@ from crucible_trader.exception_proposal import (
     proposal_day_document,
     propose,
 )
-from crucible_trader.ledger import post_daily_ledger
+from crucible_trader.ledger import LEDGER_JOURNAL_PREFIX, post_daily_ledger
 from crucible_trader.month_end_close import CloseSource, close_prior_month, month_trading_days
 from crucible_trader.performance_statement import file_statement
 from crucible_trader.reconciliation import CorporateActionSet, Fill
@@ -155,6 +156,67 @@ def _statement(store: Store, day: str) -> BrokerStatement:
     return statement_from_document(raw)
 
 
+class _JournalsAsOf(Store):
+    """``inner`` as the month's close run day saw it: every ledger journal
+    dated after ``as_of`` is hidden, everything else passes straight through
+    (writes included, so the capturing store still records them).
+
+    The dry run replays a past month into a store whose ledger has since moved
+    on: the v2 ledger opened 2026-11-03, so October's run reads a store that
+    already holds November's journals. The ledger refuses to insert a day
+    behind a later journal (codex review, crucible-trader#114), which is right
+    for the live job and refused every October day here, so the close was
+    never attempted. On the run day those later journals did not exist yet,
+    and this view is that store (`alpha-engine-config-I13124`).
+    """
+
+    def __init__(self, inner: Store, as_of: str) -> None:
+        self._inner = inner
+        self._as_of = as_of
+
+    def _hidden(self, key: str) -> bool:
+        return (
+            key.startswith(LEDGER_JOURNAL_PREFIX)
+            and key.endswith(".json")
+            and key.rsplit("/", 1)[-1].removesuffix(".json") > self._as_of
+        )
+
+    def put_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        return self._inner.put_bytes(
+            key,
+            payload,
+            object_lock_mode=object_lock_mode,
+            object_lock_retain_until=object_lock_retain_until,
+        )
+
+    def get_bytes(self, key: str) -> bytes:
+        if self._hidden(key):
+            raise KeyError(key)
+        return self._inner.get_bytes(key)
+
+    def exists(self, key: str) -> bool:
+        return not self._hidden(key) and self._inner.exists(key)
+
+    def list_keys(self, prefix: str = "") -> Iterator[str]:
+        return (k for k in self._inner.list_keys(prefix) if not self._hidden(k))
+
+    def etag(self, key: str) -> str:
+        return ETAG_ABSENT if self._hidden(key) else self._inner.etag(key)
+
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        return self._inner.compare_and_swap(key, expected, payload)
+
+    def presigned_url(self, key: str, expires_s: int) -> str:
+        return self._inner.presigned_url(key, expires_s)
+
+
 def dry_run(
     store: Store,
     *,
@@ -207,6 +269,9 @@ def dry_run(
     # into suspense (`alpha-engine-config-I13124`).
     # The first stored day opens against the newest statement before it, as the
     # job would (codex 36dcff7b); without one it opens from its own statement.
+    # Steps 3 and 4 read the store as of the close run day (`_JournalsAsOf`).
+    run_day = _next_trading_day(trading_days[-1])
+    as_of = _JournalsAsOf(store, run_day)
     ledger: list[dict[str, object]] = []
     anchor: BrokerStatement | None = None
     anchor_day: str | None = None
@@ -214,7 +279,7 @@ def dry_run(
         anchor, anchor_day = prior[2], prior[2].trading_day
     booked_on: dict[str, str] = {}
     for day in stored:
-        ctx = _ctx(store, day, now)
+        ctx = _ctx(as_of, day, now)
         broker = _statement(store, day)
         reconciliation = cast(
             "dict[str, object]", json.loads(store.get_bytes(trader_reconciliation_key(day)))
@@ -242,8 +307,7 @@ def dry_run(
             anchor, anchor_day = broker, day
 
     # 4: close the month as the next month's first run would.
-    run_day = _next_trading_day(trading_days[-1])
-    ctx = _ctx(store, run_day, now)
+    ctx = _ctx(as_of, run_day, now)
     account = _statement(store, stored[-1]).account
     close = close_prior_month(
         ctx,
