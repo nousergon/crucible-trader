@@ -474,3 +474,25 @@ class TestRehearseClose:
         with pytest.raises(SystemExit):
             main(args)
         assert "needs --close" in capsys.readouterr().err
+
+    def test_cli_close_refuses_a_non_empty_out(self, gap_root, tmp_path, capsys):
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "earlier.json").write_text("{}", encoding="utf-8")
+        args = ["--store", str(gap_root), "--day", DAY, "--statement", str(stmt)]
+        with pytest.raises(SystemExit):
+            main([*args, "--close", "2026-09", "--out", str(out)])
+        assert "is not empty" in capsys.readouterr().err
+
+    def test_cli_close_bad_statement_is_a_no_go_and_writes_nothing(
+        self, gap_root, tmp_path, capsys
+    ):
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="U9"), encoding="utf-8")
+        out = tmp_path / "out"
+        args = ["--store", str(gap_root), "--day", DAY, "--statement", str(stmt)]
+        assert main([*args, "--close", "2026-09", "--out", str(out)]) == 1
+        assert "NO-GO" in capsys.readouterr().err
+        assert not out.exists()
