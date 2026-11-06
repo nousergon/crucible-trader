@@ -18,6 +18,7 @@ from crucible.manifest import read_manifest
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement
+from crucible_trader.corporate_action_check import share_rows
 from crucible_trader.corporate_action_feed import (
     SCAN_SCHEMA_VERSION,
     CorporateActionScanError,
@@ -28,6 +29,7 @@ from crucible_trader.corporate_action_feed import (
     scans_uri_from_env,
 )
 from crucible_trader.reconciliation import (
+    HANDLED_ACTION_KINDS,
     CorporateAction,
     CorporateActionSet,
     Fill,
@@ -162,6 +164,53 @@ def test_a_declared_spinoff_is_carried_so_the_reconciler_refuses_it():
     assert resolve(doc, {"AAA"}, {}).actions == (CorporateAction("AAA", "spinoff"),)
 
 
+def test_a_delisted_holding_is_carried_so_the_reconciler_refuses_it():
+    doc = scan(
+        delistings=[
+            {"ticker": "QQA.B", "delisted_date": DAY_ISO, "delisted_utc": "x"},
+            {"ticker": "QQZ", "delisted_date": DAY_ISO, "delisted_utc": "x"},
+        ],
+        delistings_complete=True,
+    )
+    got = resolve(doc, {"QQA B", "QQB"}, {})
+    assert got.resolved == frozenset({"QQA B", "QQB"})
+    assert got.actions == (CorporateAction("QQA B", "delisting"),)
+
+
+def test_a_delisting_shows_not_comparable_not_an_ib_only_share_break():
+    got = resolve(scan(delistings=[{"ticker": "QQA"}]), {"QQA"}, {})
+    rows = share_rows(
+        anchor={"QQA": 10},
+        broker={},
+        net_fills={},
+        actions={"QQA": got.actions},
+        resolved=got.resolved,
+        ledger=None,
+        handled_kinds=HANDLED_ACTION_KINDS,
+    )
+    assert [(r["status"], r["finding"]) for r in rows] == [
+        ("not_comparable", "unhandled_corporate_action")
+    ]
+
+
+def test_an_older_scan_without_delistings_still_resolves():
+    assert "delistings" not in scan()
+    assert resolve(scan(), {"QQA"}, {}).resolved == frozenset({"QQA"})
+
+
+def test_a_failed_delisting_query_leaves_dividends_and_splits_resolved(caplog):
+    doc = scan(
+        splits=[{"ticker": "QQA", "split_from": 1, "split_to": 2}],
+        delistings=[],
+        delistings_complete=False,
+        delistings_error="HTTPError",
+    )
+    got = resolve(doc, {"QQA", "QQB"}, {})
+    assert got.resolved == frozenset({"QQA", "QQB"})
+    assert got.actions == (CorporateAction("QQA", "split", ratio=2.0),)
+    assert "delisting query failed (HTTPError)" in caplog.text
+
+
 @pytest.mark.parametrize(
     "doc",
     [
@@ -169,6 +218,8 @@ def test_a_declared_spinoff_is_carried_so_the_reconciler_refuses_it():
         scan(day="2026-09-10"),
         scan(complete=False),
         scan(splits=None),
+        scan(delistings=None),
+        scan(delistings_complete="no"),
     ],
 )
 def test_a_scan_that_is_not_trustworthy_raises(doc):
