@@ -70,6 +70,31 @@ def test_retain_until_is_fiscal_year_end_plus_five_years():
     assert retain_until(dt.date(2026, 12, 31)) == UNTIL
 
 
+def test_retain_until_counts_from_the_year_the_entry_was_written():
+    # codex 2c57f968e826feba: a 2020 day backfilled in 2026 was given
+    # 2026-01-01, a date already past, instead of five years from 2026.
+    assert retain_until(dt.date(2020, 6, 1), written_on=dt.date(2026, 11, 8)) == UNTIL
+    # A write earlier than the day (never expected) cannot shorten it.
+    assert retain_until(dt.date(2026, 6, 1), written_on=dt.date(2025, 1, 2)) == UNTIL
+
+
+def test_a_cycle_rerun_in_a_later_year_locks_from_that_year():
+    store, client = s3_store()
+    ctx = ctx_for(store)
+    ctx.record_output("trader/exceptions/2026-09-11.json", b"{}")
+    lock_cycle_books(ctx, now="2027-01-04T21:00:00Z")
+    later = dt.datetime(2033, 1, 1, tzinfo=dt.UTC)
+    assert client.retention["crucible/trader/exceptions/2026-09-11.json"]["RetainUntilDate"] == (
+        later
+    )
+    assert "2033-01-01" in ctx.metrics[0]["status_reason"]
+    # A malformed stamp falls back to the trading year: the books still lock.
+    ctx = ctx_for(store)
+    ctx.record_output("trader/exceptions/2026-09-11.json", b"{}")
+    lock_cycle_books(ctx, now="not a timestamp")
+    assert ctx.metrics[0]["status"] == "OK" and "2032-01-01" in ctx.metrics[0]["status_reason"]
+
+
 def test_locks_books_keys_in_compliance_mode_and_skips_the_rest():
     store, client = s3_store()
     keys = ["trader/ledger/journal/t/2026-09-11.json", "trader/evidence.json"]

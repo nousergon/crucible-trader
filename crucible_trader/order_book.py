@@ -98,7 +98,9 @@ def order_book_document(
     benchmark = universe.tickers[universe.benchmark_idx]
     alpha = book.alpha or {}
     eligible = book.eligible or {}
-    previous = previous_weights or {}
+    # No previous book is an all-cash book (construction's w_initial), so the
+    # cash row's previous weight is 1.0, not 0 (codex ac64b346aa382999).
+    previous = previous_weights if previous_weights is not None else {cash: 1.0}
 
     ranked = sorted(
         (t for t in universe.tickers if eligible.get(t, False) and t not in {cash, benchmark}),

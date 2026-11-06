@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import pytest
 from crucible.slots.strategy import BookUniverse
 from crucible.store import LocalStore
 
@@ -81,6 +82,9 @@ def test_an_eligible_name_with_no_weight_is_not_selected() -> None:
     doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
     assert {r["ticker"]: r["action"] for r in doc["rows"]}["BBB"] == "not_selected"
     assert doc["previous_book"] == "all_cash"
+    # codex ac64b346aa382999: an all-cash previous book records cash at 1.0.
+    cash = next(r for r in doc["rows"] if r["ticker"] == "$CASH")
+    assert cash["previous_weight"] == 1.0 and cash["weight_change"] == pytest.approx(-0.9)
 
 
 def test_the_book_is_written_under_its_day_and_is_a_book_of_record(tmp_path) -> None:

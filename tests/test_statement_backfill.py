@@ -231,6 +231,34 @@ class TestBackfill:
         with pytest.raises(BackfillRefused, match="no reconciliation"):
             apply_writes(backend, view, summary, now=OUTSIDE)
 
+    def test_a_cycle_that_wrote_no_journal_applies_nothing(self, root):
+        # codex 29e6af2958a0c547: a reconciliation with a refused ledger
+        # posting applied anyway, leaving the day with no books.
+        def reconciliation_only(view, *_a, **_k):
+            view.put_bytes(trader_reconciliation_key(DAY), b"{}")
+
+        backend = LocalStore(root)
+        view, summary = backfill_day(
+            backend, _statement(), corporate_actions=CA, runner=reconciliation_only
+        )
+        assert summary["has_reconciliation"] and not summary["has_ledger"]
+        before = snapshot(root)
+        with pytest.raises(BackfillRefused, match="no journal and ledger view"):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+        assert snapshot(root) == before
+
+    def test_a_key_written_after_the_scan_is_refused_not_overwritten(self, root, monkeypatch):
+        # codex 9b1df526e391319d: exists() then an unconditional put let a
+        # writer landing between the two be overwritten.
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        taken = journal_key("nous-ergon-paper", DAY)
+        backend.put_bytes(taken, b"{}")
+        monkeypatch.setattr(backend, "exists", lambda _key: False)  # the scan saw nothing
+        with pytest.raises(BackfillRefused, match="written during the apply"):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+        assert backend.get_bytes(taken) == b"{}"
+
 
 class TestCli:
     def _args(self, root, tmp_path, *extra, text=None):
