@@ -13,9 +13,11 @@ import sys
 
 import pytest
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
-from crucible.store import LocalStore
+from crucible.store import LocalStore, S3Store
+from s3_fake import FakeS3
 
 from crucible_trader import statement_backfill
+from crucible_trader.books_retention import RETENTION_MODE, is_books_key, retain_until
 from crucible_trader.broker_statement import BrokerStatement, BrokerStatementError
 from crucible_trader.ledger import journal_key
 from crucible_trader.reconciliation import CorporateActionSet, Fill
@@ -293,3 +295,63 @@ class TestEdges:
         with pytest.raises(SystemExit) as exited:
             runpy.run_module("crucible_trader.statement_backfill", run_name="__main__")
         assert exited.value.code == 1
+
+
+# -- WORM retention over S3 (alpha-engine-config-I13237) ---------------------------------
+
+
+class _RecordingS3(FakeS3):
+    """Records every ``PutObjectRetention`` ATTEMPT, refused or not."""
+
+    def __init__(self) -> None:
+        super().__init__(now=lambda: dt.datetime(2026, 9, 9, 21, 0, tzinfo=dt.UTC))
+        self.retention_calls: list[str] = []
+
+    def put_object_retention(self, **kw):
+        self.retention_calls.append(kw["Key"])
+        return super().put_object_retention(**kw)
+
+
+def _s3_backend() -> tuple[S3Store, _RecordingS3]:
+    client = _RecordingS3()
+    store = S3Store("bucket", "crucible", client=client)
+    anchor = BrokerStatement("DU1", ANCHOR, {"AAA": 10}, 1_000.0)
+    store.put_bytes(trader_broker_statement_key(ANCHOR), json.dumps(anchor.to_document()).encode())
+    return store, client
+
+
+class TestRetention:
+    def test_the_dry_run_makes_no_write_and_no_retention_call(self):
+        backend, client = _s3_backend()
+        before = dict(client.objects)
+        _view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        assert summary["has_reconciliation"]
+        assert client.objects == before
+        assert client.retention_calls == []
+
+    def test_apply_locks_the_books_it_writes_as_the_cycle_does(self):
+        backend, client = _s3_backend()
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        written = apply_writes(backend, view, summary, now=OUTSIDE)
+        until = retain_until(dt.date.fromisoformat(DAY))
+        books = [k for k in written if is_books_key(k)]
+        assert trader_reconciliation_key(DAY) in books
+        assert client.retention == {
+            f"crucible/{k}": {"Mode": RETENTION_MODE, "RetainUntilDate": until} for k in books
+        }
+
+    def test_a_refused_lock_keeps_the_writes_and_exits_2(self, tmp_path, capsys, monkeypatch):
+        backend, client = _s3_backend()
+
+        def refuse(**kw):
+            raise RuntimeError("AccessDenied")
+
+        monkeypatch.setattr(client, "put_object_retention", refuse)
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        path = tmp_path / "stmt.csv"
+        path.write_text(csv_text(account="DU1"), encoding="utf-8")
+        args = ["--day", DAY, "--statement", str(path), "--apply"]
+        assert main(args, opener=lambda _uri: backend, clock=lambda: OUTSIDE) == 2
+        out = json.loads(capsys.readouterr().out)
+        assert backend.exists(trader_reconciliation_key(DAY))
+        assert out["locked"] == [] and trader_reconciliation_key(DAY) in out["lock_refused"]

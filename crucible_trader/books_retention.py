@@ -40,7 +40,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from crucible.store import S3Store, Store
+from crucible.store import S3Store, Store, is_capturing
 
 log = logging.getLogger(__name__)
 
@@ -98,11 +98,17 @@ def lock_books_records(
     Returns ``(locked, refused)``: the keys locked, and ``{key: reason}`` for
     each one S3 refused. A store with no Object Lock concept (``LocalStore``)
     locks nothing and refuses nothing. Never raises.
+
+    A capturing store (``crucible.store.capturing``, what a dry run resolves)
+    locks nothing either: it IS an ``S3Store`` and shares the real store's
+    client, so without this check a dry run would send a real, irreversible
+    ``PutObjectRetention`` -- to the real current version of any key that
+    already exists -- for writes it only recorded (alpha-engine-config-I13237).
     """
     locked: list[str] = []
     refused: dict[str, str] = {}
     try:
-        if not isinstance(store, S3Store):
+        if not isinstance(store, S3Store) or is_capturing(store):
             return locked, refused
         until = retain_until(trading_day)
         for key in dict.fromkeys(k for k in keys if k.startswith(prefixes)):

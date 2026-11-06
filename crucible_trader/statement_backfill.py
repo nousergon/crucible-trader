@@ -64,6 +64,7 @@ from crucible.store import (
 )
 
 from crucible_trader.back_office_dry_run import load_fills
+from crucible_trader.books_retention import lock_books_records
 from crucible_trader.broker_statement import (
     PAPER_ACCOUNT_PREFIX,
     BrokerStatement,
@@ -295,12 +296,17 @@ def _in_window(now: dt.datetime) -> bool:
 def apply_writes(
     backend: Store,
     view: Store,
-    summary: Mapping[str, Any],  # pyright: ignore[reportExplicitAny]
+    summary: dict[str, Any],  # pyright: ignore[reportExplicitAny]
     *,
     now: dt.datetime,
 ) -> list[str]:
-    """Copy the captured objects to ``backend``, create-only. Every refusal is
-    checked before the first write."""
+    """Copy the captured objects to ``backend``, create-only, then put the
+    books among them under WORM retention exactly as the live cycle's step 5h
+    does (:func:`crucible_trader.books_retention.lock_books_records`, same
+    prefixes, same date from the day's trading year). Every refusal is checked
+    before the first write. A refused lock never unwinds the writes; it is
+    recorded in ``summary["lock_refused"]`` (``summary["locked"]`` lists the
+    keys locked)."""
     if _in_window(now):
         raise BackfillRefused(
             f"it is {now.astimezone(_ET):%H:%M} ET on a weekday, inside 09:00-16:30 ET; "
@@ -318,6 +324,10 @@ def apply_writes(
         raise BackfillRefused(f"create-only: {len(existing)} key(s) already exist: {existing}")
     for key in keys:
         backend.put_bytes(key, view.get_bytes(key))
+    locked, refused = lock_books_records(
+        backend, keys, trading_day=dt.date.fromisoformat(str(summary["trading_day"]))
+    )
+    summary["locked"], summary["lock_refused"] = locked, refused
     return keys
 
 
@@ -360,6 +370,12 @@ def main(
         sys.stderr.write(f"NO-GO: {exc}\n")
         return 1
     sys.stdout.write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    if summary.get("lock_refused"):
+        sys.stderr.write(
+            f"{day}: written, but {len(summary['lock_refused'])} books record(s) are NOT under "
+            "WORM retention (see lock_refused)\n"
+        )
+        return 2
     sys.stderr.write(
         f"{day}: reconcile {summary['reconcile']}; {len(summary['keys_to_write'])} key(s) "
         + ("written" if args.apply else "would be written (dry run; re-run with --apply)")
