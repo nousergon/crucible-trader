@@ -36,6 +36,7 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from crucible.execution import execution_shortfall_key, validate_execution_shortfall
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
 __all__ = [
@@ -172,24 +173,53 @@ def claim_order_intent(store: Store, document: Mapping[str, Any]) -> str:  # pyr
         raise OrderIntentConflictError(key, existing) from None
 
 
+def _filled_by_order(store: Store, day: str) -> dict[str, float]:
+    """Shares filled per order key in book ``day``'s session record (`execution_shortfall`).
+
+    Empty when the session filed no record of fills: none written, ``no_orders``,
+    or ``not_computed``. A record that cannot be read raises.
+    """
+    key = execution_shortfall_key(day)
+    if not store.exists(key):
+        return {}
+    try:
+        document = validate_execution_shortfall(json.loads(store.get_bytes(key)), origin=key)
+    except ValueError as exc:  # bad JSON, or ExecutionArtifactError
+        raise OrderIntentError(f"{key!r} is not a readable session record: {exc}") from exc
+    if document.get("outcome") != "computed":
+        return {}
+    orders: list[dict[str, Any]] = document.get("orders") or []  # pyright: ignore[reportExplicitAny]  # validated JSON document
+    return {str(o["order_id"]): float(o["filled_quantity"]) for o in orders}
+
+
 def bought_by_this_trader(
     store: Store, symbols: Iterable[str], *, account: str, before: str
 ) -> frozenset[str]:
-    """Of ``symbols``, the names this trader itself bought into ``account``.
+    """Of ``symbols``, the names this trader itself still holds shares of in ``account``.
 
-    A name counts when its LATEST intent on a book day before ``before`` is a
-    ``buy`` for ``account``. The router's own position is not foreign to it: on
-    2026-11-04 the trader bought SNDK (book 2026-11-03), and SNDK is neither one
-    of v1's declared inherited names nor certain to be in the next book, so
+    A name counts when the shares its own orders FILLED on book days before
+    ``before`` -- bought minus sold, from each session's ``execution_shortfall``
+    record, matched by order key -- are still positive. The router's own
+    position is not foreign to it: on 2026-11-04 the trader bought SNDK (book
+    2026-11-03), and SNDK is neither one of v1's declared inherited names nor
+    certain to be in the next book, so
     :func:`~crucible_trader.order_router.plan_orders` would refuse the whole
     next session over the trader's own holding (``ForeignPositionError``,
     alpha-engine-config-I13164) the first time the champion rotated out of it.
 
-    Only ``symbols`` are read (one list of the prefix, then the newest intent
-    per wanted name), so the cost tracks the names the book dropped, not the
-    intent history. An intent that cannot be read raises
-    :class:`OrderIntentError`: a name is never called owned on a guess, and a
-    name never called owned stays refused.
+    An intent alone is not a holding: it is written BEFORE the submit, so a buy
+    that never filled owns nothing, and a sell that trimmed or partly filled
+    leaves the trader's remaining shares its own (alpha-engine-config-I13237).
+    A buy with no fill on record counts as nothing filled -- at worst the name
+    stays refused. A sell with no fill on record raises
+    :class:`OrderIntentError`: counting it as unfilled would call shares owned
+    that the trader may already have sold. So does an intent or session record
+    that cannot be read: a name is never called owned on a guess, and a name
+    never called owned stays refused.
+
+    Only ``symbols`` are read (one list of the prefix, the intents per wanted
+    name, and one session record per day they span), so the cost tracks the
+    names the book dropped, not the whole intent history.
     """
     wanted = set(symbols)
     if not wanted:
@@ -204,12 +234,29 @@ def bought_by_this_trader(
         symbol = name[: -len(".json")]
         if symbol in wanted and _ISO_DAY.match(day) and day < before:
             days_by_symbol.setdefault(symbol, []).append(day)
+    sessions: dict[str, dict[str, float]] = {}
     owned: set[str] = set()
     for symbol, days in days_by_symbol.items():
-        latest = max(days)
-        intent = read_order_intent(store, latest, symbol)
-        if intent is None:  # listed, then gone: never read as absent
-            raise OrderIntentError(f"intent for {latest}/{symbol} vanished while read")
-        if intent["side"] == "buy" and intent["account"] == account and intent["symbol"] == symbol:
+        held = 0.0
+        for day in sorted(days):
+            intent = read_order_intent(store, day, symbol)
+            if intent is None:  # listed, then gone: never read as absent
+                raise OrderIntentError(f"intent for {day}/{symbol} vanished while read")
+            if intent["account"] != account or intent["symbol"] != symbol:
+                continue
+            if day not in sessions:
+                sessions[day] = _filled_by_order(store, day)
+            filled = sessions[day].get(str(intent["order_key"]))
+            if intent["side"] == "buy":
+                held += filled or 0.0
+            elif filled is None:
+                raise OrderIntentError(
+                    f"sell intent {day}/{symbol} has no fill on record in "
+                    f"{execution_shortfall_key(day)!r}; what it sold is unknown, so the name "
+                    "is not called owned. Reconcile it against the broker's executions."
+                )
+            else:
+                held -= filled
+        if held > 0:
             owned.add(symbol)
     return frozenset(owned)
