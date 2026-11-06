@@ -653,6 +653,16 @@ class TestStatement:
         assert bill["adviser_fee_cents"] == 917
         assert (bill["billed_days"], bill["days_in_month"]) == (30, 30)
 
+    def test_an_opening_valued_in_the_prior_month_bills_the_whole_month(self):
+        # aec#13237 cffb19f8: an anchor statement from 10-30 opens the book for
+        # all of November; its day-of-month (30) must not prorate the bill.
+        statement = build_statement(
+            closed(start_trading_day="2026-10-30", first_trading_day="2026-11-02"), None, {}
+        )
+        bill = statement["simulated_fee_bill"]
+        assert bill["adviser_fee_cents"] == 917
+        assert (bill["billed_days"], bill["days_in_month"]) == (30, 30)
+
     def test_a_month_carried_from_a_prior_statement_bills_the_whole_month(self):
         prior = {
             "month": "2026-10",

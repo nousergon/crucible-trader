@@ -118,8 +118,28 @@ class TestSplits:
         result = run({"AAA": 100}, {"AAA": 200}, (SPLIT,), ledger={"AAA": 60})
         assert classes(result) == [MISMATCH_CLASS]
         (finding,) = result.discrepancies
-        assert finding.side == "ledger" and finding.delta == 0.0
+        # aec#13237 802d1ddd: the finding carries the LEDGER's change (60 -> 120,
+        # +60) against Polygon's +100, not IB's matching +100.
+        assert (finding.expected, finding.actual, finding.delta, finding.side) == (
+            100.0,
+            60.0,
+            -40.0,
+            "ledger",
+        )
         assert rows(result)[0]["ledger_shares"] == 60
+
+    def test_zero_ib_movement_does_not_hide_a_ledger_only_disagreement(self):
+        # aec#13237 3a427069: splits compounding to 1:1 move neither IB nor
+        # Polygon, but the ledger books each whole-share rebase (+100, -50).
+        # IB agrees with Polygon, so this is a ledger-side mismatch, never
+        # "IB has not applied it".
+        undo = CorporateAction("AAA", "split", ratio=0.5)
+        result = run({"AAA": 100}, {"AAA": 100}, (SPLIT, undo), ledger={"AAA": 100})
+        (row,) = rows(result)
+        assert (row["status"], row["ib_shares"], row["polygon_shares"]) == ("mismatch", 0, 0)
+        assert classes(result) == [MISMATCH_CLASS]
+        (finding,) = result.discrepancies
+        assert (finding.actual, finding.side) == (50.0, "ledger")
 
     def test_an_unreadable_ledger_compares_the_other_two_and_says_so(self):
         result = run({"AAA": 100}, {"AAA": 200}, (SPLIT,))

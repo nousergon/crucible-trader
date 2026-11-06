@@ -173,7 +173,7 @@ def share_rows(
             row["detail"] = "every source agrees" + (
                 "" if ours is not None else " (ledger leg unavailable)"
             )
-        elif ib == 0:
+        elif ib == 0 and polygon != 0:
             # IB still shows the pre-action holding: the reconciler's own
             # `corporate_action` finding ("not yet applied at the broker") is
             # this disagreement's one finding.

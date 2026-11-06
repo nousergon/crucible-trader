@@ -7,6 +7,7 @@ counts it in NAV and in the attribution. All figures are synthetic.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import pathlib
@@ -64,6 +65,13 @@ def inputs(broker, anchor, opening=None):
 
 def kinds(posting):
     return [(e.kind, e.event_ref) for e in posting.entries]
+
+
+def interest(posting):
+    """``posting`` with only its interest entries."""
+    return dataclasses.replace(
+        posting, entries=tuple(e for e in posting.entries if e.kind.startswith("interest"))
+    )
 
 
 def legs(entry: Entry) -> dict[str, int]:
@@ -128,20 +136,60 @@ class TestTheLedgerHoldsIBsAccrual:
         later = book_day(ledger, inputs(stmt("2026-12-01", 1_000.0, 3.40), stmt(D3, 1_000.0)))
         assert kinds(later) == [("interest_accrual", "accrual/2026-12-01")]
 
-    def test_zero_accruals_book_nothing_and_an_unchanged_one_books_nothing(self):
+    def test_a_zero_accrual_is_a_baseline_and_an_unchanged_one_books_nothing(self):
         ledger = Ledger()
         book_day(ledger, inputs(stmt(D1, 1_000.0, 0.0), None))
         assert (
             book_day(ledger, inputs(stmt(D2, 1_000.0, 0.0), stmt(D1, 1_000.0, 0.0))).entries == ()
         )
+        # aec#13237 9ed92137: a first RECORDED zero establishes the baseline (a
+        # zero entry), so a later balance is income, not first-recorded.
         zero_open = Ledger()
         book_day(zero_open, inputs(stmt(D1, 1_000.0), None))
         posting = book_day(zero_open, inputs(stmt(D2, 1_000.0, 0.0), stmt(D1, 1_000.0)))
-        assert posting.entries == ()
+        assert kinds(posting) == [("interest_accrual", f"accrual/first-recorded/{D2}")]
+        assert legs(posting.entries[0]) == {INTEREST_RECEIVABLE: 0, INTEREST_FIRST_RECORDED: 0}
+        later = book_day(zero_open, inputs(stmt(D3, 1_000.0, 0.25), stmt(D2, 1_000.0, 0.0)))
+        assert kinds(later) == [("interest_accrual", f"accrual/{D3}")]
+        assert legs(later.entries[0]) == {INTEREST_RECEIVABLE: 25, INTEREST_INCOME: -25}
+        assert zero_open.cents(T, "DU1", INTEREST_FIRST_RECORDED) == 0
         steady = Ledger()
         d1 = stmt(D1, 1_000.0, 1.00)
         book_day(steady, inputs(d1, None))
         assert book_day(steady, inputs(stmt(D2, 1_000.0, 1.00), d1)).entries == ()
+
+
+class TestDebitInterest:
+    """aec#13237 df92e938: IB's AccruedCash is negative for debit interest. A
+    move AWAY from zero accrues; only a move toward zero is a posting to cash.
+    (The inferred cash posting also books cash rounding; only interest shown.)"""
+
+    def test_a_falling_negative_accrual_accrues_and_a_rise_toward_zero_settles(self):
+        ledger = Ledger()
+        book_day(ledger, inputs(stmt(D1, 1_000.0, -0.05), None))
+        deeper = book_day(ledger, inputs(stmt(D2, 1_000.0, -0.08), stmt(D1, 1_000.0, -0.05)))
+        assert kinds(interest(deeper)) == [("interest_accrual", f"accrual/{D2}")]
+        assert legs(interest(deeper).entries[0]) == {INTEREST_RECEIVABLE: -3, INTEREST_INCOME: 3}
+        paid = book_day(ledger, inputs(stmt(D3, 1_000.0, -0.02), stmt(D2, 1_000.0, -0.08)))
+        assert kinds(interest(paid)) == [("interest_settlement", f"accrual/{D3}")]
+        assert legs(interest(paid).entries[0]) == {CASH: -6, INTEREST_RECEIVABLE: 6}
+        assert ledger.cents(T, "DU1", INTEREST_RECEIVABLE) == -2
+
+    def test_a_move_across_zero_settles_the_old_balance_and_accrues_the_new(self):
+        ledger = Ledger()
+        book_day(ledger, inputs(stmt(D1, 1_000.0, 0.05), None))
+        flip = book_day(ledger, inputs(stmt(D2, 1_000.0, -0.03), stmt(D1, 1_000.0, 0.05)))
+        assert kinds(interest(flip)) == [
+            ("interest_settlement", f"accrual/{D2}"),
+            ("interest_accrual", f"accrual/{D2}"),
+        ]
+        assert legs(interest(flip).entries[0]) == {CASH: 5, INTEREST_RECEIVABLE: -5}
+        assert legs(interest(flip).entries[1]) == {INTEREST_RECEIVABLE: -3, INTEREST_INCOME: 3}
+        back = book_day(ledger, inputs(stmt(D3, 1_000.0, 0.01), stmt(D2, 1_000.0, -0.03)))
+        assert [legs(e) for e in interest(back).entries] == [
+            {CASH: -3, INTEREST_RECEIVABLE: 3},
+            {INTEREST_RECEIVABLE: 1, INTEREST_INCOME: -1},
+        ]
 
 
 def ctx_for(store, day):

@@ -955,6 +955,22 @@ class TestSettledCloseCompleteness:
         assert checks["completeness"]["missing"] == [{"day": PREV, "missing": ["close:AAA"]}]
         assert [b["check"] for b in checks["breaks"]] == ["completeness"]
 
+    def test_an_earlier_unresolved_gap_is_rechecked_every_run(self, store):
+        # aec#13237 c217e396: PREV's missing close is still a break on NEXT's
+        # run, not only on DAY's; DAY's close is in.
+        post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
+        post(store, stmt(DAY, {"AAA": 10}, 1_000.0), stmt(PREV, {"AAA": 10}, 1_000.0))
+        asked = []
+
+        def closes(day, tickers):
+            asked.append(day)
+            return {} if day == PREV else {t: 1.0 for t in tickers}
+
+        checks = self._checks(store, closes, day=NEXT)
+        assert asked == [PREV, DAY]
+        assert checks["completeness"]["closes_day"] == DAY
+        assert checks["completeness"]["missing"] == [{"day": PREV, "missing": ["close:AAA"]}]
+
     def test_an_unreadable_close_source_is_a_missing_close_never_a_raise(self, store):
         post(store, stmt(PREV, {"AAA": 10}, 1_000.0), None)
 
