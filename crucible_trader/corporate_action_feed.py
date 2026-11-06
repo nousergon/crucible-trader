@@ -26,6 +26,14 @@ exists only if every Polygon query for the day succeeded, so:
   position sold between the record and pay dates is still paid.
 * ``declared`` (a spin-off and the like) -> an action of that kind, which the
   reconciler refuses as `unhandled_corporate_action`. Loud by design.
+* ``delistings`` (a cash takeover, a merger, an exchange delisting) ->
+  ``delisting``, which the reconciler likewise refuses as
+  `unhandled_corporate_action`, so the three-way check shows the name as
+  ``not_comparable`` instead of an unexplained ``ib_only`` share break
+  (`alpha-engine-config-I13314`). The key is newer than the scan schema, so a
+  scan without it parses as before. ``delistings_complete: false`` means the
+  delisting query alone failed: delistings are then not known, and that is
+  logged, but the dividend and split halves of the scan still resolve the book.
 * ``dividends_ex`` is not cash and moves no shares; it is not used here.
 
 **What it leaves unresolved.** A paid dividend whose entitlement cannot be
@@ -132,6 +140,11 @@ def _validate(document: Mapping[str, Any], day: str, uri: str) -> None:
     for field in ("splits", "dividends_paid", "declared"):
         if not isinstance(document.get(field), list):
             raise CorporateActionScanError(f"{uri}: {field!r} is not a list")
+    # Additive keys (alpha-engine-config-I13314): absent in older scans.
+    if not isinstance(document.get("delistings", []), list):
+        raise CorporateActionScanError(f"{uri}: 'delistings' is not a list")
+    if not isinstance(document.get("delistings_complete", True), bool):
+        raise CorporateActionScanError(f"{uri}: 'delistings_complete' is not a bool")
 
 
 def actions_from_scan(
@@ -200,6 +213,19 @@ def actions_from_scan(
         ticker = ib_symbol(str(row["ticker"]))
         if ticker in universe:
             actions.append(CorporateAction(ticker=ticker, kind=str(row.get("kind") or "declared")))
+
+    for row in document.get("delistings", ()):
+        ticker = ib_symbol(str(row["ticker"]))
+        if ticker in universe:
+            actions.append(CorporateAction(ticker=ticker, kind="delisting"))
+    if document.get("delistings_complete") is False:
+        # Unknown for delistings ONLY: never a reason to unresolve the book.
+        logger.warning(
+            "corporate-action scan %s: the delisting query failed (%s); a delisted "
+            "holding would show as a share break",
+            uri,
+            document.get("delistings_error") or "no error recorded",
+        )
 
     if unresolved:
         logger.warning(
