@@ -778,6 +778,25 @@ def test_a_book_over_its_notional_is_refused() -> None:
         _plan(_book({"AAA": 0.7, "BBB": 0.5}))
 
 
+@pytest.mark.parametrize(
+    ("weights", "session_cap", "match"),
+    [
+        ({"AAA": 0.4, "BBB": 0.4, "CCC": 0.4}, 100_000.0, "gross exceeds"),
+        ({"AAA": 0.3, "BBB": 0.3, "CCC": 0.3}, 80_000.0, "per-session cap"),
+    ],
+)
+def test_a_batch_of_entries_each_within_limits_but_together_over_the_cap_is_refused(
+    weights: dict[str, float], session_cap: float, match: str
+) -> None:
+    # Ported from the v1 backtester case (alpha-engine-config#11504): each entry
+    # passes alone, so a check that ignores same-batch orders would let them all through.
+    for name, weight in weights.items():
+        sells, (alone,) = _plan(_book({name: weight}), session_cap=session_cap)
+        assert sells == () and alone.decision.side == "buy"
+    with pytest.raises(RiskCapExceededError, match=match):
+        _plan(_book(weights), session_cap=session_cap)
+
+
 @pytest.mark.parametrize("price", [None, math.nan, 0.0, -1.0])
 def test_a_missing_decision_price_refuses_the_whole_plan(price) -> None:
     with pytest.raises(PriceUnavailableError, match="AAA"):
