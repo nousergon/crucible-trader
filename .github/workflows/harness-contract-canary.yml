@@ -65,5 +65,5 @@ jobs:
   notify-main-failure:
     needs: [canary]
     if: ${{ always() && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@065f28a75ad33732b636720676603483b72880cb
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@2c6e4be46c1fdfda87df28db7e9c38f7dbac78a4
     secrets: inherit
