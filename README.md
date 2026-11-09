@@ -137,6 +137,13 @@ buy is sent. While it waits, `trader/entry_watch/{day}.json` lists every
 waiting buy and what released each one. `CRUCIBLE_TRADER_ENTRY_TIMING=immediate`
 sends every buy at the start instead.
 
+**A held name that gaps down is sold whole first** (`crucible_trader.gap_stop`,
+the v1 executor's catastrophic gap stop). At the session start every held name
+is priced live against the book day's close; one 15% or more below it is sold in
+full in the opening sell batch, whatever the book wants, and is not bought that
+day. Every check, fired or not, is recorded at `trader/gap_stop/{day}.json`.
+`CRUCIBLE_TRADER_GAP_STOP_PCT` overrides the threshold; `off` disables it.
+
 ## Where the rest lives
 
 | You need | Go to |

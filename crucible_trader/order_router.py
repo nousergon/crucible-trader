@@ -78,6 +78,12 @@ unchanged -- one order per name per trading day -- and a buy this day's broker
 already knows is adopted at once rather than watched. :data:`ENTRY_TIMING_VAR`
 ``immediate`` restores the old behaviour (every buy at the open).
 
+**A held name that gapped down is sold whole in the opening batch**
+(`crucible_trader.gap_stop`, v1's catastrophic gap stop): priced live, never from
+the close fallback, against the book day's close; at
+:attr:`RouterConfig.gap_stop_pct` (v1's 0.15) or more below it, the name's planned
+sell becomes a full exit and any buy of it is dropped.
+
 **Declared scope:** an order still working when the fill wait ends is left
 working (a DAY order), and its record carries the broker status and what filled
 so far. An adopted order's `submitted_at` is its decision instant, because the
@@ -116,6 +122,14 @@ from crucible_trader.execution_shortfall import (
     build_no_orders_document,
     build_shortfall_document,
     decide,
+)
+from crucible_trader.gap_stop import (
+    DEFAULT_GAP_STOP_PCT,
+    apply_gap_exits,
+    check_gaps,
+    exit_decision,
+    gap_stop_document,
+    write_gap_stop_document,
 )
 from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
@@ -163,6 +177,10 @@ MAX_SESSION_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD"
 #: (`crucible_trader.entry_timing`). ``immediate``: at the session start with the
 #: sells, the behaviour before 2026-11-09. Anything else is refused.
 ENTRY_TIMING_VAR = "CRUCIBLE_TRADER_ENTRY_TIMING"
+
+#: The catastrophic gap stop (`crucible_trader.gap_stop`). Unset: v1's 0.15.
+#: A fraction in (0, 1) overrides it; ``off`` disables it.
+GAP_STOP_VAR = "CRUCIBLE_TRADER_GAP_STOP_PCT"
 ENTRY_TIMING_TRIGGERED = "v1_triggers"
 ENTRY_TIMING_IMMEDIATE = "immediate"
 
@@ -287,6 +305,21 @@ def _positive_float(source: Mapping[str, str], var: str) -> float:
     return value
 
 
+def _gap_stop_pct(source: Mapping[str, str]) -> float | None:
+    raw = (source.get(GAP_STOP_VAR) or "").strip()
+    if not raw:
+        return DEFAULT_GAP_STOP_PCT
+    if raw == "off":
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RouterSettingsError(f"{GAP_STOP_VAR}={raw!r} is not a number or 'off'") from exc
+    if not (math.isfinite(value) and 0.0 < value < 1.0):
+        raise RouterSettingsError(f"{GAP_STOP_VAR}={raw!r} must be a fraction in (0, 1)")
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class RouterConfig:
     """Whether orders are routed, and to what. Disabled unless explicitly enabled."""
@@ -298,6 +331,8 @@ class RouterConfig:
     max_session_notional_usd: float | None = None
     #: v1's entry triggers, or None to send every buy at the session start.
     entry_timing: EntryTimingParams | None = EntryTimingParams()
+    #: The opening batch's gap-stop threshold (`crucible_trader.gap_stop`), or None.
+    gap_stop_pct: float | None = DEFAULT_GAP_STOP_PCT
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -341,6 +376,7 @@ class RouterConfig:
             max_order_notional_usd=_positive_float(source, MAX_ORDER_NOTIONAL_VAR),
             max_session_notional_usd=_positive_float(source, MAX_SESSION_NOTIONAL_VAR),
             entry_timing=None if timing == ENTRY_TIMING_IMMEDIATE else EntryTimingParams(),
+            gap_stop_pct=_gap_stop_pct(source),
         )
 
 
@@ -727,6 +763,7 @@ class PaperOrderRouter:
         clock: Callable[[], dt.datetime] = utcnow,
         quote: QuoteSource | None = None,
         fill_timeout_s: float = FILL_TIMEOUT_S,
+        live_quote: QuoteSource | None = None,
     ) -> None:
         if not config.enabled:
             raise RoutingDisabledError(f"order routing is off ({ROUTING_VAR} unset)")
@@ -747,10 +784,13 @@ class PaperOrderRouter:
         if quote is None:
             from crucible_trader.simulated_broker import PanelCloseSource  # imports this module
 
-            quote = CloseFallbackQuote(
-                IbQuoteSource(client, sdk), PanelCloseSource(store, trading_day)
-            )
+            primary = IbQuoteSource(client, sdk)
+            live_quote = live_quote or primary
+            quote = CloseFallbackQuote(primary, PanelCloseSource(store, trading_day))
         self._quote = quote
+        # The gap stop's price: IB only, never the close fallback, whose price
+        # IS the reference and would read every unpriced name as a 0% drop.
+        self._live_quote = live_quote or quote
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
@@ -787,12 +827,70 @@ class PaperOrderRouter:
             inherited=inherited,
             owned=owned,
         )
+        if self._config.gap_stop_pct is not None:
+            sells, buys = self._gap_stop(statement.positions, sells, buys)
         self._planned = sells + buys
         # Sells first, so their proceeds are cash before the buys go out.
         if self._config.entry_timing is None or not buys:
             return [batch for batch in (sells, buys) if batch]
         opening = [sells] if sells else []
         return itertools.chain(opening, self._timed_entries(self._config.entry_timing, buys, sells))
+
+    def _gap_stop(
+        self,
+        positions: Mapping[str, int],
+        sells: tuple[PlannedOrder, ...],
+        buys: tuple[PlannedOrder, ...],
+    ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...]]:
+        """The opening batch with every gapped held name sold whole (`gap_stop`).
+
+        The record is written before the orders exist, so an exit that reaches
+        the broker is never off the record.
+        """
+        from crucible_trader.simulated_broker import PanelCloseSource  # imports this module
+
+        threshold = self._config.gap_stop_pct
+        assert threshold is not None  # the caller checked
+        reference = PanelCloseSource(self._store, self._day)
+
+        def safe_reference(symbol: str) -> float | None:
+            try:
+                return reference(symbol)
+            except PriceUnavailableError:
+                return None
+
+        checks = check_gaps(
+            positions, reference=safe_reference, live_price=self._live_quote, threshold=threshold
+        )
+        now = self._clock()
+        write_gap_stop_document(
+            self._store,
+            self._day,
+            gap_stop_document(
+                self._day,
+                checks,
+                threshold=threshold,
+                reference_source=reference.source_key,
+                now=now,
+            ),
+        )
+        for check in checks:
+            if check.fired:
+                print(
+                    f"order_router: GAP STOP {check.symbol} at {check.price} is "
+                    f"{check.drop:.1%} below the {self._day} close {check.reference_close}; "
+                    f"selling all {check.shares} shares",
+                    file=sys.stderr,
+                )
+        return apply_gap_exits(
+            sells,
+            buys,
+            checks,
+            symbol_of=lambda o: o.decision.symbol,
+            full_exit=lambda c: PlannedOrder(
+                trading_day=self._day, decision=exit_decision(c, now=now)
+            ),
+        )
 
     def _timed_entries(
         self,
