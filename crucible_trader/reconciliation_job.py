@@ -115,6 +115,7 @@ from crucible_trader.broker_statement import (
 from crucible_trader.dividend_entitlements import (
     OWED_BOOTSTRAP_FROM,
     load_declared_entitlements,
+    load_declared_waivers,
     owed_dividends,
 )
 from crucible_trader.exception_decision import (
@@ -162,6 +163,7 @@ from crucible_trader.reconciliation import (
     RECONCILIATION_SCHEMA_VERSION,
     CashFlow,
     CorporateActionSet,
+    DividendWaiver,
     Fill,
     ReconciliationInputs,
     ReconciliationResult,
@@ -331,6 +333,7 @@ def reconcile_cycle(
     genesis: bool = False,
     reconciler: Reconciler = reconcile,
     order_records: tuple[Sequence[BrokerOrder], Sequence[BrokerExecution]] | None = None,
+    dividend_waivers: Sequence[DividendWaiver] | None = None,
 ) -> ReconciliationResult:
     """The job body. See the module docstring for the order and the raises.
 
@@ -338,7 +341,8 @@ def reconcile_cycle(
     :data:`CorporateActionProvider` asked for it once the statements are read.
     ``order_records`` is the broker's orders and executions
     (:func:`~crucible_trader.order_intent_reconciliation.broker_records_from_client`);
-    when given, step 5a runs.
+    when given, step 5a runs. ``dividend_waivers`` defaults to the declared file
+    (:func:`~crucible_trader.dividend_entitlements.load_declared_waivers`).
     """
     day = ctx.trading_day.isoformat()
     broker = source.read_statement(day)
@@ -374,6 +378,9 @@ def reconcile_cycle(
         owed_dividends=owed,
         ledger_positions=ledger_positions,
         ledger_source=ledger_source,
+        dividend_waivers=tuple(
+            load_declared_waivers() if dividend_waivers is None else dividend_waivers
+        ),
     )
     result = reconciler(inputs)
     verdict = run_control_arm(inputs, reconciler=reconciler)

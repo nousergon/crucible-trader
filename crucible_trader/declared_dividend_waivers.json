@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "_comment": "Owed dividends an operator ruled the broker will not credit (crucible_trader/dividend_entitlements.py, alpha-engine-config-I12024). Each waives ONE dividend by ticker, pay date and exact amount; an owed amount that differs by a cent is refused. A waived dividend leaves the owed list and is recorded in the reconciliation's `dividends_waived`. Store keys are relative to the crucible store prefix.",
+  "waivers": [
+    {
+      "ticker": "MU",
+      "pay_date": "2026-10-29",
+      "amount_usd": 11.85,
+      "ruling": "Brian 2026-11-09 (project thread, alpha-engine-config-I12024): waive the v1-era MU dividend the IB paper account never credited; ratified by the merge of this declaration.",
+      "ruled_on": "2026-11-09",
+      "evidence": [
+        "corporate_actions/scans/2026-10-29.json (Polygon): MU cash dividend 0.15/share, ex and record 2026-10-14, pay 2026-10-29",
+        "trader/broker_statements/2026-10-13.json: MU 79 shares at the record session, so 79 x 0.15 = 11.85 was owed",
+        "trader/reconciliation/2026-10-29.json: cash_residual_usd -11.86, cash short exactly the MU dividend on its pay date",
+        "trader/reconciliation/2026-10-30.json, 2026-11-03.json, 2026-11-05.json, 2026-11-06.json, 2026-11-09.json: cash_residual_usd 0.0 with no dividend_credits",
+        "trader/reconciliation/2026-11-04.json: cash_residual_usd 107.69 is October interest (accrued_cash_usd fell 109.28 to 3.43 between trader/broker_statements/2026-11-03.json and 2026-11-04.json), leaving no room for the dividend",
+        "IB paper account did not credit"
+      ]
+    },
+    {
+      "ticker": "SPY",
+      "pay_date": "2026-10-30",
+      "amount_usd": 18.89,
+      "ruling": "Brian 2026-11-09 (project thread, alpha-engine-config-I12024): waive the v1-era SPY dividend the IB paper account never credited; ratified by the merge of this declaration.",
+      "ruled_on": "2026-11-09",
+      "evidence": [
+        "crucible_trader/declared_dividend_entitlements.json: SPY 10 shares x 1.888834 at record session 2026-09-17, pay 2026-10-30, 18.89 owed (estimated)",
+        "trader/reconciliation/2026-10-30.json: cash_residual_usd 0.0 against trader/broker_statements/2026-10-29.json, so no credit on the pay date",
+        "trader/reconciliation/2026-11-03.json, 2026-11-05.json, 2026-11-06.json, 2026-11-09.json: cash_residual_usd 0.0 with no dividend_credits",
+        "trader/reconciliation/2026-11-04.json: cash_residual_usd 107.69 is October interest (accrued_cash_usd fell 109.28 to 3.43), leaving no room for the dividend",
+        "IB paper account did not credit"
+      ]
+    }
+  ]
+}
