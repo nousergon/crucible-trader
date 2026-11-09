@@ -15,8 +15,8 @@ broker by a route that skips one:
    forecast the safeguard has just called degenerate.
 3. **Before the contract is resolved**, `v1_rules_guard.enforce_v1_rules`
    (`alpha-engine-config-I12024`): every v1 trading rule the private record
-   still owes is named on the run; from the record's ``enforce_from`` date
-   an owed money-path rule refuses the session before anything is built.
+   still owes is named on the run. It never holds a session: from the
+   record's ``enforce_from`` the debt fails CI instead.
 4. **Before every order batch**, `kill_switch.assert_trading_permitted` raises
    :class:`~crucible_trader.kill_switch.TradingHaltedError` when flatten or
    freeze is engaged or a hold covers the day. It is re-read per batch, so a
@@ -77,7 +77,7 @@ def session_cycle(
     disagreement = running_wheel_disagreement(ctx.store, installed_version)
     if disagreement is not None:
         raise RunningWheelMismatchError(disagreement)
-    rules_guard(ctx)  # raises V1RulesUnmetError from the record's enforce_from
+    rules_guard(ctx)  # reports only; never raises (no trading holds)
 
     day = ctx.trading_day.isoformat()
     contract = contract_resolver(ctx.store, day)

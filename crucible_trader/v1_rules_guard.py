@@ -1,4 +1,4 @@
-"""The v1 trading-rules guard: v2 may not trade on a v1 rule nobody has carried.
+"""The v1 trading-rules guard: no v1 rule stays owed without CI going red.
 
 `alpha-engine-config-I12024`. On 2026-11-03 v2 began routing orders without
 v1's loss floor, drawdown ladder, broker-side stop, negative-alpha exit and
@@ -13,9 +13,10 @@ did not fire, for three reasons this module answers one by one:
 2. **`deferred` read as a decision.** The ledger's ten executor-parameter rows
    sat `deferred`, which its phase-3 clause grades MET. Here a `deferred`
    executor-parameter row is OUTSTANDING, like a `pending` rule.
-3. **The clause gates a phase, not a session.** This guard runs inside
-   :func:`crucible_trader.session.session_cycle`, before the contract is
-   resolved, so it stands between the record and the first order.
+3. **The clause gates a phase, and nothing failed on the trading path.** This
+   guard runs inside :func:`crucible_trader.session.session_cycle` and names
+   every owed rule on every session; :data:`OWED_RULES` with
+   :data:`CI_ENFORCE_FROM` turns the same debt into a red CI from a date.
 
 **What is OUTSTANDING.** A `money_path` rule that is `pending`; a `carried`
 rule this wheel does not register in :data:`IMPLEMENTED_RULES`, or registers
@@ -24,24 +25,27 @@ disagree, so neither proves the rule); and a `deferred` row of the ledger's
 `config/executor_params.json` section. A rule `superseded` or `excluded` on the
 record carries a ruling reference and is settled.
 
-**What it does, by date.** The record carries ``enforce_from``.
+**It never holds a session.** Brian's standing rule is no trading holds. On
+every session, before and after any date, the outstanding rows are named on
+the run's ``v1_trading_rules_outstanding`` metric (status ``BREACH``, or
+``unmeasurable`` when the record or ledger cannot be read) and logged at
+ERROR, and the session trades.
 
-* Before it: the session TRADES. The outstanding rows are named on the run's
-  ``v1_trading_rules_outstanding`` metric (status ``BREACH``) and logged at
-  ERROR, every session. Brian's rule is no trading holds, so the guard lands
-  ahead of the fixes it waits on and only reports until they merge.
-* On and after it: :class:`V1RulesUnmetError` is raised before anything is
-  built. No book, no order, no evidence; `trader.session` files a failed
-  manifest whose reason names every outstanding rule, which is the failure
-  page (`crucible.alerts`).
+**What enforces it is CI, from a date.** The private record carries
+``enforce_from`` (2026-11-30). From that date:
 
-**An unreadable record is UNMEASURABLE.** When the date is known (the record
-parsed but the ledger did not), an unmeasurable reading on or after it
-refuses, like an outstanding one. When the record itself is absent or
-malformed the date is unknown, so the guard reports and trades: an absent
-record is the state before the private tree first publishes it, and refusing
-on it would hold every session on a deploy-order accident. The private tree's
-own test refuses a malformed or missing record before it can publish.
+* this repository's `tests/test_v1_rules_guard.py` fails while
+  :data:`OWED_RULES` is non-empty, so every trader PR and `main` go red until
+  each rule is built (its id moves to :data:`IMPLEMENTED_RULES`) or ruled
+  `excluded`/`superseded` in the private record (its id is dropped here);
+* the private tree's `tests/test_v1_trading_rules.py` fails while any
+  money-path row is `pending` or an executor parameter is `deferred`, and
+  fails on a missing or unreadable record at any date.
+
+:data:`OWED_RULES` is the public mirror of the private record's owed set —
+rule ids only, never a threshold. The private tree's test cross-checks the two
+wherever a sibling checkout of this repository is present; this repository's
+CI cannot read the private record, so it fails on the mirror.
 
 **Adding an implementation.** A PR that implements a v1 rule adds its entry to
 :data:`IMPLEMENTED_RULES` (location + the test that proves it); the private
@@ -132,12 +136,36 @@ class RulesRecordError(ValueError):
     """The record is present and does not satisfy its schema."""
 
 
-class V1RulesUnmetError(RuntimeError):
-    """A v1 trading rule is outstanding on or after the record's enforce date.
+#: From this date `tests/test_v1_rules_guard.py` fails while
+#: :data:`OWED_RULES` is non-empty. Mirrors the private record's
+#: ``enforce_from``; moving it later weakens a guard (red line 3).
+CI_ENFORCE_FROM = dt.date(2026, 11, 30)
 
-    Raised before construction: the session trades nothing and its run fails,
-    which pages. Distinct from `ContractUnavailable` (a hold that is `ok`).
-    """
+#: The money-path v1 rules the private record still owes (`pending`, or
+#: carrying a `deferred` executor parameter). A PR that implements one moves it
+#: to :data:`IMPLEMENTED_RULES`; a ruling that excludes or supersedes one
+#: drops it here in the same change as the record.
+OWED_RULES: frozenset[str] = frozenset(
+    {
+        "broker_stop",
+        "gap_stop_intraday",
+        "position_loss_floor",
+        "drawdown_ladder",
+        "nav_sizing",
+        "negative_alpha_exit",
+        "hard_risk_reentry_lockout",
+        "hard_risk_precedence",
+        "sector_cap",
+        "predictor_veto",
+        "research_exit_signal",
+        "expectancy_derisk_gate",
+        "intraday_resolve",
+        "stance_caps",
+        "score_floor",
+        "rebalance_band",
+        "entry_timing",
+    }
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,13 +355,10 @@ def read_rules(
 def enforce_v1_rules(
     ctx: RunContext, *, implemented: Mapping[str, Implementation] = IMPLEMENTED_RULES
 ) -> RulesReading:
-    """Report every session; refuse the session from ``enforce_from``.
-
-    Records the reading as a metric first, so a refused run still names what
-    it refused on.
-    """
+    """Report every session. Never raises and never holds: Brian's rule is no
+    trading holds, and the debt is enforced by CI from ``enforce_from``."""
     reading = read_rules(ctx.store, implemented=implemented)
-    enforced = reading.state != "MET" and reading.enforced_on(ctx.trading_day)
+    late = reading.state != "MET" and reading.enforced_on(ctx.trading_day)
     status = {"MET": "OK", "OUTSTANDING": "BREACH", "UNMEASURABLE": "unmeasurable"}[reading.state]
     ctx.record_metric(
         {
@@ -343,7 +368,7 @@ def enforce_v1_rules(
             "value": float(len(reading.outstanding)),
             "unit": "count",
             "n_floor": 1,
-            "status": "FAIL" if enforced else status,
+            "status": status,
             "status_reason": reading.describe(),
             "source_path": RULES_KEY,
             "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -351,18 +376,18 @@ def enforce_v1_rules(
     )
     if reading.state == "MET":
         return reading
-    if enforced:
-        raise V1RulesUnmetError(
-            f"trading refused on {ctx.trading_day.isoformat()}: {reading.describe()}. "
-            "Each outstanding rule needs a merged implementation (row -> carried) or a "
-            "ruling (row -> superseded/excluded) in strategy/v1_trading_rules.yaml"
-        )
-    log.error("v1 trading rules NOT enforced yet, trading anyway: %s", reading.describe())
+    log.error(
+        "v1 trading rules owed, trading anyway%s: %s",
+        " (PAST enforce_from: CI is red until each is built or ruled)" if late else "",
+        reading.describe(),
+    )
     return reading
 
 
 __all__ = [
+    "CI_ENFORCE_FROM",
     "IMPLEMENTED_RULES",
+    "OWED_RULES",
     "METRIC_NAME",
     "RULES_KEY",
     "RULES_SCHEMA_VERSION",
@@ -371,7 +396,6 @@ __all__ = [
     "RulesReading",
     "RulesRecord",
     "RulesRecordError",
-    "V1RulesUnmetError",
     "enforce_v1_rules",
     "parse_rules",
     "read_rules",

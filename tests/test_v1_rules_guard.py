@@ -1,15 +1,14 @@
 """The v1 trading-rules guard (`alpha-engine-config-I12024`).
 
-The mutations are the point: each plants one way a v1 rule can be owed into a
-settled world and asserts the reading moves, then asserts what the session
-does with it on either side of ``enforce_from`` — report and trade before,
-refuse before anything is built on and after.
+The mutations plant one way a v1 rule can be owed into a settled world and
+assert the reading moves. The session is never held, on any date (Brian's
+standing rule: no trading holds); it reports a BREACH metric and an ERROR log.
 
-The last class is the "no working v2 implementation" test: every entry in
-:data:`IMPLEMENTED_RULES` must import, and a test it names in this repository
-must exist. Delete or rename an implementation and this suite goes red; the
-private record's `carried` row then reads OUTSTANDING on the box because this
-wheel no longer registers it.
+The enforcement is CI: from `CI_ENFORCE_FROM`,
+`test_no_v1_rule_is_owed_on_or_after_the_enforce_date` fails while
+`OWED_RULES` is non-empty, so every PR goes red until each rule is built or
+ruled out. The last block is the "no working v2 implementation" test: every
+entry in `IMPLEMENTED_RULES` must import, and a test it names here must exist.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import ast
 import datetime as dt
 import importlib
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -29,12 +29,13 @@ from ib_fakes import ctx_for
 
 from crucible_trader.session import session_cycle
 from crucible_trader.v1_rules_guard import (
+    CI_ENFORCE_FROM,
     IMPLEMENTED_RULES,
     METRIC_NAME,
+    OWED_RULES,
     RULES_KEY,
     Implementation,
     RulesRecordError,
-    V1RulesUnmetError,
     enforce_v1_rules,
     parse_rules,
     read_rules,
@@ -205,6 +206,10 @@ class TestParse:
             ({"schema_version": "v0"}, "schema_version"),
             ({"enforce_from": "soon"}, "ISO date"),
             ({"rules": []}, "non-empty"),
+            ({"rules": ["a rule"]}, "not a mapping"),
+            ({"rules": [_rule("a", "pending", reference="I12024")]}, "not an issue id"),
+            ({"rules": [_rule("a", "pending", v2_prs="crucible-trader-PR1")]}, "v2_prs"),
+            ({"rules": [_rule("a", "pending", v2_prs=[141])]}, "v2_prs"),
             ({"rules": [_rule("a", "pending", extra_field=1)]}, "unknown field"),
             ({"rules": [_rule("a", "carried", v2_test=None)]}, "v2_test"),
             ({"rules": [_rule("a", "pending", reference=None)]}, "reference"),
@@ -219,7 +224,18 @@ class TestParse:
             parse_rules(self._raw(**change))
 
 
-class TestTheGuardByDate:
+@pytest.mark.parametrize(
+    ("raw", "match"), [(b"rules: [\n", "not readable YAML"), (b"- a\n", "not a mapping")]
+)
+def test_an_unparseable_record_is_refused(raw: bytes, match: str) -> None:
+    with pytest.raises(RulesRecordError, match=match):
+        parse_rules(raw)
+
+
+class TestTheGuardNeverHolds:
+    """Brian's standing rule is no trading holds: the guard reports on every
+    session, on every date, and never raises. CI enforces the debt."""
+
     def _owed(self, tmp_path):
         return _store(tmp_path, rules=[*_settled_rules(), _rule("broker_stop", "pending")])
 
@@ -231,61 +247,104 @@ class TestTheGuardByDate:
         metric = _metric(ctx)
         assert (metric["status"], metric["value"]) == ("BREACH", 1.0)
         assert "broker_stop: pending" in metric["status_reason"]
-        assert "NOT enforced yet" in caplog.text
+        assert "trading anyway:" in caplog.text
+        assert "PAST enforce_from" not in caplog.text
 
     @pytest.mark.parametrize("day", [ENFORCE, AFTER])
-    def test_on_and_after_the_date_it_refuses(self, tmp_path, day) -> None:
+    def test_on_and_after_the_date_it_still_only_reports(self, tmp_path, caplog, day) -> None:
         ctx = ctx_for(self._owed(tmp_path), "trader.session", day=day)
-        with pytest.raises(V1RulesUnmetError, match="broker_stop: pending"):
-            enforce_v1_rules(ctx)
-        assert _metric(ctx)["status"] == "FAIL"
+        with caplog.at_level(logging.ERROR):
+            assert enforce_v1_rules(ctx).state == "OUTSTANDING"
+        assert _metric(ctx)["status"] == "BREACH"
+        assert "PAST enforce_from: CI is red" in caplog.text
 
-    def test_a_settled_record_never_refuses(self, tmp_path) -> None:
+    def test_a_settled_record_reports_ok(self, tmp_path, caplog) -> None:
         ctx = ctx_for(_store(tmp_path), "trader.session", day=AFTER)
-        assert enforce_v1_rules(ctx).state == "MET"
+        with caplog.at_level(logging.ERROR):
+            assert enforce_v1_rules(ctx).state == "MET"
         assert _metric(ctx)["status"] == "OK"
+        assert caplog.text == ""
 
-    def test_no_record_reports_and_trades_even_late(self, tmp_path) -> None:
-        """The date is in the record: with no record it is unknown, and a
-        deploy-order accident must not hold a session."""
+    def test_no_record_reports_unmeasurable_and_trades(self, tmp_path) -> None:
         ctx = ctx_for(_store(tmp_path, rules=False), "trader.session", day=AFTER)
         assert enforce_v1_rules(ctx).state == "UNMEASURABLE"
         assert _metric(ctx)["status"] == "unmeasurable"
 
-    def test_an_unreadable_ledger_refuses_once_the_date_is_known_and_passed(self, tmp_path) -> None:
+    def test_an_unreadable_ledger_reports_unmeasurable_and_trades(self, tmp_path) -> None:
         ctx = ctx_for(_store(tmp_path, ledger=False), "trader.session", day=AFTER)
-        with pytest.raises(V1RulesUnmetError, match="UNMEASURABLE"):
-            enforce_v1_rules(ctx)
+        assert enforce_v1_rules(ctx).state == "UNMEASURABLE"
+        assert _metric(ctx)["status"] == "unmeasurable"
 
 
-class Router:
-    def __init__(self) -> None:
-        self.books: list = []
-
-    def batches(self, book):
-        self.books.append(book)
-        return iter(())
-
-    def send(self, batch):  # pragma: no cover - never reached
-        raise AssertionError("no batch is sent")
+class _Resolved(Exception):
+    pass
 
 
-def test_the_session_refuses_before_resolving_the_contract(tmp_path, monkeypatch) -> None:
-    """On a day it fires: nothing is resolved, built or sent."""
+def test_the_session_reports_and_goes_on_to_resolve_the_contract(tmp_path, monkeypatch) -> None:
+    """Past the date with a rule owed, the session still reaches the contract."""
     store = _store(tmp_path, rules=[_rule("broker_stop", "pending")])
     monkeypatch.setattr("crucible_trader.session.running_wheel_disagreement", lambda *a: None)
-    resolved: list = []
-    router = Router()
-    with pytest.raises(V1RulesUnmetError):
+
+    def resolver(store, day):
+        raise _Resolved(day)
+
+    ctx = ctx_for(store, "trader.session", day=AFTER)
+    with pytest.raises(_Resolved):
         session_cycle(
-            ctx_for(store, "trader.session", day=AFTER),
+            ctx,
             broker=object(),  # type: ignore[arg-type]
-            router=router,
+            router=object(),  # type: ignore[arg-type]
             installed_version="0.1.0",
             previous_weights=None,
-            contract_resolver=lambda s, d: resolved.append(d),  # type: ignore[arg-type,func-returns-value]
+            contract_resolver=resolver,  # type: ignore[arg-type]
         )
-    assert (resolved, router.books) == ([], [])
+    assert _metric(ctx)["status"] == "BREACH"
+
+
+class _FailingStore:
+    def exists(self, key: str) -> bool:
+        raise OSError(f"denied: {key}")
+
+
+def test_a_store_fault_on_the_record_is_unmeasurable() -> None:
+    reading = read_rules(_FailingStore())  # type: ignore[arg-type]
+    assert (reading.state, reading.enforce_from) == ("UNMEASURABLE", None)
+    assert "denied" in (reading.problem or "")
+
+
+def test_a_malformed_ledger_is_unmeasurable_with_the_date(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.put_bytes(v1_carryover_key(), b"schema_version: nope\n")
+    reading = read_rules(store)
+    assert (reading.state, reading.enforce_from) == ("UNMEASURABLE", ENFORCE)
+    assert "ledger unreadable" in (reading.problem or "")
+
+
+# ---------------------------------------------------------------------------
+# the CI half: from CI_ENFORCE_FROM an owed rule fails this suite
+# ---------------------------------------------------------------------------
+
+
+def test_no_v1_rule_is_owed_on_or_after_the_enforce_date() -> None:
+    """THE ENFORCEMENT. From `CI_ENFORCE_FROM` every PR and `main` are red
+    while any money-path v1 rule is owed: build it (move its id to
+    IMPLEMENTED_RULES) or get it ruled excluded/superseded in the private
+    record (drop its id from OWED_RULES). Moving the date is red line 3."""
+    owed = sorted(OWED_RULES) if dt.date.today() >= CI_ENFORCE_FROM else []
+    assert not owed, f"v1 trading rules still owed on/after {CI_ENFORCE_FROM}: {owed}"
+
+
+def test_an_owed_rule_is_never_also_implemented() -> None:
+    """Implementing a rule moves it; a rule in both lists is a stale mirror."""
+    assert not (OWED_RULES & set(IMPLEMENTED_RULES))
+
+
+def test_owed_rule_ids_are_well_formed() -> None:
+    assert all(re.fullmatch(r"[a-z][a-z0-9_]*", rule) for rule in OWED_RULES)
+
+
+def test_the_ci_date_is_the_record_date() -> None:
+    assert CI_ENFORCE_FROM == ENFORCE
 
 
 # ---------------------------------------------------------------------------
