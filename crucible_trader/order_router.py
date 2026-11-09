@@ -67,9 +67,10 @@ in a `finally`.
 **Buys wait for their entry trigger** (`crucible_trader.entry_timing`, Brian
 2026-11-09). Sells go out at the session start; with
 :attr:`RouterConfig.entry_timing` set -- the default, v1's parameters -- the buys
-are held and released one poll at a time by v1's pullback / graduated / expiry
-triggers on streaming IB quotes, so the session runs until the last buy is
-released (at the latest v1's 15:55 ET expiry) or the market closes. Each released
+are held and released one poll at a time by v1's pullback / VWAP discount /
+support bounce / graduated / expiry triggers on streaming IB quotes, so the
+session runs until the last buy is released (at the latest v1's 15:55 ET
+expiry) or the market closes. Each released
 buy is its own batch, so `session_cycle` re-checks the kill switch before it and
 :meth:`PaperOrderRouter.send` before its order, exactly as for the open's batch;
 the watch also re-reads the switch on every poll. The idempotency key is
@@ -107,6 +108,7 @@ from crucible_trader.entry_timing import (
     IbIntradayQuotes,
     WatchedEntry,
     entry_trigger,
+    panel_support_levels,
 )
 from crucible_trader.execution_shortfall import (
     Fill,
@@ -802,6 +804,12 @@ class PaperOrderRouter:
         now = self._clock()
         schedule = params.schedule(now.astimezone(NYSE_ZONE).date())
         by_key = {order.key: order for order in buys}
+        support = panel_support_levels(
+            self._store,
+            self._day,
+            [o.decision.symbol for o in buys],
+            lookback_days=params.support_lookback_days,
+        )
         watch = EntryWatch(
             self._store,
             trading_day=self._day,
@@ -814,6 +822,7 @@ class PaperOrderRouter:
                     quantity=int(o.decision.quantity),
                     reference_price=float(o.decision.decision_price),
                     decided_at=o.decision.decided_at,
+                    support_level=support.get(o.decision.symbol),
                 )
                 for o in buys
             ],
@@ -871,6 +880,7 @@ class PaperOrderRouter:
                         now=now,
                         schedule=schedule,
                         params=params,
+                        support_level=entry.support_level,
                     )
                     if reason is None:
                         continue
@@ -888,6 +898,16 @@ class PaperOrderRouter:
             watch.state = "complete"
         finally:
             quotes.close()
+            no_vwap = sorted(
+                e.symbol for e in watch.entries if e.last is not None and e.vwap is None
+            )
+            if no_vwap:
+                # Fail-safe, not silent: the VWAP trigger could not fire for these.
+                print(
+                    f"order_router: no VWAP was streamed for {', '.join(no_vwap)}; "
+                    "the VWAP-discount trigger could not fire for them",
+                    file=sys.stderr,
+                )
             if watch.state == "watching":
                 watch.state = "stopped"
             watch.write(self._clock())

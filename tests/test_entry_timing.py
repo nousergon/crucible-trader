@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import io
 import json
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
+from crucible.keys import data_panel_key
 from crucible.store import LocalStore
 from ib_fakes import FakeClock, FakeSdk
 from test_order_router import ACCOUNT, DAY, RoutingIB, _book, _config, _env, _halt
@@ -29,6 +32,7 @@ from crucible_trader.entry_timing import (
     WatchedEntry,
     entry_trigger,
     entry_watch_key,
+    panel_support_levels,
 )
 from crucible_trader.kill_switch import TradingHaltedError
 from crucible_trader.order_intent import claim_order_intent, order_intent_document
@@ -59,6 +63,9 @@ SCHEDULE = PARAMS.schedule(SESSION)
 def test_the_defaults_are_what_v1_ran() -> None:
     assert PARAMS.document() == {
         "pullback_pct": 0.02,
+        "vwap_discount_pct": 0.005,
+        "support_pct": 0.01,
+        "support_lookback_days": 20,
         "graduated_start_et": "15:30",
         "graduated_max_premium_pct": 0.01,
         "expiry_et": "15:55",
@@ -75,6 +82,9 @@ def test_the_defaults_are_what_v1_ran() -> None:
         ("graduated_start_et", dt.time(15, 56), "inside the session"),
         ("expiry_et", dt.time(16, 0), "inside the session"),
         ("graduated_start_et", dt.time(9, 30), "inside the session"),
+        ("vwap_discount_pct", 0.0, "vwap_discount_pct"),
+        ("support_pct", 1.0, "support_pct"),
+        ("support_lookback_days", 0, "support_lookback_days"),
         ("poll_interval_s", 0.0, "poll_interval_s"),
         ("poll_interval_s", float("nan"), "poll_interval_s"),
     ],
@@ -144,6 +154,56 @@ def test_a_pullback_is_named_before_the_expiry() -> None:
     assert _fires(90.0, 100.0, et(15, 58)).startswith("pullback")
 
 
+def _quoted(
+    quote: IntradayQuote, at: dt.datetime | None = None, *, support: float | None = None
+) -> str | None:
+    return entry_trigger(
+        reference_price=100.0,
+        quote=quote,
+        now=at or et(10),
+        schedule=SCHEDULE,
+        params=PARAMS,
+        support_level=support,
+    )
+
+
+def test_half_a_percent_under_the_vwap_releases_the_buy() -> None:
+    assert _quoted(IntradayQuote(last=99.5, high=99.6, vwap=100.0)) == (
+        "vwap_discount 0.50% below VWAP 100.00"
+    )
+    assert _quoted(IntradayQuote(last=99.6, high=99.6, vwap=100.0)) is None
+
+
+def test_no_vwap_only_silences_the_vwap_trigger() -> None:
+    assert _quoted(IntradayQuote(last=99.0, high=99.0, vwap=None)) is None
+    assert _quoted(IntradayQuote(last=99.0, high=99.0, vwap=float("nan"))) is None
+    assert _quoted(IntradayQuote(last=99.0, high=99.0), et(15, 55)) == "time_expiry"
+
+
+def test_a_price_within_one_percent_above_support_releases_the_buy() -> None:
+    quote = IntradayQuote(last=101.0, high=101.0, low=100.5)
+    assert _quoted(quote, support=100.0) == "support_bounce 1.00% above support 100.00"
+    assert _quoted(IntradayQuote(last=101.1, high=101.1, low=100.5), support=100.0) is None
+    # Exactly at support is a bounce; no day low read is not a break (v1).
+    assert _quoted(IntradayQuote(last=100.0, high=100.0), support=100.0) is not None
+
+
+def test_a_support_the_day_has_broken_is_not_a_bounce() -> None:
+    assert _quoted(IntradayQuote(last=100.5, high=100.5, low=99.9), support=100.0) is None
+    assert _quoted(IntradayQuote(last=99.9, high=99.9, low=99.9), support=100.0) is None
+
+
+def test_no_support_level_only_silences_the_support_trigger() -> None:
+    assert _quoted(IntradayQuote(last=100.5, high=100.5, low=100.5), support=None) is None
+
+
+def test_the_triggers_are_named_in_v1s_order() -> None:
+    quote = IntradayQuote(last=98.0, high=100.0, low=98.0, vwap=99.0)
+    assert _quoted(quote, support=97.5).startswith("pullback")
+    quote = IntradayQuote(last=98.5, high=99.0, low=98.0, vwap=99.0)
+    assert _quoted(quote, support=98.0).startswith("vwap_discount")
+
+
 def test_an_unusable_price_is_no_price() -> None:
     assert _fires(float("nan"), 100.0, et(10)) is None
     assert _fires(-1.0, 100.0, et(10)) is None
@@ -165,12 +225,25 @@ def _watched(symbol: str = "AAA") -> WatchedEntry:
 def test_the_high_is_never_below_a_last_price_seen() -> None:
     entry = _watched()
     assert entry.observe(IntradayQuote(last=101.0, high=None, market_data_type=3)) == (
-        IntradayQuote(last=101.0, high=101.0)
+        IntradayQuote(last=101.0, high=101.0, low=101.0)
     )
-    assert entry.observe(IntradayQuote(last=None, high=None)) == IntradayQuote(None, 101.0)
+    assert entry.observe(IntradayQuote(last=None, high=None)) == IntradayQuote(
+        None, 101.0, low=101.0
+    )
     seen = entry.observe(IntradayQuote(last=99.0, high=100.5))
-    assert seen == IntradayQuote(last=99.0, high=101.0)
+    assert seen == IntradayQuote(last=99.0, high=101.0, low=99.0)
     assert (entry.last, entry.market_data_type) == (99.0, 3)
+
+
+def test_the_low_is_never_above_a_last_price_and_the_vwap_is_the_latest() -> None:
+    entry = _watched()
+    entry.observe(IntradayQuote(last=100.0, high=100.0, low=99.5, vwap=99.8))
+    seen = entry.observe(IntradayQuote(last=99.0, high=None, low=None, vwap=None))
+    assert seen == IntradayQuote(last=99.0, high=100.0, low=99.0, vwap=99.8)
+    entry.observe(IntradayQuote(last=None, high=None, low=98.0, vwap=99.7))
+    assert (entry.low, entry.vwap) == (98.0, 99.7)
+    row = entry.document()
+    assert (row["low"], row["vwap"], row["support_level"]) == (98.0, 99.7, None)
 
 
 class _RefusingStore(LocalStore):
@@ -236,6 +309,16 @@ class _Ticker:
     def high(self) -> float:
         return self._ib.high_at(self._symbol)
 
+    @property
+    def low(self) -> float:
+        return min(self._ib._seen(self._symbol))
+
+    @property
+    def vwap(self) -> float | None:
+        now = self._ib.clock().astimezone(NYSE_ZONE).time()
+        seen = [v for at, v in self._ib.vwaps.get(self._symbol, []) if at <= now]
+        return seen[-1] if seen else None
+
     close = float("nan")
 
 
@@ -248,6 +331,9 @@ class TimedIB(RoutingIB):
         super().__init__(prices={s: p[0][1] for s, p in paths.items()}, clock=clock, **kwargs)
         self.connected = True
         self.subscribed: list[str] = []
+        self.tick_lists: list[str] = []
+        #: The session VWAP each name's stream carries over the day (absent: none streamed).
+        self.vwaps: dict[str, list[tuple[dt.time, float]]] = {}
 
     def _seen(self, symbol: str) -> list[float]:
         now = self.clock().astimezone(NYSE_ZONE).time()
@@ -266,6 +352,7 @@ class TimedIB(RoutingIB):
 
     def reqMktData(self, contract, tick_list, snapshot, regulatory):  # noqa: N802
         self.subscribed.append(contract.symbol)
+        self.tick_lists.append(tick_list)
         return _Ticker(self, contract.symbol)
 
     def sleep(self, seconds):
@@ -291,7 +378,11 @@ def test_the_quote_stream_reads_last_and_high_and_skips_an_unqualifiable_name() 
     quotes = IbIntradayQuotes(ib, FakeSdk(ib))
     quotes.subscribe(["AAA", "ZZZ"])
     assert ib.subscribed == ["AAA"] and ib.market_data_type == 3
-    assert quotes("AAA") == IntradayQuote(last=103.0, high=103.0, market_data_type=3)
+    assert ib.tick_lists == ["233"]  # RTVolume: the stream carries the VWAP
+    ib.vwaps["AAA"] = [(dt.time(9, 30), 101.5)]
+    assert quotes("AAA") == IntradayQuote(
+        last=103.0, high=103.0, market_data_type=3, low=100.0, vwap=101.5
+    )
     assert quotes("ZZZ") == IntradayQuote(last=None, high=None)
     quotes.close()
     quotes.close()  # idempotent
@@ -316,6 +407,7 @@ def test_a_ticker_without_a_data_type_reads_as_unknown() -> None:
     quotes = IbIntradayQuotes(ib, FakeSdk(ib))
     quotes.subscribe(["AAA"])
     assert quotes("AAA") == IntradayQuote(last=100.0, high=None, market_data_type=None)
+    assert quotes("AAA").vwap is None and quotes("AAA").low is None
 
 
 # -- the router, over a whole simulated day --------------------------------------------
@@ -328,7 +420,7 @@ def store(tmp_path):
 
 def _timed_router(store, ib: TimedIB, **config) -> PaperOrderRouter:
     return PaperOrderRouter(
-        _config(entry_timing=PARAMS, **config),
+        _config(**{"entry_timing": PARAMS, **config}),
         client=ib,
         sdk=FakeSdk(ib),
         store=store,
@@ -513,3 +605,80 @@ def test_immediate_entry_timing_sends_every_buy_at_the_start() -> None:
 def test_an_unrecognised_entry_timing_is_refused() -> None:
     with pytest.raises(RouterSettingsError, match=ENTRY_TIMING_VAR):
         RouterConfig.from_env(_env(**{ENTRY_TIMING_VAR: "later"}))
+
+
+# -- the support level from the price panel -------------------------------------------
+
+
+def _panel(store, rows: dict[str, list[float]], *, day: str = DAY) -> None:
+    """A panel for ``day`` whose rows for each name end on ``day``, one low per session."""
+    end = dt.date.fromisoformat(day)
+    records = []
+    for ticker, lows in rows.items():
+        for back, low in enumerate(reversed(lows)):
+            records.append(
+                {
+                    "trading_day": end - dt.timedelta(days=back),
+                    "ticker": ticker,
+                    "low_raw": low,
+                }
+            )
+    # A row after the decision day is never part of its history.
+    records.append({"trading_day": end + dt.timedelta(days=1), "ticker": "AAA", "low_raw": 1.0})
+    frame = pd.DataFrame(records)
+    buffer = io.BytesIO()
+    frame.to_parquet(buffer)
+    store.put_bytes(data_panel_key(day), buffer.getvalue())
+
+
+def test_the_support_level_is_the_low_of_the_last_twenty_sessions(store, capsys) -> None:
+    _panel(
+        store,
+        {
+            "AAA": [5.0, *[100.0 + i for i in range(19)], 99.0],  # 21 rows; the 5.0 is too old
+            "BBB": [50.0] * 19,  # one session short: no level (v1)
+            "CCC": [float("nan"), -1.0, *([20.0] * 18)],  # unusable lows skipped
+            "DDD": [float("nan")] * 20,  # nothing usable
+        },
+    )
+    levels = panel_support_levels(store, DAY, ["AAA", "BBB", "CCC", "DDD", "EEE"], lookback_days=20)
+    assert levels == {"AAA": 99.0, "CCC": 20.0}
+    assert "for BBB, DDD, EEE" in capsys.readouterr().err
+
+
+def test_no_panel_leaves_no_support_level_and_says_so(store, capsys) -> None:
+    assert panel_support_levels(store, DAY, ["AAA"], lookback_days=20) == {}
+    assert "the support-bounce trigger will not fire today" in capsys.readouterr().err
+    assert panel_support_levels(store, DAY, [], lookback_days=20) == {}
+
+
+def test_a_buy_is_released_at_its_vwap_discount(store) -> None:
+    ib = TimedIB({"AAA": [(dt.time(9, 30), 100.0), (dt.time(10, 30), 100.5)]})
+    # 100.0 at its VWAP until 10:30, when 100.5 is 0.59% under it.
+    ib.vwaps["AAA"] = [(dt.time(9, 30), 100.0), (dt.time(10, 30), 101.1)]
+    router = _timed_router(store, ib)
+    _run_day(router, _book({"AAA": 0.1}))
+    assert ib.placed() == [("AAA", "BUY", 100, "10:30")]
+    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
+    assert row["trigger"].startswith("vwap_discount") and row["vwap"] == 101.1
+
+
+def test_a_buy_is_released_on_a_bounce_off_its_support(store) -> None:
+    _panel(store, {"AAA": [96.0] * 20})
+    path = [(dt.time(9, 30), 100.0), (dt.time(10, 0), 99.0), (dt.time(13, 0), 96.9)]
+    ib = TimedIB({"AAA": path})
+    ib.vwaps["AAA"] = [(dt.time(9, 30), 96.0)]  # never at a discount to the VWAP
+    router = _timed_router(store, ib, entry_timing=dataclasses.replace(PARAMS, pullback_pct=0.5))
+    _run_day(router, _book({"AAA": 0.1}))
+    assert ib.placed() == [("AAA", "BUY", 100, "13:00")]
+    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
+    assert row["support_level"] == 96.0
+    assert row["trigger"] == "support_bounce 0.94% above support 96.00"
+
+
+def test_a_stream_with_no_vwap_is_logged_and_the_buy_still_goes(store, capsys) -> None:
+    ib = TimedIB({"CCC": [(dt.time(9, 30), 20.0), (dt.time(12, 0), 21.0)]})
+    router = _timed_router(store, ib)
+    _run_day(router, _book({"CCC": 0.1}))
+    assert ib.placed() == [("CCC", "BUY", 500, "15:55")]
+    assert "no VWAP was streamed for CCC" in capsys.readouterr().err

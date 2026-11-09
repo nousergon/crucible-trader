@@ -14,14 +14,34 @@ which ports `crucible-executor` `executor/entry_triggers.py`:
 
 1. **pullback** -- the last price is at least :attr:`EntryTimingParams.pullback_pct`
    below the intraday high;
-2. **time expiry** -- unconditional at :attr:`EntryTimingParams.expiry_et`;
-3. **graduated** -- from :attr:`EntryTimingParams.graduated_start_et`, the last
+2. **VWAP discount** -- the last price is at least
+   :attr:`EntryTimingParams.vwap_discount_pct` below the VWAP;
+3. **support bounce** -- the last price is at or above the support level and
+   within :attr:`EntryTimingParams.support_pct` of it, and the day's low has not
+   broken it;
+4. **time expiry** -- unconditional at :attr:`EntryTimingParams.expiry_et`;
+5. **graduated** -- from :attr:`EntryTimingParams.graduated_start_et`, the last
    price is at most :attr:`EntryTimingParams.graduated_max_premium_pct` above the
    price the buy was sized at (v1's "morning price").
 
-v1 had two more, VWAP discount and support bounce. Both read inputs v1's planner
-computed (the previous day's VWAP, a 20-day support level) that the v2 book does
-not carry, so they are not ported; the three above are the ones Brian named.
+All five are v1's, in v1's order; v1's live ``disabled_triggers`` was empty, so
+none is left out. Two inputs come from different places than in v1:
+
+* **The VWAP is today's, from IB's stream** (generic tick 233, RTVolume, which
+  ``ib_async`` folds into ``Ticker.vwap``). v1 compared against the PREVIOUS
+  day's VWAP its planner loaded from ArcticDB; the v2 panel carries OHLCV and
+  no VWAP. Today's VWAP is the conventional benchmark for "buying below the
+  average price paid today".
+* **The support level is the N-day low of the price panel** the session already
+  reads (:func:`panel_support_levels`): the minimum positive ``low_raw`` over the
+  last :attr:`EntryTimingParams.support_lookback_days` sessions up to the book's
+  decision day, and none at all for a name with fewer -- v1's
+  ``_compute_support_level`` exactly.
+
+**An input that is not there fails safe.** A name with no VWAP on its stream,
+or no support level in the panel, simply never fires that trigger; the other
+four still can. Each is logged, and the watch document carries ``vwap`` and
+``support_level`` per name, so a trigger that could not fire is visible.
 
 **The defaults are what v1 RAN, not what its code said.** v1's code default for
 the graduated start was 14:00; its live configuration set 15:30, so a buy that
@@ -45,14 +65,16 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import io
 import json
 import logging
 import math
 import sys
-from collections.abc import Callable, Iterable
-from typing import Any, Literal
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
+from crucible.keys import data_panel_key
 from crucible.store import Store
 from krepis.trading_calendar import session_close_et
 
@@ -67,6 +89,7 @@ __all__ = [
     "WatchedEntry",
     "entry_trigger",
     "entry_watch_key",
+    "panel_support_levels",
 ]
 
 log = logging.getLogger(__name__)
@@ -82,6 +105,9 @@ REGULAR_CLOSE_ET = dt.time(16, 0)
 #: (the router's own decision prices use the same, `order_router.MARKET_DATA_TYPE`).
 MARKET_DATA_TYPE = 3
 
+#: IB generic tick 233 (RTVolume): ``ib_async`` derives ``Ticker.vwap`` from it.
+VWAP_GENERIC_TICKS = "233"
+
 #: How often the watch document is rewritten while nothing triggers.
 HEARTBEAT_S = 600.0
 
@@ -94,6 +120,12 @@ class EntryTimingParams:
 
     #: v1 `intraday_pullback_pct`: a buy is released this far below the intraday high.
     pullback_pct: float = 0.02
+    #: v1 `intraday_vwap_discount_pct`: released this far below the VWAP.
+    vwap_discount_pct: float = 0.005
+    #: v1 `intraday_support_pct`: released within this distance above the support level.
+    support_pct: float = 0.01
+    #: v1 `intraday_support_lookback_days`: the support level is the low of this many sessions.
+    support_lookback_days: int = 20
     #: v1 `intraday_graduated_start_time` (its live configuration: "15:30").
     graduated_start_et: dt.time = dt.time(15, 30)
     #: v1 `intraday_graduated_max_premium_pct`.
@@ -106,6 +138,14 @@ class EntryTimingParams:
     def __post_init__(self) -> None:
         if not (0.0 < self.pullback_pct < 1.0):
             raise ValueError(f"pullback_pct {self.pullback_pct!r} must be in (0, 1)")
+        for name in ("vwap_discount_pct", "support_pct"):
+            value = getattr(self, name)
+            if not (0.0 < value < 1.0):
+                raise ValueError(f"{name} {value!r} must be in (0, 1)")
+        if self.support_lookback_days < 1:
+            raise ValueError(
+                f"support_lookback_days {self.support_lookback_days!r} must be at least 1"
+            )
         if not (0.0 <= self.graduated_max_premium_pct < 1.0):
             raise ValueError(
                 f"graduated_max_premium_pct {self.graduated_max_premium_pct!r} must be in [0, 1)"
@@ -123,6 +163,9 @@ class EntryTimingParams:
         """The parameters in force, as recorded on the watch document."""
         return {
             "pullback_pct": self.pullback_pct,
+            "vwap_discount_pct": self.vwap_discount_pct,
+            "support_pct": self.support_pct,
+            "support_lookback_days": self.support_lookback_days,
             "graduated_start_et": self.graduated_start_et.strftime("%H:%M"),
             "graduated_max_premium_pct": self.graduated_max_premium_pct,
             "expiry_et": self.expiry_et.strftime("%H:%M"),
@@ -167,11 +210,13 @@ class EntrySchedule:
 
 @dataclasses.dataclass(frozen=True)
 class IntradayQuote:
-    """What the watch reads for one name: the last trade and the session high."""
+    """What the watch reads for one name: the last trade, the session high and low, the VWAP."""
 
     last: float | None
     high: float | None
     market_data_type: int | None = None
+    low: float | None = None
+    vwap: float | None = None
 
 
 def _valid(value: object) -> float | None:
@@ -187,12 +232,14 @@ def entry_trigger(
     now: dt.datetime,
     schedule: EntrySchedule,
     params: EntryTimingParams,
+    support_level: float | None = None,
 ) -> str | None:
     """Why a waiting buy is released now, or ``None`` to keep waiting.
 
     v1's order and v1's arithmetic (`EntryTriggerEngine.should_enter`). Nothing is
-    released before the open or at/after the close; expiry needs no price, the
-    other two need a last price, and the pullback a high as well.
+    released before the open or at/after the close; expiry needs no price, every
+    other trigger needs a last price, and each its own input as well (the high,
+    the VWAP, the support level). A missing input only keeps its trigger quiet.
     """
     if now < schedule.opens_at or now >= schedule.closes_at:
         return None
@@ -202,6 +249,18 @@ def entry_trigger(
         pullback = (high - last) / high
         if pullback >= params.pullback_pct:
             return f"pullback {pullback:.2%} from high {high:.2f}"
+    vwap = _valid(quote.vwap)
+    if last is not None and vwap is not None:
+        discount = (vwap - last) / vwap
+        if discount >= params.vwap_discount_pct:
+            return f"vwap_discount {discount:.2%} below VWAP {vwap:.2f}"
+    support = _valid(support_level)
+    low = _valid(quote.low)
+    # v1: a day low under the support level means support broke; no bounce.
+    if last is not None and support is not None and (low is None or low >= support):
+        distance = (last - support) / support
+        if 0.0 <= distance <= params.support_pct:
+            return f"support_bounce {distance:.2%} above support {support:.2f}"
     if now >= schedule.expires_at:
         return "time_expiry"
     if now >= schedule.graduated_at and last is not None:
@@ -232,6 +291,7 @@ class WatchedEntry:
     quantity: int
     reference_price: float
     decided_at: dt.datetime
+    support_level: float | None = None
     status: EntryStatus = "waiting"
     trigger: str | None = None
     released_at: dt.datetime | None = None
@@ -239,19 +299,35 @@ class WatchedEntry:
     release_price: float | None = None
     last: float | None = None
     high: float | None = None
+    low: float | None = None
+    vwap: float | None = None
     market_data_type: int | None = None
 
     def observe(self, quote: IntradayQuote) -> IntradayQuote:
-        """Fold a quote in; the high is never lower than any last price seen."""
+        """Fold a quote in: the high never below, the low never above, any last price seen.
+
+        The VWAP is the stream's latest; a poll without one keeps the last seen.
+        """
         last = _valid(quote.last)
         if last is not None:
             self.last = last
         for value in (_valid(quote.high), last):
             if value is not None:
                 self.high = value if self.high is None else max(self.high, value)
+        for value in (_valid(quote.low), last):
+            if value is not None:
+                self.low = value if self.low is None else min(self.low, value)
+        vwap = _valid(quote.vwap)
+        if vwap is not None:
+            self.vwap = vwap
         if quote.market_data_type is not None:
             self.market_data_type = quote.market_data_type
-        return IntradayQuote(last=self.last if last is not None else None, high=self.high)
+        return IntradayQuote(
+            last=self.last if last is not None else None,
+            high=self.high,
+            low=self.low,
+            vwap=self.vwap,
+        )
 
     def document(self) -> dict[str, object]:
         return {
@@ -268,6 +344,9 @@ class WatchedEntry:
             "release_price": self.release_price,
             "last": self.last,
             "high": self.high,
+            "low": self.low,
+            "vwap": self.vwap,
+            "support_level": self.support_level,
             "market_data_type": self.market_data_type,
         }
 
@@ -349,6 +428,9 @@ class IbIntradayQuotes:
 
     One `reqMktData` subscription per name, opened once and read on every poll:
     the client's ``sleep`` between polls is what lets the SDK apply the ticks.
+    Generic tick :data:`VWAP_GENERIC_TICKS` (RTVolume) is requested so the
+    ticker carries the session VWAP; a name whose stream never carries one only
+    loses the VWAP trigger.
     """
 
     def __init__(self, client: Any, sdk: Any) -> None:  # pyright: ignore[reportExplicitAny]  # untyped SDK objects
@@ -368,7 +450,9 @@ class IbIntradayQuotes:
                 print(f"entry_timing: {symbol} did not qualify; no quote", file=sys.stderr)
                 continue
             self._contracts.append(contract)
-            self._tickers[symbol] = self._client.reqMktData(contract, "", False, False)
+            self._tickers[symbol] = self._client.reqMktData(
+                contract, VWAP_GENERIC_TICKS, False, False
+            )
 
     def __call__(self, symbol: str) -> IntradayQuote:
         ticker = self._tickers.get(symbol)
@@ -379,6 +463,8 @@ class IbIntradayQuotes:
             last=_valid(getattr(ticker, "last", None)),
             high=_valid(getattr(ticker, "high", None)),
             market_data_type=kind if isinstance(kind, int) else None,
+            low=_valid(getattr(ticker, "low", None)),
+            vwap=_valid(getattr(ticker, "vwap", None)),
         )
 
     def close(self) -> None:
@@ -388,3 +474,59 @@ class IbIntradayQuotes:
                 self._client.cancelMktData(contract)
             except Exception:  # noqa: BLE001 - teardown never blocks the session's end
                 log.exception("cancelMktData failed during teardown")
+
+
+def panel_support_levels(
+    store: Store, trading_day: str, symbols: Sequence[str], *, lookback_days: int
+) -> dict[str, float]:
+    """Each name's support level: the lowest ``low_raw`` of its last ``lookback_days`` sessions.
+
+    Read from the price panel compiled for ``trading_day`` (the book's decision
+    day), whose rows run up to and including that day -- the history v1's
+    ``_compute_support_level`` took the low of. A name with fewer than
+    ``lookback_days`` rows, or no positive low among them, has no support level
+    (v1 likewise). Never raises: a panel that cannot be read leaves every name
+    without one, logged, and the support trigger then simply never fires.
+    """
+    wanted = set(symbols)
+    if not wanted:
+        return {}
+    key = data_panel_key(trading_day)
+    try:
+        import pandas as pd  # noqa: PLC0415  # pyright: ignore[reportMissingTypeStubs]  # no pandas-stubs in the lock; only when a buy is watched
+
+        frame = pd.read_parquet(  # pyright: ignore[reportUnknownMemberType]  # pandas ships no complete stubs here
+            io.BytesIO(store.get_bytes(key)), columns=["trading_day", "ticker", "low_raw"]
+        )
+        records = cast(
+            "list[dict[str, object]]",
+            frame.to_dict(orient="records"),  # pyright: ignore[reportUnknownMemberType]  # pandas ships no complete stubs here
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing input silences one trigger, never the session
+        log.warning("support levels unavailable from %s: %r", key, exc)
+        print(
+            f"entry_timing: no support levels ({key}: {type(exc).__name__}: {exc}); "
+            "the support-bounce trigger will not fire today",
+            file=sys.stderr,
+        )
+        return {}
+    history: dict[str, list[tuple[str, object]]] = {}
+    for row in records:
+        ticker, day = str(row["ticker"]), str(row["trading_day"])[:10]
+        if ticker in wanted and day <= trading_day:
+            history.setdefault(ticker, []).append((day, row["low_raw"]))
+    levels: dict[str, float] = {}
+    for ticker, rows in history.items():
+        if len(rows) < lookback_days:
+            continue
+        lows = [v for _, low in sorted(rows)[-lookback_days:] if (v := _valid(low)) is not None]
+        if lows:
+            levels[ticker] = min(lows)
+    missing = sorted(wanted - set(levels))
+    if missing:
+        print(
+            f"entry_timing: no {lookback_days}-session support level for {', '.join(missing)}; "
+            "the support-bounce trigger will not fire for them",
+            file=sys.stderr,
+        )
+    return levels
