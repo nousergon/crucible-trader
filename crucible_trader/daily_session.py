@@ -96,6 +96,7 @@ from crucible_trader.contract import (
     record_session,
     resolve,
 )
+from crucible_trader.hard_risk import BrokerFacts
 from crucible_trader.kill_switch import (
     BrokerControl,
     IbBrokerControl,
@@ -203,6 +204,17 @@ def _held_into_session(store: Store, router: object) -> dict[str, float] | None:
     return held(float(params.book_notional_usd))
 
 
+def _hard_risk_facts(router: object) -> BrokerFacts | None:
+    """The broker's facts for the hard-risk layer, or None for a router with no broker.
+
+    A live router reads average cost, marks and NAV from the account
+    (`order_router.PaperOrderRouter.hard_risk_facts`); a shadow or staging
+    simulated router has no account, so the layer stays off for that session.
+    """
+    read: Callable[[], BrokerFacts] | None = getattr(router, "hard_risk_facts", None)
+    return None if read is None else read()
+
+
 def daily_session_cycle(
     ctx: RunContext,
     *,
@@ -244,6 +256,7 @@ def daily_session_cycle(
             clock=clock,
             contract_resolver=capture,
             construct=construct or construct_target_book,
+            hard_risk_facts=_hard_risk_facts(router),
         )
     except ContractUnavailable as exc:
         # Failure mode swallowed: the harness has not published a champion,

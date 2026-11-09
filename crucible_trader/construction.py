@@ -98,6 +98,7 @@ from crucible.slots.strategy import (
 from crucible.store import Store
 
 from crucible_trader.contract import ContractRefusal, ContractUnavailable, read_slot_champion
+from crucible_trader.hard_risk import HardRiskDecision, HardRiskInputs, decide
 
 __all__ = [
     "STRATEGY_SLOT",
@@ -142,6 +143,10 @@ class TargetBook:
     #: (:func:`session_turnover_budget`). ``None`` when the parameter set
     #: disables the budget, or from a test double (`alpha-engine-config-I13305`).
     turnover_budget: float | None = None
+    #: This session's hard-risk outcome (`crucible_trader.hard_risk`): the names
+    #: forced out and locked out, and the drawdown rung. ``None`` when the
+    #: session had no broker to evaluate it on.
+    hard_risk: HardRiskDecision | None = None
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -362,8 +367,14 @@ def construct_target_book(
     previous_weights: Mapping[str, float] | None,
     now: dt.datetime,
     feature_version: str | None = None,
+    hard_risk: HardRiskInputs | None = None,
 ) -> TargetBook:
     """Construct the book for ``trading_day`` through `construct_book`, or refuse.
+
+    ``hard_risk`` (the broker's facts and the carried state) applies the
+    hard-risk layer: :func:`crucible_trader.hard_risk.decide` over the
+    session's own alpha, its forced names handed to the engine as
+    `SessionInputs.hard_exit` and its drawdown rung as `buy_multiplier`.
 
     ``previous_weights`` is the book held into the session by ticker (None at
     inception: all cash). Raises :class:`ContractUnavailable` when a half the
@@ -401,11 +412,30 @@ def construct_target_book(
         store, session, trading_day=trading_day, m_champion=m_pointer.arm_id, u_champion=u_champion
     )
 
+    sessions = inputs.sessions
+    decision: HardRiskDecision | None = None
+    if hard_risk is not None:
+        (raw,) = sessions
+        tickers = inputs.universe.tickers
+        decision = decide(
+            params,
+            hard_risk,
+            trading_day=trading_day,
+            alpha={t: float(a) for t, a in zip(tickers, raw.alpha_hat, strict=True)},
+        )
+        sentinels = {inputs.universe.benchmark_idx, inputs.universe.cash_idx}
+        hard_exit = np.array(
+            [i not in sentinels and t in decision.forced for i, t in enumerate(tickers)],
+            dtype=bool,
+        )
+        sessions = [
+            dataclasses.replace(raw, hard_exit=hard_exit, buy_multiplier=decision.buy_multiplier)
+        ]
     constructed = construct_book(
         recipe=arm.recipe,
         params=params,
         universe=inputs.universe,
-        sessions=inputs.sessions,
+        sessions=sessions,
         portfolio_notional=params.book_notional_usd,
         w_initial=_previous_weights(inputs.universe, previous_weights, trading_day=trading_day),
     )
@@ -439,4 +469,5 @@ def construct_target_book(
             t: bool(e)
             for t, e in zip(inputs.universe.tickers, inputs.sessions[0].eligibility, strict=True)
         },
+        hard_risk=decision,
     )

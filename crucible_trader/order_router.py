@@ -93,6 +93,7 @@ from crucible_trader.execution_shortfall import (
     build_shortfall_document,
     decide,
 )
+from crucible_trader.hard_risk import BrokerFacts, read_broker_facts
 from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
 from crucible_trader.order_intent import (
@@ -885,6 +886,10 @@ class PaperOrderRouter:
 
     def close(self) -> None:
         self._client.disconnect()
+
+    def hard_risk_facts(self) -> BrokerFacts:
+        """Average cost, mark and NAV for the hard-risk layer (`hard_risk.read_broker_facts`)."""
+        return read_broker_facts(self._client, trading_day=self._day, quote=self._quote)
 
 
 def open_paper_router(
