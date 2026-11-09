@@ -258,6 +258,40 @@ class TestARoutedSession:
         assert not store.exists(execution_shortfall_key(DAY.isoformat()))
 
 
+class WatchingRouter(LiveRouter):
+    """A routed router that held buys for their triggers (`entry_timing`)."""
+
+    def entry_watch_payload(self, now):
+        return "trader/entry_watch/2026-09-11.json", b'{"state": "complete"}'
+
+
+class TestTheEntryWatchIsOnTheRecord:
+    def test_a_served_session_records_the_final_watch(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        ctx, _, _ = _cycle(store, WatchingRouter())
+        assert "trader/entry_watch/2026-09-11.json" in {o["key"] for o in ctx.outputs}
+
+    def test_a_watch_that_cannot_be_recorded_never_fails_the_session(self, store, capsys) -> None:
+        ctx = SimpleNamespace(record_output=lambda *a: (_ for _ in ()).throw(PermissionError("no")))
+        module._record_entry_watch(ctx, WatchingRouter(), clock=lambda: NOW)
+        assert "not recorded (PermissionError" in capsys.readouterr().err
+
+    def test_a_router_that_held_nothing_records_nothing(self, store) -> None:
+        ctx = ctx_for(store, SESSION_JOB, day=DAY)
+        module._record_entry_watch(ctx, LiveRouter(), clock=lambda: NOW)
+        router = WatchingRouter()
+        router.entry_watch_payload = lambda now: None
+        module._record_entry_watch(ctx, router, clock=lambda: NOW)
+        assert ctx.outputs == []
+
+    def test_a_failure_after_orders_records_the_watch_too(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        router = WatchingRouter(fail=RuntimeError("gateway dropped"))
+        with pytest.raises(RuntimeError, match="gateway dropped"):
+            _cycle(store, router)
+        assert store.exists("trader/entry_watch/2026-09-11.json")
+
+
 class TestTheHoldControlIsReadOnly:
     def test_it_refuses_to_cancel_or_close(self) -> None:
         ib = FakeIB()
@@ -739,6 +773,15 @@ class TestALiveSessionSizesOnNavAndProtectsItsHoldings:
         _serveable(store, trading_day=DAY.isoformat())
         _, result, _ = _cycle(store, LiveRouter())
         assert result["sizing"] is None and result["protective_stops"] is None
+        assert result["protective_stops_in_session"] == []
+
+    def test_the_stops_the_all_day_session_placed_are_on_the_record(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        router = SizingRouter({"PLTR": 0.25, "__CASH__": 0.75}, nav=850_000.0)
+        event = {"moment": "after the timed buy of PLTR", "symbol": "PLTR"}
+        router.protective_stop_events = (event,)
+        _, result, _ = _cycle(store, router)
+        assert result["protective_stops_in_session"] == [event]
 
     def test_an_unreadable_nav_fails_the_session_before_anything_is_built(self, store) -> None:
         from crucible_trader.order_router import NavUnavailableError

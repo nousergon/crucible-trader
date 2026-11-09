@@ -61,6 +61,13 @@ calls that could change the book -- `cancel_all`, `submit_close` -- are
 refused, so no session can cancel the v1 executor's stops on the shared paper
 account.
 
+**A routed session lasts the trading day** (Brian 2026-11-09,
+`crucible_trader.entry_timing`). Its sells go out at the 09:35 start; its buys
+wait for v1's entry triggers and the last goes out by 15:55 ET (earlier on a half
+day), so the run -- and its one manifest, evidence entry and shortfall document
+-- ends after that rather than two minutes after the start. The final watch
+document is recorded as an output of the run, failed or not.
+
 **The book held into the session is the account's positions** when routing
 is live (``_held_into_session``), valued as weights of the book notional, so
 the engine's turnover budget binds against what is actually held. Until
@@ -76,6 +83,13 @@ start -- an unreadable NAV refuses the session -- and the sizing is filed in
 the run's returned document and on the order book. After the session's
 orders the router re-asserts one GTC protective stop per held name; a name
 it cannot protect fails the run, after the orders are on the record.
+
+**Under the all-day session the stops do not wait for the end.** The router
+protects the names held at the start once the opening sells have settled,
+and each timed buy as soon as its batch returns (`order_router`), so a run
+that fails at 13:00 leaves every name it holds by then protected. The
+end-of-session re-assertion here is the backstop: it keeps what already
+stands, places what the day could not, and is the step that fails the run.
 """
 
 from __future__ import annotations
@@ -84,6 +98,8 @@ import argparse
 import datetime as dt
 import functools
 import json
+import logging
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -110,6 +126,7 @@ from crucible_trader.contract import (
     record_session,
     resolve,
 )
+from crucible_trader.entry_timing import ENTRY_WATCH_SCHEMA_VERSION
 from crucible_trader.kill_switch import (
     BrokerControl,
     IbBrokerControl,
@@ -148,6 +165,8 @@ SESSION_JOB = "trader.session"
 METRIC_MODULE = "crucible_trader.daily_session"
 
 NYSE_ZONE = ZoneInfo("America/New_York")
+
+log = logging.getLogger(__name__)
 
 #: The router surface this module relies on beyond `session.OrderRouter`.
 RouterFactory = Callable[..., Any]
@@ -195,6 +214,32 @@ def _file_shortfall(
         EXECUTION_SHORTFALL_SCHEMA_VERSION,
     )
     return document
+
+
+def _record_entry_watch(
+    ctx: RunContext, router: object, *, clock: Callable[[], dt.datetime]
+) -> None:
+    """Record the router's final entry-watch document on the run. Never raises.
+
+    The router has already written it to the store as the day went; this makes
+    the final state an output of the manifest. A failed write must not fail a
+    session whose orders are already at the broker.
+    """
+    payload: Callable[[dt.datetime], tuple[str, bytes] | None] | None = getattr(
+        router, "entry_watch_payload", None
+    )
+    found = None if payload is None else payload(clock())
+    if found is None:
+        return
+    key, body = found
+    try:
+        ctx.record_output(key, body, ENTRY_WATCH_SCHEMA_VERSION)
+    except Exception as exc:  # noqa: BLE001 - a missing record must never fail the orders
+        log.exception("entry watch output not recorded")
+        print(
+            f"daily_session: entry watch {key} not recorded ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
 
 
 def _held_into_session(
@@ -297,6 +342,7 @@ def daily_session_cycle(
         # record. A shadow router holds no records and files nothing here.
         if resolved and router.records:
             _file_shortfall(ctx, router, champion=resolved[0].arm_id, clock=clock)
+        _record_entry_watch(ctx, router, clock=clock)
         raise
 
     # A halted day is not a served day. `session_cycle` checks the switch only
@@ -316,6 +362,7 @@ def daily_session_cycle(
         environ=environ,
     )
     shortfall = _file_shortfall(ctx, router, champion=contract.arm_id, clock=clock)
+    _record_entry_watch(ctx, router, clock=clock)
     _record_turnover(ctx, result)
     shadow_days = len(evidence.shadow_days())
     ctx.record_metric(
@@ -336,6 +383,8 @@ def daily_session_cycle(
         "shortfall_outcome": shortfall["outcome"],
         "sizing": None if sizing is None else sizing.record(),
         "protective_stops": None if protective_stops is None else list(protective_stops),
+        # What the all-day session placed, resized or could not place as it went.
+        "protective_stops_in_session": list(getattr(router, "protective_stop_events", ())),
         "trading_days": evidence.trading_days,
         "shadow_days": shadow_days,
     }
