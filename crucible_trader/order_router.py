@@ -64,6 +64,26 @@ fill price the share-weighted mean of the executions; decision prices from
 (v1's fix for a cold data farm that nan'd a whole book), subscription released
 in a `finally`.
 
+**The book is sized on the account's live NAV** (2026-11-09 v1/v2 parity
+audit, row 5). :meth:`PaperOrderRouter.session_sizing` reads the broker's
+``NetLiquidation`` once at session start (:func:`read_net_liquidation`) and the
+book is constructed on ``min(book_notional_usd, NAV)``: the declared notional
+is the ceiling. An unreadable NAV refuses the session, and :meth:`batches`
+refuses a book sized past the NAV it read, so a session can never size past
+the money the account has. This read is for SIZING only; the ledger and the
+reconciler still never read ``NetLiquidation`` (`broker_statement.CASH_TAG`).
+
+**Every held long carries a standing GTC protective stop** (parity audit row
+1). After the session's orders, :meth:`PaperOrderRouter.protect_holdings`
+re-asserts exactly one ``STP`` SELL, ``tif="GTC"``, per held name at
+:attr:`RouterConfig.stop_distance_pct` (default 20%, v1's bracket distance)
+below the session's reference price. A stop already standing for today at the
+right size is kept, so a rerun places nothing; a stale one (another day, or a
+size the holdings no longer match) is cancelled -- confirmed -- before its
+replacement goes. The size is the shares held LESS every other working sell
+on the name, so stops never exceed the holding. Before a session SELL the
+name's own stops are cancelled, so a sell and a stop can never both fill.
+
 **Declared scope:** an order still working when the fill wait ends is left
 working (a DAY order), and its record carries the broker status and what filled
 so far. An adopted order's `submitted_at` is its decision instant, because the
@@ -85,7 +105,7 @@ from crucible.store import Store
 
 from crucible_trader.broker_session import GatewayAddress, connect, load_sdk
 from crucible_trader.broker_statement import PAPER_ACCOUNT_PREFIX, IbPaperStatementSource
-from crucible_trader.construction import TargetBook
+from crucible_trader.construction import SessionSizing, TargetBook
 from crucible_trader.execution_shortfall import (
     Fill,
     SizingDecision,
@@ -103,9 +123,12 @@ from crucible_trader.order_intent import (
 )
 
 __all__ = [
+    "DEFAULT_STOP_DISTANCE_PCT",
     "ExecutionRecord",
+    "NavUnavailableError",
     "PaperOrderRouter",
     "PlannedOrder",
+    "ProtectiveStopError",
     "RouterConfig",
     "ShadowRouter",
     "StagingRoutingRefusedError",
@@ -116,6 +139,8 @@ __all__ = [
     "is_staging",
     "open_paper_router",
     "plan_orders",
+    "read_net_liquidation",
+    "stop_price_for",
 ]
 
 #: The one switch. Unset or ``off``: shadow, nothing is sent.
@@ -138,6 +163,18 @@ MAX_SESSION_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD"
 PAPER_GATEWAY_PORT = 4002
 
 ORDER_REF_PREFIX = "crucible-trader"
+#: Every protective stop's `orderRef` starts with this. It is NOT
+#: ``ORDER_REF_PREFIX + "|"``, so the session orders' readers (adoption here,
+#: the intent reconciliation) never take a stop for a session order.
+STOP_REF_PREFIX = "crucible-trader-stop"
+
+#: How far below the reference price the standing stop sits: v1's bracket STP
+#: (`catastrophic_gap_stop_pct` 0.15 + `bracket_backstop_extra_pct` 0.05).
+DEFAULT_STOP_DISTANCE_PCT = 0.20
+STOP_DISTANCE_VAR = "CRUCIBLE_TRADER_STOP_DISTANCE_PCT"
+
+#: The account-summary tag the SIZING reads. Read only here, never by the ledger.
+NAV_TAG = "NetLiquidation"
 _REF_SEP = "|"
 _STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -193,6 +230,14 @@ class OrderRefError(RoutingRefusedError):
 
 class StagingRoutingRefusedError(RoutingRefusedError):
     """The routing switch is present in staging. Staging never routes."""
+
+
+class NavUnavailableError(RoutingRefusedError):
+    """The broker's NetLiquidation could not be read. A live session never sizes blind."""
+
+
+class ProtectiveStopError(RoutingRefusedError):
+    """A held name could not be given its protective stop. Page; the name is unprotected."""
 
 
 class UnknownOrderStateError(RoutingRefusedError):
@@ -263,6 +308,7 @@ class RouterConfig:
     address: GatewayAddress | None = None
     max_order_notional_usd: float | None = None
     max_session_notional_usd: float | None = None
+    stop_distance_pct: float = DEFAULT_STOP_DISTANCE_PCT
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -274,6 +320,10 @@ class RouterConfig:
             value = getattr(self, name)
             if value is None or not (math.isfinite(value) and value > 0):
                 raise RouterSettingsError(f"routing is enabled with {name}={value!r}")
+        if not (math.isfinite(self.stop_distance_pct) and 0 < self.stop_distance_pct < 1):
+            raise RouterSettingsError(
+                f"stop_distance_pct={self.stop_distance_pct!r} must be a fraction in (0, 1)"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> RouterConfig:
@@ -298,7 +348,54 @@ class RouterConfig:
             address=GatewayAddress.from_env(dict(source)),
             max_order_notional_usd=_positive_float(source, MAX_ORDER_NOTIONAL_VAR),
             max_session_notional_usd=_positive_float(source, MAX_SESSION_NOTIONAL_VAR),
+            stop_distance_pct=(
+                _positive_float(source, STOP_DISTANCE_VAR)
+                if (source.get(STOP_DISTANCE_VAR) or "").strip()
+                else DEFAULT_STOP_DISTANCE_PCT
+            ),
         )
+
+
+def read_net_liquidation(client: Any, account: str) -> float:  # pyright: ignore[reportExplicitAny]  # an ib_async IB
+    """The account's ``NetLiquidation`` in USD, for SIZING the session's book.
+
+    Exactly one finite, positive USD row for ``account``, or
+    :class:`NavUnavailableError`: a NAV that cannot be read is not the
+    declared notional, and a live session refuses rather than size on a guess.
+    """
+    rows = [
+        item
+        for item in client.accountSummary()
+        if item.account == account and item.tag == NAV_TAG and item.currency == "USD"
+    ]
+    if len(rows) != 1:
+        raise NavUnavailableError(
+            f"expected exactly one USD {NAV_TAG} row for {account}, found {len(rows)}; the "
+            "session is not sized on the declared notional in its place"
+        )
+    try:
+        value = float(rows[0].value)
+    except (TypeError, ValueError) as exc:
+        raise NavUnavailableError(f"{NAV_TAG} {rows[0].value!r} is not a number") from exc
+    if not (math.isfinite(value) and value > 0):
+        raise NavUnavailableError(f"{NAV_TAG} {value!r} is not a positive, finite amount")
+    return value
+
+
+def stop_price_for(reference: float, distance: float) -> float:
+    """The stop price ``distance`` below ``reference``, floored to the cent."""
+    price = math.floor(reference * (1.0 - distance) * 100.0) / 100.0
+    if not price > 0:
+        raise PriceUnavailableError(
+            f"a stop {distance:.0%} below {reference!r} rounds to {price!r}; no stop is placed "
+            "at a price that is not positive"
+        )
+    return price
+
+
+def stop_ref(trading_day: str, symbol: str, quantity: int, stop_price: float) -> str:
+    """A protective stop's `orderRef`: the day it was asserted, its size and price."""
+    return _REF_SEP.join((STOP_REF_PREFIX, trading_day, symbol, str(quantity), f"{stop_price:.2f}"))
 
 
 def order_key(trading_day: str, symbol: str) -> str:
@@ -711,15 +808,36 @@ class PaperOrderRouter:
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
+        self._nav: float | None = None
+        #: The names this session may protect: the book's, inherited and owned.
+        self._managed: frozenset[str] = frozenset()
 
     @property
     def records(self) -> tuple[ExecutionRecord, ...]:
         return tuple(self._records)
 
+    def _net_liquidation(self) -> float:
+        """The account's NAV, read once per session (`read_net_liquidation`)."""
+        if self._nav is None:
+            self._nav = read_net_liquidation(self._client, self._config.account)  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
+        return self._nav
+
+    def session_sizing(self, ceiling_usd: float) -> SessionSizing:
+        """The live sizing: ``min(ceiling_usd, NetLiquidation)``. Raises when unreadable."""
+        return SessionSizing(ceiling_usd=ceiling_usd, nav_usd=self._net_liquidation())
+
     def batches(self, book: TargetBook) -> Iterable[Sequence[Any]]:
         if book.trading_day != self._day:
             raise RoutingRefusedError(
                 f"the book is for {book.trading_day}; this router was opened for {self._day}"
+            )
+        # The chokepoint for live sizing: whatever built the book, it is never
+        # sized past the money the account holds (parity audit row 5).
+        nav = self._net_liquidation()
+        if book.portfolio_notional_usd > nav * (1 + _GROSS_TOLERANCE):
+            raise RiskCapExceededError(
+                f"the book is sized on ${book.portfolio_notional_usd:,.2f}, over the account's "
+                f"{NAV_TAG} ${nav:,.2f}: a live book is sized on min(declared notional, NAV)"
             )
         statement = IbPaperStatementSource(self._client).read_statement(self._day)
         inherited = inherited_for(self._day)
@@ -743,6 +861,7 @@ class PaperOrderRouter:
             owned=owned,
         )
         self._planned = sells + buys
+        self._managed = frozenset(_tradable(book)) | inherited | owned
         # Sells first, so their proceeds are cash before the buys go out.
         return [batch for batch in (sells, buys) if batch]
 
@@ -781,6 +900,9 @@ class PaperOrderRouter:
                     prior = parse_order_ref(known[order.key])
                     self._records.append(self._record(prior, "adopted", "Adopted", None))
                     continue
+                if order.action == "SELL":
+                    # A sell and a standing stop must never both fill.
+                    self._cancel_stops(order.decision.symbol, self._open_stops())
                 try:
                     trade = self._place(order)
                 except OrderIntentConflictError as conflict:
@@ -833,6 +955,134 @@ class PaperOrderRouter:
         ib_order.outsideRth = False
         ib_order.transmit = True
         return self._client.placeOrder(contract, ib_order)
+
+    def _open_stops(self) -> dict[str, list[Any]]:  # pyright: ignore[reportExplicitAny]  # ib_async Trades
+        """This router's working protective stops, by symbol."""
+        stops: dict[str, list[Any]] = {}  # pyright: ignore[reportExplicitAny]  # ib_async Trades
+        for trade in self._client.reqAllOpenOrders():
+            ref = trade.order.orderRef or ""
+            if ref.startswith(STOP_REF_PREFIX + _REF_SEP) and (
+                trade.orderStatus.status not in TERMINAL_STATUSES
+            ):
+                stops.setdefault(trade.contract.symbol, []).append(trade)
+        return stops
+
+    def _cancel_stops(self, symbol: str, stops: Mapping[str, list[Any]]) -> list[str]:  # pyright: ignore[reportExplicitAny]
+        """Cancel ``symbol``'s stops and wait until the broker confirms it. Raises if not."""
+        trades = stops.get(symbol, [])
+        for trade in trades:
+            self._client.cancelOrder(trade.order)
+        waited = 0.0
+        while any(t.orderStatus.status not in TERMINAL_STATUSES for t in trades):
+            if waited >= self._fill_timeout_s:
+                raise ProtectiveStopError(
+                    f"{symbol}: a stale protective stop was not confirmed cancelled within "
+                    f"{self._fill_timeout_s:g}s; no further order on it is sent, so the stops "
+                    "can never exceed the shares held"
+                )
+            self._client.sleep(POLL_INTERVAL_S)
+            waited += POLL_INTERVAL_S
+        return [t.order.orderRef for t in trades]
+
+    def protect_holdings(self) -> tuple[dict[str, object], ...]:
+        """Re-assert one GTC STP SELL per held name, after the session's orders.
+
+        Sized to the shares held less every other working sell on the name, at
+        :attr:`RouterConfig.stop_distance_pct` below the session's reference
+        price (:attr:`_quote`). A stop already standing for today at that size
+        is kept; any other stop of this router's on the name is cancelled --
+        confirmed -- first. A stop on a name no longer held is cancelled. The
+        kill switch is re-read before every stop. Every name is attempted; any
+        that could not be protected raise :class:`ProtectiveStopError` at the end.
+        """
+        assert_trading_permitted(self._store, self._day)
+        positions = IbPaperStatementSource(self._client).read_statement(self._day).positions
+        stops = self._open_stops()
+        other_sells: dict[str, float] = {}
+        for trade in self._client.reqAllOpenOrders():
+            ref = trade.order.orderRef or ""
+            if (
+                trade.order.action == "SELL"
+                and not ref.startswith(STOP_REF_PREFIX + _REF_SEP)
+                and trade.orderStatus.status not in TERMINAL_STATUSES
+            ):
+                remaining = float(trade.order.totalQuantity) - float(trade.orderStatus.filled)
+                symbol = trade.contract.symbol
+                other_sells[symbol] = other_sells.get(symbol, 0.0) + max(0.0, remaining)
+        held_names = {s for s, q in positions.items() if q > 0 and s in self._managed}
+        results: list[dict[str, object]] = []
+        failures: list[str] = []
+        for symbol in sorted(held_names | set(stops)):
+            quantity = 0
+            if symbol in held_names:
+                quantity = max(0, math.floor(positions[symbol] - other_sells.get(symbol, 0.0)))
+            existing = stops.get(symbol, [])
+            keep_prefix = _REF_SEP.join((STOP_REF_PREFIX, self._day, symbol, str(quantity))) + (
+                _REF_SEP
+            )
+            if (
+                quantity > 0
+                and len(existing) == 1
+                and existing[0].order.orderRef.startswith(keep_prefix)
+            ):
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "disposition": "kept",
+                        "order_ref": existing[0].order.orderRef,
+                    }
+                )
+                continue
+            try:
+                results.append(self._reassert_stop(symbol, quantity, stops))
+            except RoutingRefusedError as exc:
+                failures.append(f"{symbol}: {exc}")
+        if failures:
+            raise ProtectiveStopError(
+                f"{len(failures)} held name(s) are without a protective stop: "
+                + "; ".join(failures)
+            )
+        return tuple(results)
+
+    def _reassert_stop(
+        self,
+        symbol: str,
+        quantity: int,
+        stops: Mapping[str, list[Any]],  # pyright: ignore[reportExplicitAny]
+    ) -> dict[str, object]:
+        """Cancel ``symbol``'s stale stops, then place one for ``quantity`` (none at 0)."""
+        cancelled = self._cancel_stops(symbol, stops)
+        if quantity == 0:
+            return {"symbol": symbol, "disposition": "cancelled", "cancelled": cancelled}
+        reference = self._quote(symbol)
+        if reference is None or not (math.isfinite(reference) and reference > 0):
+            raise PriceUnavailableError(f"no reference price for {symbol} ({reference!r})")
+        price = stop_price_for(reference, self._config.stop_distance_pct)
+        ref = stop_ref(self._day, symbol, quantity, price)
+        # The kill switch, re-read before every stop as before every order.
+        assert_trading_permitted(self._store, self._day)
+        self._place_stop(symbol, quantity, price, ref)
+        return {
+            "symbol": symbol,
+            "disposition": "placed",
+            "order_ref": ref,
+            "quantity": quantity,
+            "stop_price": price,
+            "reference_price": reference,
+            "cancelled": cancelled,
+        }
+
+    def _place_stop(self, symbol: str, quantity: int, stop_price: float, ref: str) -> None:
+        contract = self._sdk.Stock(symbol, "SMART", "USD")
+        if not _qualified(self._client, contract):
+            raise RoutingRefusedError(f"IB could not qualify {symbol}")
+        ib_order = self._sdk.StopOrder("SELL", quantity, stop_price)
+        ib_order.orderRef = ref
+        ib_order.account = self._config.account
+        ib_order.tif = "GTC"
+        ib_order.outsideRth = False
+        ib_order.transmit = True
+        self._client.placeOrder(contract, ib_order)
 
     def _record_placed(self, placed: list[tuple[PlannedOrder, Any, dt.datetime]]) -> None:
         for order, trade, submitted_at in placed:

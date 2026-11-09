@@ -148,6 +148,9 @@ def order_book_document(
         "m_champion": book.m_champion,
         "u_champion": book.u_champion,
         "portfolio_notional_usd": book.portfolio_notional_usd,
+        # A live session's NAV-based sizing (broker NetLiquidation, capped at
+        # the declared notional); None when sized on the declared notional.
+        "sizing": None if book.sizing is None else book.sizing.record(),
         "turnover_one_way_ratio": book.turnover_one_way_ratio,
         "cost_bps": book.cost_bps,
         "session_inputs_key": book.session_inputs_key,

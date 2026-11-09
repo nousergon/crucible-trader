@@ -68,12 +68,21 @@ the engine's turnover budget binds against what is actually held. Until
 left this trader; it survived routing going live on 11-03, and the budget then
 measured each day against an empty book (97% one-way turnover on 11-03 and
 11-04). A shadow or simulated session still starts from all cash.
+
+**A live session is sized on the account's NAV and leaves every held long
+protected** (the 2026-11-09 v1/v2 trading-parity audit, rows 5 and 1). The
+book notional is ``min(book_notional_usd, NetLiquidation)`` read at session
+start -- an unreadable NAV refuses the session -- and the sizing is filed in
+the run's returned document and on the order book. After the session's
+orders the router re-asserts one GTC protective stop per held name; a name
+it cannot protect fails the run, after the orders are on the record.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -87,7 +96,12 @@ from crucible.runner import RunContext, run_job
 from crucible.store import Store
 
 from crucible_trader.broker_session import GatewayAddress, OrderRefusedError, connect, load_sdk
-from crucible_trader.construction import STRATEGY_SLOT, TargetBook, construct_target_book
+from crucible_trader.construction import (
+    STRATEGY_SLOT,
+    SessionSizing,
+    TargetBook,
+    construct_target_book,
+)
 from crucible_trader.contract import (
     EVIDENCE_SCHEMA_VERSION,
     ContractRefusal,
@@ -183,24 +197,33 @@ def _file_shortfall(
     return document
 
 
-def _held_into_session(store: Store, router: object) -> dict[str, float] | None:
-    """The book held into the session, or None (all cash) for a router with no book.
+def _held_into_session(
+    store: Store, router: object
+) -> tuple[dict[str, float] | None, SessionSizing | None]:
+    """The book held into the session (None: all cash) and the live sizing (None: declared).
 
-    A live router values the account's positions as weights of the S slot's book
-    notional (`order_router.held_weights`), so the engine's turnover budget and
-    cost model measure each day against the book actually held. The staging
-    simulated router answers the same way from its carried simulated book
-    (`alpha-engine-config-I13305`). A shadow router holds nothing of its own
-    and keeps the all-cash start.
+    A live router sizes the session on the account's NAV
+    (`order_router.PaperOrderRouter.session_sizing`: ``min(book_notional_usd,
+    NetLiquidation)``, refusing when the NAV is unreadable) and values the
+    account's positions as weights of that notional (`order_router.held_weights`),
+    so the engine's turnover budget and cost model measure each day against the
+    book actually held. The staging simulated router answers the held book from
+    its carried simulated book (`alpha-engine-config-I13305`) on the declared
+    notional. A shadow router holds nothing of its own and keeps the all-cash
+    start on the declared notional.
     """
     held: Callable[[float], dict[str, float]] | None = getattr(router, "held_weights", None)
-    if held is None:
-        return None
+    sizer: Callable[[float], SessionSizing] | None = getattr(router, "session_sizing", None)
+    if held is None and sizer is None:
+        return None, None
     try:
         params = load_portfolio_params_from_store(STRATEGY_SLOT, store=store)
     except PortfolioParamsError as exc:
         raise ContractRefusal(f"the S slot's portfolio parameter set is unusable: {exc}") from exc
-    return held(float(params.book_notional_usd))
+    ceiling = float(params.book_notional_usd)
+    sizing = None if sizer is None else sizer(ceiling)
+    notional = ceiling if sizing is None else sizing.notional_usd
+    return (None if held is None else held(notional)), sizing
 
 
 def daily_session_cycle(
@@ -228,6 +251,7 @@ def daily_session_cycle(
     else:
         mode = "live" if router.enabled else "shadow"
     resolved: list[ResolvedContract] = []
+    protective_stops: tuple[dict[str, object], ...] | None = None
 
     def capture(store: Store, trading_day: str) -> ResolvedContract:
         contract = contract_resolver(store, trading_day)
@@ -235,16 +259,28 @@ def daily_session_cycle(
         return contract
 
     try:
+        previous_weights, sizing = _held_into_session(ctx.store, router)
+        constructor = construct or construct_target_book
         result = session_cycle(
             ctx,
             broker=broker,
             router=router,
             installed_version=installed_version,
-            previous_weights=_held_into_session(ctx.store, router),
+            previous_weights=previous_weights,
             clock=clock,
             contract_resolver=capture,
-            construct=construct or construct_target_book,
+            construct=constructor
+            if sizing is None
+            else functools.partial(constructor, sizing=sizing),
         )
+        # After the session's orders: one standing GTC stop per held long
+        # (`PaperOrderRouter.protect_holdings`). A router without stops (shadow,
+        # simulated) has nothing to protect.
+        protect: Callable[[], tuple[dict[str, object], ...]] | None = getattr(
+            router, "protect_holdings", None
+        )
+        if protect is not None:
+            protective_stops = protect()
     except ContractUnavailable as exc:
         # Failure mode swallowed: the harness has not published a champion,
         # a feed or a construction input for this day. Why the deliverable
@@ -298,6 +334,8 @@ def daily_session_cycle(
         "session_mode": mode,
         "outcome": "served",
         "shortfall_outcome": shortfall["outcome"],
+        "sizing": None if sizing is None else sizing.record(),
+        "protective_stops": None if protective_stops is None else list(protective_stops),
         "trading_days": evidence.trading_days,
         "shadow_days": shadow_days,
     }
