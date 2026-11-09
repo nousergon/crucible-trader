@@ -124,6 +124,10 @@ class ReconciliationInputError(ValueError):
     """The inputs are not a reconciliation that can be run at all."""
 
 
+class DividendWaiverError(ReconciliationInputError):
+    """A declared dividend waiver does not match what is owed. Raised, never skipped."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Fill:
     """One execution the trader recorded. ``shares`` signed (+buy), ``cash_usd``
@@ -228,6 +232,36 @@ class OwedDividend:
 
 
 @dataclasses.dataclass(frozen=True)
+class DividendWaiver:
+    """An operator's ruling that one owed dividend will not be credited.
+
+    Declared by exact key AND amount (`dividend_entitlements.load_declared_waivers`).
+    A waived dividend leaves the owed list, so it neither absorbs a later credit
+    nor becomes a `corporate_action` finding past
+    :data:`OWED_DIVIDEND_MAX_DAYS`; it is recorded in the day's
+    ``dividends_waived`` instead, so nothing it removes is hidden. An amount
+    that differs from what is owed by even a cent is refused
+    (:class:`DividendWaiverError`): a waiver covers one known dividend, never
+    whatever happens to be owed under its key. A waiver whose key is not owed
+    today is inert and is not recorded.
+    """
+
+    ticker: str
+    pay_date: str
+    amount_usd: float
+    ruling: str
+    ruled_on: str
+    evidence: tuple[str, ...]
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.ticker, self.pay_date)
+
+    def to_document(self) -> dict[str, object]:
+        return {**dataclasses.asdict(self), "evidence": list(self.evidence)}
+
+
+@dataclasses.dataclass(frozen=True)
 class ReconciliationInputs:
     trading_day: str
     broker: BrokerStatement
@@ -248,8 +282,26 @@ class ReconciliationInputs:
     ledger_positions: Mapping[str, int] | None = None
     #: Where ``ledger_positions`` came from, or why it is absent.
     ledger_source: str = "unavailable: not supplied"
+    #: Owed dividends an operator ruled will not be credited (:class:`DividendWaiver`).
+    dividend_waivers: tuple[DividendWaiver, ...] = ()
 
     def __post_init__(self) -> None:
+        waivers: dict[tuple[str, str], DividendWaiver] = {}
+        for waiver in self.dividend_waivers:
+            if waiver.key in waivers:
+                raise DividendWaiverError(f"a second waiver for {waiver.key}")
+            waivers[waiver.key] = waiver
+        for owed in self.owed_dividends:
+            waiver = waivers.get(owed.key)
+            if waiver is not None and round(waiver.amount_usd * 100) != round(
+                owed.amount_usd * 100
+            ):
+                raise DividendWaiverError(
+                    f"the waiver for the {owed.ticker} dividend paid {owed.pay_date} "
+                    f"declares {waiver.amount_usd:.2f}, but {owed.amount_usd:.2f} is owed; "
+                    "a waiver covers exactly one known amount and is never stretched "
+                    "to fit"
+                )
         if self.broker.trading_day != self.trading_day:
             raise ReconciliationInputError(
                 f"broker statement is for {self.broker.trading_day}, not {self.trading_day}"
@@ -320,6 +372,9 @@ class ReconciliationResult:
     #: Written for traceability only: the carry itself re-reads each dividend's
     #: originating day (`dividend_entitlements.owed_dividends`), not this field.
     dividends_owed: tuple[OwedDividend, ...] = ()
+    #: Owed dividends an operator waived (:class:`DividendWaiver`): out of the
+    #: owed list and raising no finding, and written here so none is hidden.
+    dividends_waived: tuple[DividendWaiver, ...] = ()
     #: The three-way corporate-action check (Polygon, IB, ledger) for the day;
     #: ``None`` when there was no anchor to compare from.
     corporate_action_check: Mapping[str, Any] | None = None  # pyright: ignore[reportExplicitAny]
@@ -362,6 +417,7 @@ class ReconciliationResult:
             "dividend_credits": [d.to_document() for d in self.dividend_credits],
             "dividends_unpaid": [d.to_document() for d in self.dividends_unpaid],
             "dividends_owed": [d.to_document() for d in self.dividends_owed],
+            "dividends_waived": [d.to_document() for d in self.dividends_waived],
             "interest_posted_usd": self.interest_posted_usd,
             "corporate_action_check": (
                 None if self.corporate_action_check is None else dict(self.corporate_action_check)
@@ -374,6 +430,16 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
     :class:`Discrepancy` in the result; nothing is logged-and-skipped."""
     broker = dict(inputs.broker.positions)
     findings: list[Discrepancy] = []
+    waived_keys = {w.key for w in inputs.dividend_waivers}
+    waived = tuple(
+        w for w in inputs.dividend_waivers if w.key in {o.key for o in inputs.owed_dividends}
+    )
+    # From here a waived dividend is not owed: it absorbs no credit and is no
+    # finding. It is recorded in `dividends_waived` instead.
+    inputs = dataclasses.replace(
+        inputs,
+        owed_dividends=tuple(o for o in inputs.owed_dividends if o.key not in waived_keys),
+    )
 
     if inputs.anchor is None:
         if not inputs.genesis:
@@ -395,7 +461,13 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         # every declared owed dividend is still outstanding; dropping them here
         # lost them from the day's record (codex 621a3efb97c2c2e2).
         return _result(
-            inputs, broker, {}, None, findings, dividends_owed=tuple(inputs.owed_dividends)
+            inputs,
+            broker,
+            {},
+            None,
+            findings,
+            dividends_owed=tuple(inputs.owed_dividends),
+            dividends_waived=waived,
         )
 
     if (
@@ -675,6 +747,7 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         dividend_credits=credits,
         dividends_unpaid=tuple(unpaid_today),
         dividends_owed=tuple(o for o in inputs.owed_dividends if o.key not in credited),
+        dividends_waived=waived,
         corporate_action_check=check,
         interest_posted_usd=interest,
     )
@@ -693,6 +766,7 @@ def _result(
     dividend_credits: tuple[OwedDividend, ...] = (),
     dividends_unpaid: tuple[OwedDividend, ...] = (),
     dividends_owed: tuple[OwedDividend, ...] = (),
+    dividends_waived: tuple[DividendWaiver, ...] = (),
     corporate_action_check: Mapping[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
     interest_posted_usd: float | None = None,
 ) -> ReconciliationResult:
@@ -725,6 +799,7 @@ def _result(
         dividend_credits=dividend_credits,
         dividends_unpaid=dividends_unpaid,
         dividends_owed=dividends_owed,
+        dividends_waived=dividends_waived,
         corporate_action_check=corporate_action_check,
         interest_posted_usd=interest_posted_usd,
     )

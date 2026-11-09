@@ -21,6 +21,24 @@ reconciliation results, every dividend the broker had not applied on its pay
 date and has not credited since, plus every declared entitlement whose pay date
 has passed and was not credited. The reconciler matches a later credit against
 them (:class:`~crucible_trader.reconciliation.OwedDividend`).
+
+**Declared waivers** (`alpha-engine-config-I12024`). An owed dividend the
+broker will never credit would fail every reconcile from
+:data:`~crucible_trader.reconciliation.OWED_DIVIDEND_MAX_DAYS` until it ages
+out of :data:`OWED_LOOKBACK_DAYS`. Measured 2026-11-09: IB's paper account
+credited neither MU's 2026-10-29 dividend (11.85, 79 shares held at the
+2026-10-13 record session) nor SPY's 2026-10-30 one (18.89) -- broker cash
+agreed with fills and interest alone on every session from each pay date to
+2026-11-09. Each entry in :data:`DECLARED_WAIVERS_PATH` names one owed dividend
+by ticker, pay date and EXACT amount, with the ruling, its date and the
+evidence. A waiver takes the dividend out of the owed list and the reconciler
+records it as ``dividends_waived`` (:class:`~crucible_trader.reconciliation.DividendWaiver`);
+an amount off by a cent is refused, and a dividend nobody waived still fails.
+
+The ledger books nothing for a waiver: a dividend's receivable is booked on its
+pay date, and both waived pay dates precede the paper ledger's 2026-11-03
+opening, so there is no receivable to write off. A waiver for a dividend whose
+receivable IS on the ledger needs a write-off entry first.
 """
 
 from __future__ import annotations
@@ -32,9 +50,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
-from crucible_trader.reconciliation import OwedDividend
+from crucible_trader.reconciliation import DividendWaiver, OwedDividend
 
 DECLARED_ENTITLEMENTS_PATH = Path(__file__).parent / "declared_dividend_entitlements.json"
+DECLARED_WAIVERS_PATH = Path(__file__).parent / "declared_dividend_waivers.json"
 
 #: The first session whose stored result is read for owed dividends. Results
 #: before it predate the corporate-action source (every instrument was
@@ -96,6 +115,59 @@ def load_declared_entitlements(
             raise DeclaredEntitlementError(f"{where}: a second entitlement for {key}")
         declared[key] = entry
     return declared
+
+
+def load_declared_waivers(path: Path = DECLARED_WAIVERS_PATH) -> tuple[DividendWaiver, ...]:
+    """The declared dividend waivers. A malformed file is raised, never skipped."""
+    document = cast("object", json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(document, dict):
+        raise DeclaredEntitlementError(f"{path.name}: not a JSON object")
+    top = cast("dict[str, object]", document)
+    if top.get("schema_version") != 1:
+        raise DeclaredEntitlementError(f"{path.name}: not a schema_version 1 document")
+    entries = top.get("waivers")
+    if not isinstance(entries, list):
+        raise DeclaredEntitlementError(f"{path.name}: `waivers` is not a list")
+    waivers: list[DividendWaiver] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(cast("list[object]", entries)):
+        where = f"{path.name} waivers[{index}]"
+        if not isinstance(raw, dict):
+            raise DeclaredEntitlementError(f"{where}: not an object")
+        entry = cast("dict[str, object]", raw)
+        for field in ("ticker", "pay_date", "ruling", "ruled_on"):
+            value = entry.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise DeclaredEntitlementError(f"{where}: `{field}` must be a non-empty string")
+        amount = entry.get("amount_usd")
+        if isinstance(amount, bool) or not isinstance(amount, int | float) or amount <= 0:
+            raise DeclaredEntitlementError(f"{where}: `amount_usd` must be positive")
+        if abs(amount * 100 - round(amount * 100)) > 1e-6:
+            raise DeclaredEntitlementError(f"{where}: `amount_usd` must be whole cents")
+        evidence = entry.get("evidence")
+        if (
+            not isinstance(evidence, list)
+            or not evidence
+            or not all(isinstance(e, str) and e.strip() for e in cast("list[object]", evidence))
+        ):
+            raise DeclaredEntitlementError(
+                f"{where}: `evidence` must be a non-empty list of non-empty strings"
+            )
+        dt.date.fromisoformat(str(entry["pay_date"]))
+        dt.date.fromisoformat(str(entry["ruled_on"]))
+        waiver = DividendWaiver(
+            ticker=str(entry["ticker"]),
+            pay_date=str(entry["pay_date"]),
+            amount_usd=float(amount),
+            ruling=str(entry["ruling"]),
+            ruled_on=str(entry["ruled_on"]),
+            evidence=tuple(cast("list[str]", evidence)),
+        )
+        if waiver.key in seen:
+            raise DeclaredEntitlementError(f"{where}: a second waiver for {waiver.key}")
+        seen.add(waiver.key)
+        waivers.append(waiver)
+    return tuple(waivers)
 
 
 def declared_owed(entry: Mapping[str, object]) -> OwedDividend:

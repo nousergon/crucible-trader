@@ -236,6 +236,9 @@ class TestTheJobCarriesOwedDividends:
             fills=(),
             cash_flows=(),
             corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+            # The late-credit mechanics, without the shipped waivers of these
+            # very two dividends (`TestDeclaredWaivers` covers those).
+            dividend_waivers=(),
         )
         assert result.clean
         assert {c.ticker for c in result.dividend_credits} == {"MU", "SPY"}
@@ -251,6 +254,7 @@ class TestTheJobCarriesOwedDividends:
                 fills=(),
                 cash_flows=(),
                 corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+                dividend_waivers=(),
             )
 
 
