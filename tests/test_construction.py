@@ -109,6 +109,16 @@ class TestTheTraderAndTheGradeConstructOneBook:
         for field in ("engine", "cost_model", "params_digest", "arm_id", "sessions"):
             assert traded.evidence[field] == graded.evidence[field], field
 
+    def test_the_turnover_drivers_are_the_engines_own_diagnostics(self, world) -> None:
+        # v1 parity row 16: the churn alarm attributes from these, so they are
+        # copied from the construction, never recomputed or zero-filled.
+        world.record_session(world.arm_id)
+        traded = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+        assert traded.turnover_drivers is not None
+        assert set(traded.turnover_drivers) <= set(construction.TURNOVER_DRIVER_KEYS)
+        assert "turnover_mandatory_floor" in traded.turnover_drivers
+
     def test_same_book_from_a_held_position(self, world) -> None:
         world.record_session(world.arm_id)
         first = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
