@@ -7,12 +7,14 @@ EXIT a held name in full when its price is at least ``catastrophic_gap_stop_pct`
 recent close when the session was planned. It was the only intraday exit v1
 kept under the optimizer, and it fired whatever the book wanted.
 
-Here it runs on the session's opening sell batch (`order_router.PaperOrderRouter.
+Here it runs when the session plans its orders (`order_router.PaperOrderRouter.
 batches`, 09:35 ET): every held name is priced, and each one that breaches is
-planned as a full SELL in the opening batch and any BUY of it is dropped. So it
-goes out through the same kill-switch-checked path as every other sell, before
-any buy, and it overrides the book: a gap exit is hard risk, which outranks
-eligibility, the optimizer and timing.
+planned as a full SELL and any BUY of it is dropped. With timed orders (#150:
+sells wait for an intraday exit trigger) a gap exit does NOT wait: it is the
+session's first batch, sent at once; with immediate timing it leads the opening
+sells. So it goes out through the same kill-switch-checked path as every other
+sell, before any buy, and it overrides the book: a gap exit is hard risk, which
+outranks eligibility, the optimizer and timing.
 
 **The reference is the book day's close** from the price panel compiled for it
 (`simulated_broker.PanelCloseSource`) -- the close the session was planned on,
@@ -26,7 +28,7 @@ stop is the cohort v1 never kept (config#846). An exit carries the reason
 :data:`GAP_STOP_EXIT`, v1's own string, so the hard-risk layer's re-entry
 lockout can read it as one more hard-exit reason.
 
-**Declared scope.** It is evaluated once, on the opening batch. A name that
+**Declared scope.** It is evaluated once, when the session plans its orders. A name that
 crosses the threshold later in the day is not re-checked here; the broker-side
 stop is the intraday backstop.
 """

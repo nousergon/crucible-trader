@@ -64,25 +64,39 @@ fill price the share-weighted mean of the executions; decision prices from
 (v1's fix for a cold data farm that nan'd a whole book), subscription released
 in a `finally`.
 
-**Buys wait for their entry trigger** (`crucible_trader.entry_timing`, Brian
-2026-11-09). Sells go out at the session start; with
-:attr:`RouterConfig.entry_timing` set -- the default, v1's parameters -- the buys
-are held and released one poll at a time by v1's pullback / VWAP discount /
-support bounce / graduated / expiry triggers on streaming IB quotes, so the
-session runs until the last buy is released (at the latest v1's 15:55 ET
-expiry) or the market closes. Each released
-buy is its own batch, so `session_cycle` re-checks the kill switch before it and
-:meth:`PaperOrderRouter.send` before its order, exactly as for the open's batch;
-the watch also re-reads the switch on every poll. The idempotency key is
-unchanged -- one order per name per trading day -- and a buy this day's broker
-already knows is adopted at once rather than watched. :data:`ENTRY_TIMING_VAR`
-``immediate`` restores the old behaviour (every buy at the open).
+**Every order waits for its trigger** (`crucible_trader.entry_timing`; buys
+Brian 2026-11-09, sells Brian 2026-11-10). With :attr:`RouterConfig.entry_timing`
+set -- the default -- the buys are held for v1's pullback / VWAP discount /
+support bounce / graduated / expiry triggers and the sells for their mirror (a
+2% rally off the day's low, within 1% of the sized price from 15:30, and
+unconditionally at 15:55 ET), on streaming IB quotes, so the session runs until
+the last order is released or the market closes. No sell can be carried
+overnight: its expiry needs no price. Each released order is its own batch, so
+`session_cycle` re-checks the kill switch before it and
+:meth:`PaperOrderRouter.send` before its order; the watch also re-reads the
+switch on every poll. The idempotency key is unchanged -- one order per name per
+trading day -- and an order this day's broker already knows is adopted at once
+rather than watched. :data:`ENTRY_TIMING_VAR` ``immediate`` restores the old
+behaviour (every order at the open, sells first).
 
-**A held name that gapped down is sold whole in the opening batch**
+**A buy is never sized on cash a pending sell has not freed.** The plan is sized
+on the book's notional assuming every sell's proceeds, so once sells wait too, a
+buy could otherwise trigger at 10:00 against proceeds of a sell that goes at
+15:55. :class:`_CashLedger` holds what the timed buys may spend: the book's cash
+at the start (:func:`book_cash`) plus what this run's sells have actually FILLED,
+less what its buys have committed. Each poll judges and sends the sells first,
+then the buys against the refreshed ledger. A triggered buy the ledger cannot pay
+for in full keeps waiting while any sell is still waiting (one key per name per
+day means a short buy can never be topped up); with no sell left, or at the
+expiry -- when every sell has just gone first -- it is clipped to the cash.
+
+**A held name that gapped down is sold whole at the session start**
 (`crucible_trader.gap_stop`, v1's catastrophic gap stop): priced live, never from
 the close fallback, against the book day's close; at
 :attr:`RouterConfig.gap_stop_pct` (v1's 0.15) or more below it, the name's planned
-sell becomes a full exit and any buy of it is dropped.
+sell becomes a full exit and any buy of it is dropped. Hard risk outranks timing:
+with timed orders the gap exits are the session's first batch, sent at once and
+never held for an exit trigger; immediately, they lead the opening sells.
 
 **Declared scope:** an order still working when the fill wait ends is left
 working (a DAY order), and its record carries the broker status and what filled
@@ -94,7 +108,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import itertools
 import math
 import os
 import sys
@@ -114,6 +127,7 @@ from crucible_trader.entry_timing import (
     IbIntradayQuotes,
     WatchedEntry,
     entry_trigger,
+    exit_trigger,
     panel_support_levels,
 )
 from crucible_trader.execution_shortfall import (
@@ -125,6 +139,7 @@ from crucible_trader.execution_shortfall import (
 )
 from crucible_trader.gap_stop import (
     DEFAULT_GAP_STOP_PCT,
+    GAP_STOP_EXIT,
     apply_gap_exits,
     check_gaps,
     exit_decision,
@@ -151,6 +166,7 @@ __all__ = [
     "StagingRoutingRefusedError",
     "UnknownOrderStateError",
     "assert_staging_never_routes",
+    "book_cash",
     "build_router",
     "held_weights",
     "is_staging",
@@ -173,9 +189,10 @@ ACCOUNT_VAR = "CRUCIBLE_TRADER_IB_ACCOUNT"
 MAX_ORDER_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD"
 MAX_SESSION_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD"
 
-#: When the buys go out. Unset or ``v1_triggers``: held for v1's entry triggers
-#: (`crucible_trader.entry_timing`). ``immediate``: at the session start with the
-#: sells, the behaviour before 2026-11-09. Anything else is refused.
+#: When the orders go out. Unset or ``v1_triggers``: buys held for v1's entry
+#: triggers and sells for their mirror (`crucible_trader.entry_timing`).
+#: ``immediate``: every order at the session start, sells first, the behaviour
+#: before 2026-11-09. Anything else is refused.
 ENTRY_TIMING_VAR = "CRUCIBLE_TRADER_ENTRY_TIMING"
 
 #: The catastrophic gap stop (`crucible_trader.gap_stop`). Unset: v1's 0.15.
@@ -329,7 +346,7 @@ class RouterConfig:
     address: GatewayAddress | None = None
     max_order_notional_usd: float | None = None
     max_session_notional_usd: float | None = None
-    #: v1's entry triggers, or None to send every buy at the session start.
+    #: The intraday triggers, or None to send every order at the session start.
     entry_timing: EntryTimingParams | None = EntryTimingParams()
     #: The opening batch's gap-stop threshold (`crucible_trader.gap_stop`), or None.
     gap_stop_pct: float | None = DEFAULT_GAP_STOP_PCT
@@ -366,7 +383,7 @@ class RouterConfig:
         if timing not in ("", ENTRY_TIMING_TRIGGERED, ENTRY_TIMING_IMMEDIATE):
             raise RouterSettingsError(
                 f"{ENTRY_TIMING_VAR}={timing!r} is not an entry timing. Unset or "
-                f"{ENTRY_TIMING_TRIGGERED!r} holds buys for v1's triggers; "
+                f"{ENTRY_TIMING_TRIGGERED!r} holds orders for their triggers; "
                 f"{ENTRY_TIMING_IMMEDIATE!r} sends them at the session start."
             )
         return cls(
@@ -567,6 +584,101 @@ def plan_orders(
             f"${max_session_notional_usd:,.2f}"
         )
     return tuple(sells), tuple(buys)
+
+
+def book_cash(book: TargetBook, positions: Mapping[str, int], *, quote: QuoteSource) -> float:
+    """The book's cash at the session start: its notional less the held book's value.
+
+    The same arithmetic as :func:`held_weights`' cash weight, in dollars, at the
+    prices the plan was sized on. A held book worth more than the notional has no
+    cash (never negative). The paper account is shared with the v1 executor, so
+    the account's own cash balance is not this trader's to spend; the book's
+    notional is the budget the plan was sized against.
+    """
+    held = 0.0
+    for symbol, shares in positions.items():
+        if shares > 0:
+            price = _valid(quote(symbol))
+            if price is None:
+                raise PriceUnavailableError(f"no usable price for held {symbol}; no cash figure")
+            held += shares * price
+    return max(0.0, book.portfolio_notional_usd - held)
+
+
+class _MemoQuote:
+    """One price per name per plan: a second ask of a name returns the first answer."""
+
+    def __init__(self, source: QuoteSource) -> None:
+        self._source = source
+        self._seen: dict[str, float | None] = {}
+
+    @property
+    def last_miss(self) -> str | None:
+        return getattr(self._source, "last_miss", None)
+
+    def __call__(self, symbol: str) -> float | None:
+        if symbol not in self._seen:
+            self._seen[symbol] = self._source(symbol)
+        return self._seen[symbol]
+
+
+class _CashLedger:
+    """What a timed session's buys may spend: the book's cash plus what its sells FILLED.
+
+    ``cash = book cash at the start + proceeds of this run's filled sells
+    - what this run's buys have committed``. A sell counts only once the broker
+    reports its executions, so no buy is ever sized on proceeds a still-pending
+    sell has not freed. A buy is charged at the larger of its release-time
+    notional and its filled value, so slippage can only make the ledger stricter.
+    An ADOPTED sell (a rerun's) adds nothing: what it filled before the rerun is
+    already in the positions the book cash was measured from, and what it fills
+    after is left uncounted rather than risk counting it twice. An adopted buy
+    is charged its re-planned (still-unbought) quantity at its sized price.
+
+    It also keeps the per-session notional released so far, for the cap.
+    """
+
+    def __init__(self, start: float) -> None:
+        self.start = start
+        self._sells: set[str] = set()
+        self._buys: dict[str, float] = {}
+        self._adopted = 0.0
+        self.released_notional = 0.0
+
+    def adopt(self, entry: WatchedEntry) -> None:
+        notional = entry.quantity * entry.reference_price
+        self.released_notional += notional
+        if entry.side == "buy":
+            self._adopted += notional
+
+    def release_sell(self, entry: WatchedEntry, reason: str, now: dt.datetime) -> None:
+        price = entry.last if entry.last is not None else entry.reference_price
+        entry.status, entry.trigger = "triggered", reason
+        entry.released_at, entry.release_price = now, price
+        entry.released_quantity = entry.quantity
+        self.released_notional += entry.quantity * price
+        self._sells.add(entry.order_key)
+
+    def release_buy(self, entry: WatchedEntry, order: PlannedOrder) -> float:
+        notional = float(order.decision.quantity) * (entry.release_price or 0.0)
+        self.released_notional += notional
+        self._buys[entry.order_key] = notional
+        return notional
+
+    def session_room(self, cap: float, waiting: Iterable[WatchedEntry]) -> float:
+        """The session cap less what has gone, and less the sells still owed their room."""
+        owed = sum(e.quantity * e.reference_price for e in waiting if e.side == "sell")
+        return cap - self.released_notional - owed
+
+    def cash(self, executions: Iterable[tuple[str, float, float]]) -> float:
+        """The cash left, from the broker's executions as ``(order ref, shares, price)``."""
+        filled: dict[str, float] = {}
+        for ref, shares, price in executions:
+            key = _REF_SEP.join(ref.split(_REF_SEP)[:3])
+            filled[key] = filled.get(key, 0.0) + shares * price
+        freed = sum(filled.get(key, 0.0) for key in self._sells)
+        spent = sum(max(charged, filled.get(key, 0.0)) for key, charged in self._buys.items())
+        return self.start + freed - spent - self._adopted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -817,32 +929,40 @@ class PaperOrderRouter:
             account=self._config.account,  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
             before=self._day,
         )
+        # Memoised: the timed path values the held book at the very prices it planned on.
+        quote = _MemoQuote(self._quote)
         sells, buys = plan_orders(
             book,
             positions=statement.positions,
-            quote=self._quote,
+            quote=quote,
             clock=self._clock,
             max_order_notional_usd=self._config.max_order_notional_usd,  # type: ignore[arg-type]
             max_session_notional_usd=self._config.max_session_notional_usd,  # type: ignore[arg-type]
             inherited=inherited,
             owned=owned,
         )
+        gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:
-            sells, buys = self._gap_stop(statement.positions, sells, buys)
+            sells, buys, gapped = self._gap_stop(statement.positions, sells, buys)
         self._planned = sells + buys
-        # Sells first, so their proceeds are cash before the buys go out.
-        if self._config.entry_timing is None or not buys:
+        if self._config.entry_timing is None or not self._planned:
+            # Sells first, so their proceeds are cash before the buys go out.
             return [batch for batch in (sells, buys) if batch]
-        opening = [sells] if sells else []
-        return itertools.chain(opening, self._timed_entries(self._config.entry_timing, buys, sells))
+        return self._timed_orders(
+            self._config.entry_timing,
+            sells,
+            buys,
+            book_cash=book_cash(book, statement.positions, quote=quote),
+            urgent=gapped,
+        )
 
     def _gap_stop(
         self,
         positions: Mapping[str, int],
         sells: tuple[PlannedOrder, ...],
         buys: tuple[PlannedOrder, ...],
-    ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...]]:
-        """The opening batch with every gapped held name sold whole (`gap_stop`).
+    ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...], frozenset[str]]:
+        """The plan with every gapped held name sold whole (`gap_stop`), and those names.
 
         The record is written before the orders exist, so an exit that reaches
         the broker is never off the record.
@@ -882,7 +1002,7 @@ class PaperOrderRouter:
                     f"selling all {check.shares} shares",
                     file=sys.stderr,
                 )
-        return apply_gap_exits(
+        sells, buys = apply_gap_exits(
             sells,
             buys,
             checks,
@@ -891,17 +1011,27 @@ class PaperOrderRouter:
                 trading_day=self._day, decision=exit_decision(c, now=now)
             ),
         )
+        return sells, buys, frozenset(c.symbol for c in checks if c.fired)
 
-    def _timed_entries(
+    def _timed_orders(
         self,
         params: EntryTimingParams,
-        buys: Sequence[PlannedOrder],
         sells: Sequence[PlannedOrder],
+        buys: Sequence[PlannedOrder],
+        *,
+        book_cash: float,
+        urgent: frozenset[str] = frozenset(),
     ) -> Iterator[tuple[PlannedOrder, ...]]:
-        """The buys, each released as its own batch when its trigger fires."""
+        """Every order, released as its own batch when its trigger fires.
+
+        In each poll the sells are judged and sent first, so the cash their fills
+        free is on the ledger before any buy of the same poll is sized against it.
+        The sells of the ``urgent`` names (the gap stop's exits) are hard risk and
+        wait for no trigger: they are the first batch, sent at once.
+        """
         now = self._clock()
         schedule = params.schedule(now.astimezone(NYSE_ZONE).date())
-        by_key = {order.key: order for order in buys}
+        by_key = {order.key: order for order in (*sells, *buys)}
         support = panel_support_levels(
             self._store,
             self._day,
@@ -921,25 +1051,28 @@ class PaperOrderRouter:
                     reference_price=float(o.decision.decision_price),
                     decided_at=o.decision.decided_at,
                     support_level=support.get(o.decision.symbol),
+                    side=o.decision.side,
                 )
-                for o in buys
+                for o in (*sells, *buys)
             ],
         )
         self._watch = watch
-        spent = sum(o.decision.quantity * o.decision.decision_price for o in sells)
+        ledger = _CashLedger(book_cash)
         unknown: list[OrderIntentConflictError] = []
         quotes = IbIntradayQuotes(self._client, self._sdk)
         self._intraday = quotes
         try:
-            # A rerun of the day: a buy the broker already knows is adopted now, and
-            # one with an intent the broker does not know is UNKNOWN -- never sent,
-            # and the session fails on it once every other buy has had its chance.
+            # A rerun of the day: an order the broker already knows is adopted now,
+            # and one with an intent the broker does not know is UNKNOWN -- never
+            # sent, and the session fails on it once every other order has had its
+            # chance.
             known = self._known_refs()
             adopted: list[WatchedEntry] = []
             for entry in watch.entries:
                 if entry.order_key in known:
                     entry.status, entry.trigger = "triggered", "adopted: already at the broker"
                     adopted.append(entry)
+                    ledger.adopt(entry)
                 elif (
                     intent := read_order_intent(self._store, self._day, entry.symbol)
                 ) is not None:
@@ -953,6 +1086,15 @@ class PaperOrderRouter:
                 yield tuple(by_key[e.order_key] for e in adopted)
                 for entry in adopted:
                     entry.status = "sent"
+            # Hard risk outranks timing: a gap exit never waits for an exit trigger.
+            exits = [e for e in watch.waiting() if e.side == "sell" and e.symbol in urgent]
+            if exits:
+                for entry in exits:
+                    ledger.release_sell(entry, GAP_STOP_EXIT, now)
+                watch.write(now)
+                yield tuple(by_key[e.order_key] for e in exits)
+                for entry in exits:
+                    entry.status = "sent"
             quotes.subscribe(e.symbol for e in watch.waiting())
             watch.write(self._clock())
             while watch.waiting():
@@ -960,7 +1102,7 @@ class PaperOrderRouter:
                 assert_trading_permitted(self._store, self._day)
                 if not self._client.isConnected():
                     raise RoutingRefusedError(
-                        f"the gateway connection dropped with {len(watch.waiting())} buy(s) "
+                        f"the gateway connection dropped with {len(watch.waiting())} order(s) "
                         "still waiting; they were not sent"
                     )
                 now = self._clock()
@@ -969,12 +1111,42 @@ class PaperOrderRouter:
                     for entry in watch.waiting():
                         entry.status, entry.trigger = "not_sent", "market closed before a trigger"
                     break
-                released: list[tuple[WatchedEntry, PlannedOrder]] = []
+                seen = {e.order_key: e.observe(quotes(e.symbol)) for e in watch.waiting()}
+                exits: list[WatchedEntry] = []
                 for entry in watch.waiting():
-                    seen = entry.observe(quotes(entry.symbol))
+                    if entry.side != "sell":
+                        continue
+                    reason = exit_trigger(
+                        reference_price=entry.reference_price,
+                        quote=seen[entry.order_key],
+                        now=now,
+                        schedule=schedule,
+                        params=params,
+                    )
+                    if reason is not None:
+                        ledger.release_sell(entry, reason, now)
+                        exits.append(entry)
+                if exits:
+                    watch.write(now)
+                    yield tuple(by_key[e.order_key] for e in exits)
+                    for entry in exits:
+                        entry.status = "sent"
+                # The sells sent above have had their fill wait in `send`.
+                cash = ledger.cash(
+                    (
+                        f.execution.orderRef or "",
+                        float(f.execution.shares),
+                        float(f.execution.price),
+                    )
+                    for f in self._client.fills()
+                )
+                entries: list[tuple[WatchedEntry, PlannedOrder]] = []
+                for entry in watch.waiting():
+                    if entry.side != "buy":
+                        continue
                     reason = entry_trigger(
                         reference_price=entry.reference_price,
-                        quote=seen,
+                        quote=seen[entry.order_key],
                         now=now,
                         schedule=schedule,
                         params=params,
@@ -982,14 +1154,25 @@ class PaperOrderRouter:
                     )
                     if reason is None:
                         continue
-                    order = self._release(by_key[entry.order_key], entry, reason, now, spent)
+                    sells_waiting = any(e.side == "sell" for e in watch.waiting())
+                    order = self._release(
+                        by_key[entry.order_key],
+                        entry,
+                        reason,
+                        now,
+                        session_room=ledger.session_room(
+                            float(self._config.max_session_notional_usd or 0.0), watch.waiting()
+                        ),
+                        cash=cash,
+                        may_wait=sells_waiting and now < schedule.expires_at,
+                    )
                     if order is not None:
-                        spent += order.decision.quantity * (entry.release_price or 0.0)
-                        released.append((entry, order))
-                watch.write(now, force=bool(released))
-                if released:
-                    yield tuple(order for _, order in released)
-                    for entry, _ in released:
+                        cash -= ledger.release_buy(entry, order)
+                        entries.append((entry, order))
+                watch.write(now, force=bool(entries))
+                if entries:
+                    yield tuple(order for _, order in entries)
+                    for entry, _ in entries:
                         entry.status = "sent"
                 if watch.waiting():
                     self._client.sleep(params.poll_interval_s)
@@ -997,7 +1180,9 @@ class PaperOrderRouter:
         finally:
             quotes.close()
             no_vwap = sorted(
-                e.symbol for e in watch.entries if e.last is not None and e.vwap is None
+                e.symbol
+                for e in watch.entries
+                if e.side == "buy" and e.last is not None and e.vwap is None
             )
             if no_vwap:
                 # Fail-safe, not silent: the VWAP trigger could not fire for these.
@@ -1018,34 +1203,55 @@ class PaperOrderRouter:
         entry: WatchedEntry,
         reason: str,
         now: dt.datetime,
-        spent: float,
+        *,
+        session_room: float,
+        cash: float,
+        may_wait: bool,
     ) -> PlannedOrder | None:
-        """The order a fired trigger sends, re-held to the caps at the price now.
+        """The order a fired buy trigger sends, re-held to the caps and the cash at the price now.
 
         The shares were sized at the session start; the price may have moved since.
         The per-order and per-session caps are re-checked at the last price seen and
-        the order clipped to them -- never enlarged. The decision (price and instant)
+        the order clipped to them -- never enlarged. The book's cash
+        (:class:`_CashLedger`) bounds it too: while a sell is still waiting and the
+        expiry has not come, a buy the cash cannot pay for in full stays WAITING
+        rather than going out short, since one key per name per day means a clipped
+        buy can never be topped up. With no sell left to free cash, or at the
+        expiry, it is clipped to the cash instead. The decision (price and instant)
         is the one taken at the session start, so the shortfall measures the wait.
         """
         price = entry.last if entry.last is not None else entry.reference_price
-        room = min(
-            float(self._config.max_order_notional_usd or 0.0),
-            float(self._config.max_session_notional_usd or 0.0) - spent,
-        )
         quantity = entry.quantity
+        if quantity * price > cash and may_wait:
+            note = (
+                f"{reason}; held for sell proceeds: ${max(cash, 0.0):,.2f} of the book's cash "
+                f"for ${quantity * price:,.2f}"
+            )
+            if not (entry.trigger or "").startswith(reason):
+                print(f"order_router: {entry.symbol} {note}", file=sys.stderr)
+            entry.trigger = note
+            return None
+        caps = min(float(self._config.max_order_notional_usd or 0.0), session_room)
+        room = min(caps, cash)
         if quantity * price > room:
             quantity = max(0, math.floor(room / price))
+        bound = "the book's cash" if cash < caps else "the caps"
         entry.trigger, entry.released_at, entry.release_price = reason, now, price
         if quantity == 0:
             entry.status = "not_sent"
-            entry.trigger = f"{reason}; the notional caps leave no room at {price:.2f}"
+            entry.trigger = (
+                f"{reason}; the notional caps leave no room at {price:.2f}"
+                if bound == "the caps"
+                else f"{reason}; the book's cash (${max(cash, 0.0):,.2f}) buys no share at "
+                f"{price:.2f}"
+            )
             return None
         entry.status, entry.released_quantity = "triggered", quantity
         if quantity == entry.quantity:
             return order
         d = order.decision
         print(
-            f"order_router: {d.symbol} {entry.quantity} shares at {price} exceeds the caps at "
+            f"order_router: {d.symbol} {entry.quantity} shares at {price} exceeds {bound} at "
             f"its trigger; clipped to {quantity}",
             file=sys.stderr,
         )

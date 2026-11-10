@@ -135,22 +135,29 @@ every order. It never trades a position its own book does not name. Its
 `orderRef` is keyed by trading day and symbol, so a retried session adopts the
 orders it already sent and does not send them again.
 
-**Buys wait for the right moment** (`crucible_trader.entry_timing`, ported from
-the v1 executor's entry triggers). Sells go out when the session starts. Each
-buy is held and sent when the price pulls back 2% from the day's high, is 0.5%
-below the day's VWAP, or sits within 1% above its 20-session low, or from
-15:30 ET when it is within 1% of the price it was sized at, or unconditionally
-at 15:55 ET (earlier on a half day). The session therefore runs until the last
-buy is sent. While it waits, `trader/entry_watch/{day}.json` lists every
-waiting buy and what released each one. `CRUCIBLE_TRADER_ENTRY_TIMING=immediate`
-sends every buy at the start instead.
+**Orders wait for the right moment** (`crucible_trader.entry_timing`; the buy
+triggers are ported from the v1 executor). Each buy is held and sent when the
+price pulls back 2% from the day's high, is 0.5% below the day's VWAP, or sits
+within 1% above its 20-session low, or from 15:30 ET when it is within 1% of
+the price it was sized at, or unconditionally at 15:55 ET (earlier on a half
+day). Each sell is the mirror: sent on a 2% rally off the day's low, or from
+15:30 ET when it is within 1% below the price it was sized at, or
+unconditionally at 15:55 ET, so no exit is carried overnight. A buy spends only
+the book's cash plus what its sells have actually filled: one that needs a
+waiting sell's proceeds waits for that sell. The session therefore runs until
+the last order is sent. While it waits, `trader/entry_watch/{day}.json` lists
+every waiting order and what released each one.
+`CRUCIBLE_TRADER_ENTRY_TIMING=immediate` sends every order at the start
+instead, sells first.
 
 **A held name that gaps down is sold whole first** (`crucible_trader.gap_stop`,
 the v1 executor's catastrophic gap stop). At the session start every held name
 is priced live against the book day's close; one 15% or more below it is sold in
-full in the opening sell batch, whatever the book wants, and is not bought that
-day. Every check, fired or not, is recorded at `trader/gap_stop/{day}.json`.
-`CRUCIBLE_TRADER_GAP_STOP_PCT` overrides the threshold; `off` disables it.
+full at once, as the session's first batch, whatever the book wants, and is not
+bought that day. It never waits for the sell-timing trigger the other sells wait
+for: hard risk outranks timing. Every check, fired or not, is recorded at
+`trader/gap_stop/{day}.json`. `CRUCIBLE_TRADER_GAP_STOP_PCT` overrides the
+threshold; `off` disables it.
 
 ## Where the rest lives
 

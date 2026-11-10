@@ -1,4 +1,4 @@
-"""The catastrophic gap stop on the opening sell batch (v1 → v2 parity audit row 2)."""
+"""The catastrophic gap stop at the session start (v1 → v2 parity audit row 2)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import pytest
 from crucible.keys import data_panel_key
 from crucible.store import LocalStore
 
+from crucible_trader.entry_timing import entry_watch_key
 from crucible_trader.gap_stop import (
     DEFAULT_GAP_STOP_PCT,
     GAP_STOP_EXIT,
@@ -22,6 +23,7 @@ from crucible_trader.gap_stop import (
     write_gap_stop_document,
 )
 from crucible_trader.order_router import GAP_STOP_VAR, RouterConfig, RouterSettingsError
+from tests.test_entry_timing import PATHS, TimedIB, _run_day, _timed_router
 from tests.test_order_router import DAY, RoutingIB, _book, _config, _env, _router
 
 T0 = dt.datetime(2026, 9, 9, 13, 35, tzinfo=dt.UTC)
@@ -199,3 +201,39 @@ def test_switched_off_it_checks_and_records_nothing(store) -> None:
     (sells, _buys) = list(router.batches(_book()))
     assert [(o.decision.symbol, o.decision.quantity) for o in sells] == [("BBB", 100)]
     assert not store.exists(gap_stop_key(DAY))
+
+
+# -- with timed orders: hard risk outranks timing ---------------------------------------
+
+
+def _timed(store, ib):
+    return _timed_router(store, ib, gap_stop_pct=0.15)
+
+
+def test_with_timed_orders_a_gap_exit_goes_at_once_and_the_other_sells_wait(store) -> None:
+    # BBB closed at 62.5 and trades at 50 all day (-20%); DDD is a plain exit, flat
+    # at its close, so it waits for its 15:30 graduated trigger as before.
+    _closes(store, {"AAA": 100.0, "BBB": 62.5, "DDD": 10.0})
+    paths = {"AAA": PATHS["AAA"], "BBB": [(dt.time(9, 30), 50.0)], "DDD": PATHS["DDD"]}
+    ib = TimedIB(paths, positions={"BBB": 500, "DDD": 100})
+    router = _timed(store, ib)
+    _run_day(router, _book({"AAA": 0.1, "BBB": 0.2, "DDD": 0.0}))
+    placed = ib.placed()
+    assert placed[0] == ("BBB", "SELL", 500, "09:35")  # the first batch, no trigger awaited
+    assert ("DDD", "SELL", 100, "15:30") in placed
+    assert not any(symbol == "BBB" and side == "BUY" for symbol, side, *_ in placed)
+    rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
+    assert (rows["BBB"]["status"], rows["BBB"]["trigger"]) == ("sent", GAP_STOP_EXIT)
+
+
+def test_a_rerun_adopts_a_gap_exit_already_at_the_broker(store) -> None:
+    _closes(store, {"BBB": 62.5})
+    ib = TimedIB({"BBB": [(dt.time(9, 30), 50.0)]}, positions={"BBB": 500}, stall=True)
+    first = _timed(store, ib)
+    batches = iter(first.batches(_book({"BBB": 0.0})))
+    first.send(next(batches))  # the gap exit; it never fills and the session dies
+    rerun = _timed(store, ib)
+    _run_day(rerun, _book({"BBB": 0.0}))
+    assert ib.placed() == [("BBB", "SELL", 500, "09:35")]  # adopted, not re-sent
+    (record,) = rerun.records
+    assert record.disposition == "adopted"
