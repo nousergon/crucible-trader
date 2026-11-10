@@ -62,9 +62,9 @@ refused, so no session can cancel the v1 executor's stops on the shared paper
 account.
 
 **A routed session lasts the trading day** (Brian 2026-11-09,
-`crucible_trader.entry_timing`). Its sells go out at the 09:35 start; its buys
-wait for v1's entry triggers and the last goes out by 15:55 ET (earlier on a half
-day), so the run -- and its one manifest, evidence entry and shortfall document
+`crucible_trader.entry_timing`). Its buys wait for v1's entry triggers and its
+sells for their mirror (Brian 2026-11-10), and the last order goes out by 15:55 ET
+(earlier on a half day), so the run -- and its one manifest, evidence entry and shortfall document
 -- ends after that rather than two minutes after the start. The final watch
 document is recorded as an output of the run, failed or not.
 
