@@ -75,6 +75,14 @@ start, on every trigger, and on a heartbeat: every waiting order and its side,
 the price it was sized at, the last price, high and low seen, and what released
 it. ``entry_watch.v2`` added the sells; a v1 document held buys only. Like the order
 book, a write that fails never stops the orders; it is logged and counted.
+
+**It names the release that is watching** (``code_sha``, from
+:data:`CODE_SHA_VAR`, which ``scripts/trader_pinned.sh`` exports as the pinned
+release's sha). The executor box's market-open notice reports it
+(alpha-engine-config-I12024): the watch is the first document the day's session
+writes, so it is the one place that says which release is trading before the
+session's run record exists. ``null`` when the variable is unset (a run outside
+the pinned launcher).
 """
 
 from __future__ import annotations
@@ -85,6 +93,7 @@ import io
 import json
 import logging
 import math
+import os
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Literal, cast
@@ -113,6 +122,8 @@ log = logging.getLogger(__name__)
 
 ENTRY_WATCH_SCHEMA_VERSION = "entry_watch.v2"
 ENTRY_WATCH_PREFIX = "trader/entry_watch/"
+#: The pinned release's sha, as ``scripts/trader_pinned.sh`` exports it.
+CODE_SHA_VAR = "CRUCIBLE_CODE_SHA"
 
 NYSE_ZONE = ZoneInfo("America/New_York")
 REGULAR_OPEN_ET = dt.time(9, 30)
@@ -446,6 +457,7 @@ class EntryWatch:
             "schema_version": ENTRY_WATCH_SCHEMA_VERSION,
             "trading_day": self._day,
             "session_date": self.schedule.opens_at.date().isoformat(),
+            "code_sha": os.environ.get(CODE_SHA_VAR) or None,
             "state": self.state,
             "params": self.params.document(),
             "schedule": self.schedule.document(),
