@@ -585,6 +585,28 @@ class TestPartialApply:
         assert taken in summary["written"]
 
 
+class TestRehearseSeesTheRunDaysJournals:
+    """crucible-trader#147 review: the backfill's own ledger posting reads the
+    store as of the close run day, as the dry run's postings do. A live journal
+    dated after the run day would otherwise refuse the missing day's posting."""
+
+    @pytest.mark.parametrize("live", ["2026-10-01", "2026-11-03"])
+    def test_a_later_live_journal_does_not_refuse_the_backfilled_day(self, gap_root, live):
+        LocalStore(gap_root).put_bytes(journal_key("nous-ergon-paper", live), b"{}")
+        view, summary = statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [_statement()],
+            month="2026-09",
+            now="2026-11-03T05:30:00Z",
+            corporate_actions=CA,
+        )
+        assert summary["backfill"][0]["has_ledger"]
+        assert journal_key("nous-ergon-paper", DAY) in summary["keys_written"]
+        rows = {row["trading_day"]: row for row in summary["ledger"]}
+        assert rows[DAY]["status"] == "OK"
+        assert view.exists(journal_key("nous-ergon-paper", live))  # hidden only while booking
+
+
 class TestRehearseInDateOrder:
     """codex d411bf68: a backfilled day is booked between the stored days, so an
     earlier stored day with no journal is not refused behind it."""
