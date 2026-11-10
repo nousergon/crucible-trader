@@ -69,6 +69,7 @@ from crucible.keys import (
 from crucible.runner import RunContext
 from crucible.store import (
     ETAG_ABSENT,
+    CaptureLedger,
     Store,
     capture_ledger_of,
     open_store,
@@ -177,12 +178,20 @@ class _JournalsAsOf(Store):
     day, and once the live ledger has posted it every replayed day of the
     month would sit behind it and be refused (codex facd7a3e). The close
     itself runs ON the run day, so it sees that day's journal.
+
+    It carries ``inner``'s capture (``_capture_ledger``), so a backfill handed
+    this view joins the dry run's capture instead of wrapping a fresh one whose
+    writes the dry run would never see (crucible-trader#147 review).
     """
 
     def __init__(self, inner: Store, as_of: str, *, include_as_of: bool = True) -> None:
         self._inner = inner
         self._as_of = as_of
         self._include_as_of = include_as_of
+
+    @property
+    def _capture_ledger(self) -> CaptureLedger | None:
+        return capture_ledger_of(self._inner)
 
     def _hidden(self, key: str) -> bool:
         if not (key.startswith(LEDGER_JOURNAL_PREFIX) and key.endswith(".json")):
@@ -233,14 +242,17 @@ def dry_run(
     now: str,
     fills: Mapping[str, Sequence[Fill]] | None = None,
     closes: CloseSource | None = None,
-    backfill: Mapping[str, Callable[[], object]] | None = None,
+    backfill: Mapping[str, Callable[[Store], object]] | None = None,
 ) -> dict[str, object]:
     """Run the month's loop against ``store``, which must be a capturing
     (dry-run) store, and return the summary. Raises only for a store that
     could write, or a month with nothing stored.
 
     ``backfill`` maps a missing day to the call that reconciles and books it
-    into ``store`` (the close rehearsal of an IB-statement backfill). Each
+    into the store it is handed (the close rehearsal of an IB-statement
+    backfill). That store is the booking view of step 3: its reconcile posts
+    the day's journal, which a live journal dated after the run day would
+    refuse just as it refuses a stored day (crucible-trader#147 review). Each
     runs in date order between the stored days' postings, never all first: a
     backfilled day's journal posted ahead of an earlier stored day would have
     the ledger refuse that day as inserted behind a later journal (codex
@@ -279,13 +291,13 @@ def dry_run(
     anchor: BrokerStatement | None = None
     anchor_day: str | None = None
     while pending and next(iter(pending)) < stored[0]:  # a backfilled day before the month
-        pending.pop(next(iter(pending)))()
+        pending.pop(next(iter(pending)))(as_of)
     if (prior := latest_anchor(store, stored[0])) is not None:
         anchor, anchor_day = prior[2], prior[2].trading_day
     booked_on: dict[str, str] = {}
     for day in stored:
         while pending and next(iter(pending)) <= day:
-            pending.pop(next(iter(pending)))()
+            pending.pop(next(iter(pending)))(as_of)
         if not store.exists(trader_reconciliation_key(day)):
             continue  # a backfill whose reconcile failed: a day without one
         ctx = _ctx(as_of, day, now)
@@ -315,7 +327,7 @@ def dry_run(
             booked_on.update({d: day for d in span if d != day})
             anchor, anchor_day = broker, day
     for run in pending.values():  # a backfilled day after the month's last
-        run()
+        run(as_of)
     stored = [d for d in stored if store.exists(trader_reconciliation_key(d))]
     if not stored:
         raise ValueError(f"no reconciliation for any trading day of {month}, backfilled or stored")

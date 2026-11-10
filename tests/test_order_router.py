@@ -896,6 +896,13 @@ def test_the_refusal_carries_the_quote_sources_miss() -> None:
         _plan(_book(), quote=quote)
 
 
+def test_the_routers_refusal_carries_its_quote_sources_miss(store) -> None:
+    """The router memoises its quotes per plan and still passes the source's miss through."""
+    router = _router(store, RoutingIB(), quote=_Missing({"BBB": 50.0}))
+    with pytest.raises(PriceUnavailableError, match=r"\[AAA: no tick within 18s\]"):
+        list(router.batches(_book()))
+
+
 # -- the book-day close fallback --------------------------------------------------------
 
 
