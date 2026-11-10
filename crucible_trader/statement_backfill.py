@@ -296,7 +296,13 @@ def backfill_day(
         "has_reconciliation": trader_reconciliation_key(day) in keys,
         # The day's journal and its ledger view: a cycle whose ledger posting
         # was refused wrote a reconciliation but no books (codex 29e6af2958a0c547).
-        "has_ledger": journal_key(PAPER_FUND_TENANT, day) in keys
+        # A journal an earlier, stopped apply already wrote is not re-written:
+        # the ledger verified it byte for byte before writing the view
+        # (`ledger.post_daily_ledger`), so the view stands for both (codex 40108050).
+        "has_ledger": (
+            journal_key(PAPER_FUND_TENANT, day) in keys
+            or view.exists(journal_key(PAPER_FUND_TENANT, day))
+        )
         and ledger_reconciliation_key(PAPER_FUND_TENANT, day) in keys,
     }
     return view, summary
@@ -311,23 +317,49 @@ def rehearse_close(
     fills: Mapping[str, Sequence[Fill]] | None = None,
     corporate_actions: Any = None,  # pyright: ignore[reportExplicitAny]
 ) -> tuple[Store, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
-    """Backfill every statement's day, in date order, then run the month's
-    back-office dry run, all in one capture of ``backend``. This is the proof
-    the close needs BEFORE ``--apply`` makes the books permanent: the close
-    reads the backfilled days exactly as it would after the apply. Writes
-    nothing to ``backend``."""
+    """Backfill every statement's day and run the month's back-office dry run,
+    all in one capture of ``backend``. This is the proof the close needs
+    BEFORE ``--apply`` makes the books permanent: the close reads the
+    backfilled days exactly as it would after the apply. Writes nothing to
+    ``backend``.
+
+    Each day is backfilled in date order BETWEEN the stored days the dry run
+    books, not all first: its reconcile posts the day's journal, and a stored
+    earlier day with no journal yet would then be refused as inserted behind
+    it (codex d411bf68)."""
+    twice = sorted(
+        {
+            s.trading_day
+            for s in statements
+            if [t.trading_day for t in statements].count(s.trading_day) > 1
+        }
+    )
+    if twice:
+        raise BackfillRefused(f"one statement per day: {twice} given more than once")
     view = capturing(backend)
     by_day = fills or {}
-    days = [
-        backfill_day(
-            view,
-            statement,
-            fills=by_day.get(statement.trading_day, ()),
-            corporate_actions=corporate_actions,
-        )[1]
-        for statement in sorted(statements, key=lambda s: s.trading_day)
-    ]
-    summary = dry_run(view, month=month, now=now, fills=by_day)
+    days: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny]
+
+    def backfill(statement: BrokerStatement) -> Callable[[], None]:
+        def run() -> None:
+            days.append(
+                backfill_day(
+                    view,
+                    statement,
+                    fills=by_day.get(statement.trading_day, ()),
+                    corporate_actions=corporate_actions,
+                )[1]
+            )
+
+        return run
+
+    summary = dry_run(
+        view,
+        month=month,
+        now=now,
+        fills=by_day,
+        backfill={s.trading_day: backfill(s) for s in statements},
+    )
     summary["backfill"] = days
     return view, summary
 
@@ -354,7 +386,21 @@ def apply_writes(
     apply's year). Every refusal is checked
     before the first write. A refused lock never unwinds the writes; it is
     recorded in ``summary["lock_refused"]`` (``summary["locked"]`` lists the
-    keys locked)."""
+    keys locked).
+
+    **A refusal part-way still locks what it wrote, and a re-run resumes it**
+    (codex 40108050). A writer landing between the scan and a put stops the
+    apply with earlier keys already created; those books are locked in a
+    ``finally`` (``summary["written"]`` lists them), never left without
+    retention. A key that already holds exactly the captured bytes is the same
+    write, not a conflict: it is skipped, and locked again. Writes go in three
+    tiers: the broker statement and the ledger (which replay byte for byte),
+    then the day's reconciliation -- the record that makes the day "not
+    missing" to :func:`backfill_day` -- then everything stamped with its run's
+    time (exceptions, proposals, score, manifest, claim). An apply stopped in
+    the first tier re-runs and completes, skipping what it already wrote; one
+    stopped after the reconciliation has the day's books written and locked,
+    and is refused by name rather than overwritten."""
     if _in_window(now):
         raise BackfillRefused(
             f"it is {now.astimezone(_ET):%H:%M} ET on a weekday, inside 09:00-16:30 ET; "
@@ -372,25 +418,52 @@ def apply_writes(
     if summary["locked_writes"]:
         raise BackfillRefused(f"Object Lock writes cannot be replayed: {summary['locked_writes']}")
     keys = cast("list[str]", summary["keys_to_write"])
-    existing = [k for k in keys if backend.exists(k)]
+    same = [k for k in keys if backend.exists(k) and _same(backend, view, k)]
+    existing = [k for k in keys if k not in same and backend.exists(k)]
     if existing:
         raise BackfillRefused(f"create-only: {len(existing)} key(s) already exist: {existing}")
-    for key in keys:
-        # Create-only at the write itself: the scan above refuses before any
-        # write, but a writer landing between the scan and this put must not
-        # be overwritten (codex 9b1df526e391319d).
-        try:
-            backend.compare_and_swap(key, ETAG_ABSENT, view.get_bytes(key))
-        except PointerConflictError:
-            raise BackfillRefused(f"create-only: {key} was written during the apply") from None
-    locked, refused = lock_books_records(
-        backend,
-        keys,
-        trading_day=dt.date.fromisoformat(str(summary["trading_day"])),
-        written_on=now.astimezone(dt.UTC).date(),
+    sentinel = trader_reconciliation_key(str(summary["trading_day"]))
+    order = sorted(
+        (k for k in keys if k not in same),
+        key=lambda k: 0 if k.startswith(_REPLAYABLE) else 1 if k == sentinel else 2,
     )
-    summary["locked"], summary["lock_refused"] = locked, refused
+    written: list[str] = list(same)
+    try:
+        for key in order:
+            # Create-only at the write itself: the scan above refuses before any
+            # write, but a writer landing between the scan and this put must not
+            # be overwritten (codex 9b1df526e391319d).
+            try:
+                backend.compare_and_swap(key, ETAG_ABSENT, view.get_bytes(key))
+            except PointerConflictError:
+                if not _same(backend, view, key):
+                    raise BackfillRefused(
+                        f"create-only: {key} was written during the apply; "
+                        f"{len(written)} key(s) already written and locked: {written}"
+                    ) from None
+            written.append(key)
+    finally:
+        locked, refused = lock_books_records(
+            backend,
+            written,
+            trading_day=dt.date.fromisoformat(str(summary["trading_day"])),
+            written_on=now.astimezone(dt.UTC).date(),
+        )
+        summary["written"] = written
+        summary["locked"], summary["lock_refused"] = locked, refused
     return keys
+
+
+#: The books a re-run of the same statement reproduces byte for byte.
+_REPLAYABLE: tuple[str, ...] = ("trader/broker_statements/", "trader/ledger/")
+
+
+def _same(backend: Store, view: Store, key: str) -> bool:
+    """Whether ``backend`` already holds exactly the captured bytes at ``key``."""
+    try:
+        return backend.get_bytes(key) == view.get_bytes(key)
+    except KeyError:  # gone between the check and the read: not the same write
+        return False
 
 
 # -- CLI ---------------------------------------------------------------------------

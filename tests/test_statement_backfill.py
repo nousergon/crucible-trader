@@ -524,3 +524,91 @@ class TestRehearseClose:
         assert main([*args, "--close", "2026-09", "--out", str(out)]) == 1
         assert "NO-GO" in capsys.readouterr().err
         assert not out.exists()
+
+
+# -- codex 40108050: a refusal part-way locks what it wrote, and a re-run resumes ----
+
+
+class TestPartialApply:
+    def _conflict_on(self, backend, monkeypatch, target):
+        from crucible.store import PointerConflictError
+
+        real = backend.compare_and_swap
+
+        def cas(key, expected, payload):
+            if key == target:
+                raise PointerConflictError(key)
+            return real(key, expected, payload)
+
+        monkeypatch.setattr(backend, "compare_and_swap", cas)
+        return real
+
+    def test_the_books_written_before_a_late_conflict_are_locked(self, monkeypatch):
+        backend, client = _s3_backend()
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        self._conflict_on(backend, monkeypatch, trader_reconciliation_key(DAY))
+        with pytest.raises(BackfillRefused, match="already written and locked"):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+        written = summary["written"]
+        assert journal_key("nous-ergon-paper", DAY) in written
+        assert trader_reconciliation_key(DAY) not in written
+        assert sorted(summary["locked"]) == sorted(k for k in written if is_books_key(k))
+        assert {f"crucible/{k}" for k in summary["locked"]} == set(client.retention)
+
+    def test_a_re_run_resumes_an_apply_stopped_before_the_reconciliation(self, monkeypatch):
+        backend, client = _s3_backend()
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        real = self._conflict_on(backend, monkeypatch, trader_reconciliation_key(DAY))
+        with pytest.raises(BackfillRefused):
+            apply_writes(backend, view, summary, now=OUTSIDE)
+        first = list(summary["written"])
+        monkeypatch.setattr(backend, "compare_and_swap", real)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        written = apply_writes(backend, view, summary, now=OUTSIDE)
+        assert backend.exists(trader_reconciliation_key(DAY))
+        for key in written:
+            assert backend.get_bytes(key) == view.get_bytes(key)
+        # The journal the stopped apply wrote is verified, not re-written; the
+        # rest it wrote replays byte for byte and is skipped. All of it is locked.
+        assert journal_key("nous-ergon-paper", DAY) in first
+        assert set(first) - {journal_key("nous-ergon-paper", DAY)} <= set(summary["written"])
+        books = {f"crucible/{k}" for k in [*first, *written] if is_books_key(k)}
+        assert set(client.retention) == books
+
+    def test_a_concurrent_identical_write_is_the_same_write(self, root, monkeypatch):
+        backend = LocalStore(root)
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA)
+        taken = journal_key("nous-ergon-paper", DAY)
+        backend.put_bytes(taken, view.get_bytes(taken))
+        monkeypatch.setattr(backend, "exists", lambda _key: False)  # the scan saw nothing
+        assert apply_writes(backend, view, summary, now=OUTSIDE) == summary["keys_to_write"]
+        assert taken in summary["written"]
+
+
+class TestRehearseInDateOrder:
+    """codex d411bf68: a backfilled day is booked between the stored days, so an
+    earlier stored day with no journal is not refused behind it."""
+
+    def test_a_stored_day_before_the_backfilled_one_is_still_booked(self, gap_root):
+        after = BrokerStatement("DU1", "2026-09-11", {"AAA": 10}, 1_000.0)
+        _view, summary = statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [after],
+            month="2026-09",
+            now="2026-11-03T05:30:00Z",
+            corporate_actions=CA,
+        )
+        rows = {row["trading_day"]: row for row in summary["ledger"]}
+        assert LATER in rows and "already exist" not in str(rows[LATER]["reason"])
+        assert rows[LATER]["status"] == "OK"
+        assert summary["backfill"][0]["trading_day"] == "2026-09-11"
+
+    def test_one_statement_per_day(self, gap_root):
+        with pytest.raises(BackfillRefused, match="one statement per day"):
+            statement_backfill.rehearse_close(
+                LocalStore(gap_root),
+                [_statement(), _statement()],
+                month="2026-09",
+                now="2026-11-03T05:30:00Z",
+                corporate_actions=CA,
+            )
