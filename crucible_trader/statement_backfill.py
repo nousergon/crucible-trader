@@ -340,11 +340,14 @@ def rehearse_close(
     by_day = fills or {}
     days: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny]
 
-    def backfill(statement: BrokerStatement) -> Callable[[], None]:
-        def run() -> None:
+    def backfill(statement: BrokerStatement) -> Callable[[Store], None]:
+        # `dry_run` hands each backfill its booking view of `view`: journals
+        # are seen as of the close run day, as its own postings see them, and
+        # the writes still land in this one capture (crucible-trader#147 review).
+        def run(as_of: Store) -> None:
             days.append(
                 backfill_day(
-                    view,
+                    as_of,
                     statement,
                     fills=by_day.get(statement.trading_day, ()),
                     corporate_actions=corporate_actions,
