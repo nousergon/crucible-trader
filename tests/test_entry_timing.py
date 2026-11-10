@@ -41,6 +41,7 @@ from crucible_trader.order_router import (
     ENTRY_TIMING_VAR,
     PaperOrderRouter,
     PriceUnavailableError,
+    ProtectiveStopError,
     RouterConfig,
     RouterSettingsError,
     RoutingRefusedError,
@@ -418,7 +419,7 @@ class TimedIB(RoutingIB):
         super().sleep(seconds)
 
     def placed(self) -> list[tuple[str, str, int, str]]:
-        """(symbol, action, shares, ET hh:mm) for every order, in order."""
+        """(symbol, action, shares, ET hh:mm) for every session order (no stop), in order."""
         return [
             (
                 c.symbol,
@@ -427,7 +428,30 @@ class TimedIB(RoutingIB):
                 t.log[0].time.astimezone(NYSE_ZONE).strftime("%H:%M"),
             )
             for (c, o), t in zip(self.order_calls, self._trades, strict=False)
+            if _market(o)
         ]
+
+    def stops(self) -> list[tuple[str, int, float, str, str]]:
+        """(symbol, shares, stop price, ET hh:mm placed, status) for every protective stop."""
+        return [
+            (
+                c.symbol,
+                int(o.totalQuantity),
+                o.auxPrice,
+                t.log[0].time.astimezone(NYSE_ZONE).strftime("%H:%M"),
+                t.orderStatus.status,
+            )
+            for (c, o), t in zip(self.order_calls, self._trades, strict=False)
+            if not _market(o)
+        ]
+
+
+def _market(order) -> bool:
+    return getattr(order, "orderType", "MKT") != "STP"
+
+
+def _session_symbols(ib: TimedIB) -> list[str]:
+    return [c.symbol for c, o in ib.order_calls if _market(o)]
 
 
 def test_the_quote_stream_reads_last_and_high_and_skips_an_unqualifiable_name() -> None:
@@ -520,7 +544,8 @@ def test_each_sell_and_each_buy_waits_for_its_trigger(store) -> None:
     ]
     assert batches == 4
     for _, order in ib.order_calls:
-        assert order.orderRef.startswith(f"crucible-trader|{DAY}|")
+        if _market(order):
+            assert order.orderRef.startswith(f"crucible-trader|{DAY}|")
     # The decision is the session-start one, so the shortfall measures the wait.
     ccc = next(r for r in router.records if r.order.decision.symbol == "CCC")
     assert ccc.order.decision.decision_price == 20.0
@@ -598,7 +623,7 @@ def test_the_kill_switch_stops_the_waiting_orders(store) -> None:
     _halt(store, "freeze")
     with pytest.raises(TradingHaltedError):
         next(batches)
-    assert [c.symbol for c, _ in ib.order_calls] == ["AAA"]  # the waiting sell too
+    assert _session_symbols(ib) == ["AAA"]  # the waiting sell too
     assert json.loads(store.get_bytes(entry_watch_key(DAY)))["state"] == "stopped"
 
 
@@ -653,12 +678,12 @@ def test_a_rerun_adopts_a_buy_the_broker_knows_and_watches_the_rest(store) -> No
     batches = iter(first.batches(_book(BOOK)))
     router_batch = next(batches)  # AAA at its 11:00 pullback
     first.send(router_batch)
-    assert [c.symbol for c, _ in ib.order_calls] == ["AAA"]
+    assert _session_symbols(ib) == ["AAA"]
     ib.completed.extend(ib._trades)  # the broker's completed-order record
 
     rerun = _timed_router(store, ib)
     _run_day(rerun, _book(BOOK))
-    assert [c.symbol for c, _ in ib.order_calls] == ["AAA", "BBB", "CCC"]  # AAA once
+    assert _session_symbols(ib) == ["AAA", "BBB", "CCC"]  # AAA once
     adopted = next(r for r in rerun.records if r.order.decision.symbol == "AAA")
     assert adopted.disposition == "adopted"
 
@@ -682,7 +707,7 @@ def test_a_buy_with_an_intent_and_no_broker_order_is_never_sent(store) -> None:
     router = _timed_router(store, ib)
     with pytest.raises(UnknownOrderStateError, match="BBB"):
         _run_day(router, _book(BOOK))
-    assert [c.symbol for c, _ in ib.order_calls] == ["AAA", "CCC"]
+    assert _session_symbols(ib) == ["AAA", "CCC"]
     rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
     assert rows["BBB"]["status"] == "not_sent" and rows["BBB"]["trigger"].startswith("unknown")
 
@@ -697,7 +722,7 @@ def test_a_rerun_adopts_a_sell_the_broker_is_working_and_never_resends_it(store)
 
     rerun = _timed_router(store, ib)
     assert _run_day(rerun, _book({"DDD": 0.0})) == 1
-    assert len(ib.order_calls) == 1  # adopted, not re-sent
+    assert len(ib.placed()) == 1  # adopted, not re-sent
     (record,) = rerun.records
     assert record.disposition == "adopted" and record.order.decision.side == "sell"
     (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
@@ -712,7 +737,7 @@ def test_a_rerun_after_a_filled_sell_plans_no_sell(store) -> None:
     first.send(next(batches))  # filled: the account no longer holds DDD
     rerun = _timed_router(store, ib)
     assert _run_day(rerun, _book({"DDD": 0.0})) == 0
-    assert len(ib.order_calls) == 1
+    assert len(ib.placed()) == 1
 
 
 def test_a_sell_with_an_intent_and_no_broker_order_is_never_sent(store) -> None:
@@ -888,3 +913,129 @@ def test_a_stream_with_no_vwap_is_logged_and_the_buy_still_goes(store, capsys) -
     _run_day(router, _book({"CCC": 0.1}))
     assert ib.placed() == [("CCC", "BUY", 500, "15:55")]
     assert "no VWAP was streamed for CCC" in capsys.readouterr().err
+
+
+# -- protective stops under the all-day session (stacked on #140) ----------------------
+
+
+def test_held_names_are_protected_at_the_start_and_each_timed_order_after_its_fill(
+    store,
+) -> None:
+    ib = TimedIB(PATHS, positions={"DDD": 100, "AAA": 50})
+    router = _timed_router(store, ib)
+    _run_day(router, _book({"AAA": 0.1, "BBB": 0.1, "DDD": 0.0}))
+
+    assert ib.placed() == [
+        ("AAA", "BUY", 50, "11:00"),
+        ("DDD", "SELL", 100, "15:30"),
+        ("BBB", "BUY", 200, "15:30"),
+    ]
+    assert ib.stops() == [
+        # AAA's 50 held into the day, protected at the start, before any order.
+        ("AAA", 50, 80.0, "09:35", "Cancelled"),
+        # DDD keeps its stop while its sell waits; the 15:30 sell cancels it first.
+        ("DDD", 100, 8.0, "09:35", "Cancelled"),
+        # Re-sized the moment the 11:00 buy filled, off the stream's 98.90 -- not at 16:00.
+        ("AAA", 100, 79.12, "11:00", "Submitted"),
+        ("BBB", 200, 40.24, "15:30", "Submitted"),
+    ]
+    moments = [(e["moment"], e["symbol"], e["disposition"]) for e in router.protective_stop_events]
+    assert moments == [
+        ("at the session start", "AAA", "placed"),
+        ("at the session start", "DDD", "placed"),
+        ("after the timed buy of AAA", "AAA", "placed"),
+        ("after the timed buy of BBB", "BBB", "placed"),
+    ]
+    # The session's final re-assertion finds every stop already standing.
+    assert [r["disposition"] for r in router.protect_holdings()] == ["kept", "kept"]
+
+
+def test_a_partial_sell_re_sizes_the_names_stop_right_after_its_fill(store) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.5), (dt.time(11, 0), 9.7)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 200})
+    router = _timed_router(store, ib)
+    # Hold half of a 200-share name: a 100-share trim at the 11:00 rally.
+    _run_day(router, _book({"DDD": 0.01}))
+    assert ib.placed() == [("DDD", "SELL", 100, "11:00")]
+    assert [(s, q, st) for s, q, _, _, st in ib.stops()] == [
+        ("DDD", 200, "Cancelled"),
+        ("DDD", 100, "Submitted"),
+    ]
+    assert [e["moment"] for e in router.protective_stop_events] == [
+        "at the session start",
+        "after the timed sell of DDD",
+    ]
+
+
+def test_a_sell_whose_stop_fired_while_it_waited_is_clipped_to_the_shares_held(
+    store, capsys
+) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.5), (dt.time(11, 0), 9.7)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100})
+    router = _timed_router(store, ib)
+    batches = iter(router.batches(_book({"DDD": 0.0})))
+    sell = next(batches)  # the 11:00 rally
+    ib.book["DDD"] = 40  # the protective stop filled 60 while the sell waited
+    router.send(sell)
+    assert ib.placed() == [("DDD", "SELL", 40, "11:00")]
+    assert "the sell of 100 is clipped to 40" in capsys.readouterr().err
+
+
+def test_a_sell_whose_stop_sold_the_whole_holding_is_not_sent(store, capsys) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.5), (dt.time(11, 0), 9.7)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100})
+    router = _timed_router(store, ib)
+    batches = iter(router.batches(_book({"DDD": 0.0})))
+    sell = next(batches)
+    del ib.book["DDD"]  # the stop sold every share before the sell's trigger
+    router.send(sell)
+    assert ib.placed() == [] and router.records == ()
+    assert "the sell of 100 is not sent" in capsys.readouterr().err
+
+
+def test_a_run_that_fails_mid_day_leaves_its_bought_names_protected(store) -> None:
+    ib = TimedIB(PATHS)
+    router = _timed_router(store, ib)
+    batches = iter(router.batches(_book(BOOK)))
+    router.send(next(batches))  # AAA at its 11:00 pullback
+    ib.connected = False
+    with pytest.raises(RoutingRefusedError, match="2 order"):
+        next(batches)
+    assert ib.stops() == [("AAA", 100, 79.12, "11:00", "Submitted")]
+
+
+def test_a_buy_never_released_gets_no_stop(store) -> None:
+    paths = {**PATHS, "EEE": [(dt.time(9, 30), 10.0), (dt.time(12, 0), 2_500.0)]}
+    ib = TimedIB(paths)
+    router = _timed_router(store, ib, max_session_notional_usd=1_000.0)
+    _run_day(router, _book({"EEE": 0.01}))
+    router.protect_holdings()
+    assert ib.placed() == [] and ib.stops() == []
+
+
+def test_a_stop_that_cannot_be_placed_mid_day_never_stops_the_buys(store, capsys) -> None:
+    ib = TimedIB(PATHS)
+    router = _timed_router(store, ib)
+
+    def refuse() -> tuple[dict[str, object], ...]:
+        raise ProtectiveStopError("1 held name(s) are without a protective stop: AAA: no")
+
+    router.protect_holdings = refuse
+    _run_day(router, _book(BOOK))
+    assert [s for s, *_ in ib.placed()] == ["AAA", "BBB", "CCC"]
+    assert router.protective_stop_events[0] == {
+        "moment": "at the session start",
+        "error": "1 held name(s) are without a protective stop: AAA: no",
+    }
+    assert "re-attempted at the session's end" in capsys.readouterr().err
+
+
+def test_immediate_entry_timing_still_sends_every_buy_at_the_start(store) -> None:
+    ib = TimedIB(PATHS, positions={"DDD": 100})
+    router = _timed_router(store, ib, entry_timing=None)
+    assert _run_day(router, _book(BOOK)) == 2
+    assert {at for *_, at in ib.placed()} == {"09:35"} and len(ib.placed()) == 4
+    assert ib.stops() == [] and router.protective_stop_events == ()
+    router.protect_holdings()  # the daily session's one end-of-session assertion
+    assert [s for s, *_ in ib.stops()] == ["AAA", "BBB", "CCC"]
+    assert router.entry_watch_payload(ib.clock()) is None

@@ -524,6 +524,10 @@ class IbIntradayQuotes:
                 contract, VWAP_GENERIC_TICKS, False, False
             )
 
+    def __contains__(self, symbol: object) -> bool:
+        """Whether ``symbol`` is streamed now (subscribed and not yet closed)."""
+        return symbol in self._tickers
+
     def __call__(self, symbol: str) -> IntradayQuote:
         ticker = self._tickers.get(symbol)
         if ticker is None:

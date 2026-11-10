@@ -173,7 +173,9 @@ class RoutingIB(FakeIB):
             return
         for trade in self._trades:
             ref = trade.order.orderRef or ""
-            if trade.orderStatus.status != "Submitted" or not ref.startswith(ORDER_REF_PREFIX):
+            if trade.orderStatus.status != "Submitted" or not ref.startswith(
+                ORDER_REF_PREFIX + "|"
+            ):
                 continue
             symbol, qty = trade.contract.symbol, int(trade.order.totalQuantity)
             buy = trade.order.action == "BUY"

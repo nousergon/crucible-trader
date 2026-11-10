@@ -224,6 +224,9 @@ def test_with_timed_orders_a_gap_exit_goes_at_once_and_the_other_sells_wait(stor
     assert not any(symbol == "BBB" and side == "BUY" for symbol, side, *_ in placed)
     rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
     assert (rows["BBB"]["status"], rows["BBB"]["trigger"]) == ("sent", GAP_STOP_EXIT)
+    # The exit goes before the session-start stops, so the dumped name never gets one.
+    assert "BBB" not in {symbol for symbol, *_ in ib.stops()}
+    assert router.protective_stop_events[0]["moment"] == "at the session start"
 
 
 def test_a_rerun_adopts_a_gap_exit_already_at_the_broker(store) -> None:
