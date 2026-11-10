@@ -48,3 +48,9 @@ def test_nothing_in_the_script_turns_routing_on() -> None:
     assert "CRUCIBLE_TRADER_ORDER_ROUTING=" not in text.replace(
         "CRUCIBLE_TRADER_ORDER_ROUTING=ib_paper is set", ""
     )
+
+
+def test_the_order_book_plan_is_allowlisted_and_needs_a_store() -> None:
+    """Its gateway address is checked by the plan itself, and only on a routed day."""
+    result = _run("order_book_plan")
+    assert result.returncode == 2 and "CRUCIBLE_TRADER_STORE_URI is unset" in result.stderr

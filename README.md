@@ -95,6 +95,7 @@ release (`trader/release_pin`) in a fresh virtualenv:
 
 | When (NYSE sessions, New York time) | Entry point | Writes |
 |---|---|---|
+| 08:40 | `scripts/trader_pinned.sh order_book_plan` | `trader/order_books/{day}.json` (`stage: pre_open`), before the open |
 | 10:45 | `scripts/trader_pinned.sh daily_session` | `runs/trader.session/{day}/run.json`, `trader/evidence.json`, `trader/execution_shortfall/{day}.json` |
 | 16:45 | `scripts/trader_reconcile.sh` | `runs/trader.reconcile/{day}/run.json`, `trader/reconciliation/{day}.json`, `trader/broker_statements/{day}.json` |
 | 11:00 | `scripts/trader_pinned.sh shadow_books_daily` | `trader/shadow_books/{decision_day}.json` |
@@ -103,6 +104,14 @@ The box runs from about 08:15 to between 17:10 and 17:50 New York time. The v2
 `data-daily` run publishes the day's panel at 18:30. So the shadow books for the
 last closed session are advanced the next morning, and the broker is reconciled
 before the box stops.
+
+**The order book is written before the open** (`alpha-engine-config-I12024`).
+`crucible_trader.order_book_plan` builds the day's book with no order and no
+router, reading the account's positions read-only on its own IB client id
+(`CRUCIBLE_TRADER_PLAN_IB_CLIENT_ID`) when routing is on. The day's key is
+written once, create-only. The session reuses that book when its own matches,
+and otherwise keeps its book at `trader/order_books/as_traded/{day}.json`, so
+the pre-open book is never superseded at its key.
 
 **A routed session starts only in market hours** (`alpha-engine-config-I13447`).
 With routing on, a session that starts outside 09:30 ET to the close on a
