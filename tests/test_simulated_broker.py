@@ -501,3 +501,92 @@ class TestTheSimulatedBookIsCarried:
         router._records.append(sell)  # noqa: SLF001
         with pytest.raises(module.SimulatedBrokerError, match="short"):
             router.closing_positions()
+
+
+class TestCarriedSharesFollowSplits:
+    """codex cfff90d3: a carried book is valued at the session's close_raw, which
+    a split rebases, so the carried shares are rebased with it."""
+
+    NEXT = "2026-09-09"
+
+    def _carry(self, store, positions) -> None:
+        store.put_bytes(
+            module.simulated_positions_key(DAY),
+            json.dumps(
+                {
+                    "schema_version": module.SIMULATED_POSITIONS_SCHEMA_VERSION,
+                    "positions": positions,
+                }
+            ).encode(),
+        )
+
+    def _next(self, store, splits) -> SimulatedFillRouter:
+        write_panel(store, day=self.NEXT, closes={**CLOSES, "AAA": 50.0})
+        return SimulatedFillRouter(
+            _config(), store=store, trading_day=self.NEXT, clock=lambda: NOW, splits=splits
+        )
+
+    def test_a_two_for_one_split_doubles_the_carried_shares(self, store) -> None:
+        self._carry(store, {"AAA": 301, "BBB": 400})
+        router = self._next(store, {self.NEXT: {"AAA": 2.0, "ZZZ": 3.0}}.get)
+        assert router.opening == {"AAA": 602, "BBB": 400}
+        # Valued at the post-split close, the book is what it was: no re-buy.
+        assert router.held_weights(100_000.0)["AAA"] == pytest.approx(0.301)
+        document = json.loads(router.simulated_positions_payload(trading_day=self.NEXT, now=NOW))
+        assert document["splits"] == [
+            {
+                "trading_day": self.NEXT,
+                "symbol": "AAA",
+                "ratio": 2.0,
+                "shares_before": 301,
+                "shares_after": 602,
+            }
+        ]
+
+    def test_a_reverse_split_drops_the_fractional_share(self, store) -> None:
+        self._carry(store, {"AAA": 301})
+        assert self._next(store, {self.NEXT: {"AAA": 0.1}}.get).opening == {"AAA": 30}
+
+    def test_a_day_with_unknown_splits_refuses(self, store) -> None:
+        self._carry(store, {"AAA": 300})
+        with pytest.raises(SimulatedBrokerError, match="scan for 2026-09-09 is missing"):
+            self._next(store, lambda _day: None)
+
+    def test_a_carried_name_split_with_no_ratio_refuses(self, store) -> None:
+        self._carry(store, {"AAA": 300})
+        with pytest.raises(SimulatedBrokerError, match="no usable ratio"):
+            self._next(store, {self.NEXT: {"AAA": None}}.get)
+
+    def test_only_days_after_the_carried_book_through_the_session_are_read(self, store) -> None:
+        self._carry(store, {"AAA": 300})
+        asked: list[str] = []
+        write_panel(store, day="2026-09-14", closes=CLOSES)
+        SimulatedFillRouter(
+            _config(),
+            store=store,
+            trading_day="2026-09-14",
+            clock=lambda: NOW,
+            splits=lambda day: asked.append(day) or {},
+        )
+        assert asked == ["2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14"]
+
+    def test_with_no_scans_configured_nothing_is_rebased_and_it_says_so(
+        self, store, monkeypatch
+    ) -> None:
+        monkeypatch.delenv(module.SPLIT_SCANS_VAR, raising=False)
+        self._carry(store, {"AAA": 300})
+        router = self._next(store, None)
+        assert router.opening == {"AAA": 300}
+        document = json.loads(router.simulated_positions_payload(trading_day=self.NEXT, now=NOW))
+        assert document["splits"] is None
+
+    def test_the_scans_are_read_from_the_environment(self, monkeypatch) -> None:
+        from test_corporate_action_feed import BASE, s3_with, scan
+
+        doc = scan(day=self.NEXT, splits=[{"ticker": "BRK.B", "split_from": 1, "split_to": 3}])
+        source = module.scan_split_source(BASE, s3_client=s3_with(doc, day=self.NEXT))
+        assert source(self.NEXT) == {"BRK B": 3.0}
+        missing = module.scan_split_source(BASE, s3_client=s3_with(doc, day="2026-09-10"))
+        assert missing(self.NEXT) is None
+        assert module.split_source_from_env({}) is None
+        assert callable(module.split_source_from_env({module.SPLIT_SCANS_VAR: BASE}))

@@ -326,3 +326,95 @@ def test_runs_as_a_module(root, tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exited:
         runpy.run_module("crucible_trader.back_office_dry_run", run_name="__main__")
     assert exited.value.code == 0 and (out / "summary.json").is_file()
+
+
+class TestTheRunDaysOwnJournal:
+    """codex facd7a3e: the run day is the next month's first trading day. Once
+    the live ledger has posted it, step 3 must not see it, or every replayed
+    day sits behind it and is refused; the close, run ON that day, sees it."""
+
+    def test_a_live_journal_on_the_run_day_does_not_refuse_the_month(self, root):
+        LocalStore(root).put_bytes(journal_key(T, "2026-10-01"), b"{}")
+        summary = dry_run(open_store(str(root), dry_run=True), month="2026-09", now=NOW)
+        assert summary["close_run_day"] == "2026-10-01"
+        assert {row["trading_day"] for row in summary["ledger"]} == {CLEAN, BROKEN, LATER}
+        assert not any("already exist" in str(row["reason"]) for row in summary["ledger"])
+        assert journal_key(T, LATER) in summary["keys_written"]
+
+    def test_the_run_day_is_hidden_only_when_asked(self, tmp_path):
+        inner = LocalStore(tmp_path / "s")
+        on_day = journal_key(T, "2026-10-01")
+        inner.put_bytes(on_day, b"{}")
+        booking = back_office_dry_run._JournalsAsOf(inner, "2026-10-01", include_as_of=False)
+        assert not booking.exists(on_day)
+        assert back_office_dry_run._JournalsAsOf(inner, "2026-10-01").exists(on_day)
+
+
+class TestTheQueueCarriesItsRecords:
+    """codex 09f52012: step 5 scores with each proposal's exception record, as
+    the job's step 5f does, so the queue's amount, tier and citations are filled."""
+
+    def test_step_five_passes_the_exception_records(self, root, monkeypatch):
+        seen = {}
+        real = back_office_dry_run.score
+
+        def spy(*args, **kwargs):
+            seen["exceptions"] = kwargs.get("exceptions")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(back_office_dry_run, "score", spy)
+        summary = dry_run(open_store(str(root), dry_run=True), month="2026-09", now=NOW)
+        assert summary["records"] > 0
+        exceptions = seen["exceptions"]
+        assert exceptions is not None and len(exceptions) == summary["records"]
+
+    def test_the_review_evidence_carries_the_records_the_score_read(self, root):
+        from crucible_trader.exception_record import exceptions_key
+
+        store = LocalStore(root)
+        store.put_bytes(
+            exception_proposals_key("2026-09-09"),
+            json.dumps(
+                {"trading_day": "2026-09-09", "proposals": [{"trading_day": "2026-09-09"}]}
+            ).encode(),
+        )
+        store.put_bytes(exceptions_key("2026-09-09"), b"{}")
+        keys = back_office_dry_run.review_evidence_keys(store, until="2026-10-01", written=[])
+        assert exceptions_key("2026-09-09") in keys
+
+
+def test_backfills_run_in_date_order_between_the_postings(root, monkeypatch):
+    """codex d411bf68: each backfill runs where its day falls among the stored
+    days' postings, never all of them first."""
+    order: list[str] = []
+    real = back_office_dry_run.post_daily_ledger
+
+    def post(ctx, **kw):
+        order.append(f"post {kw['broker'].trading_day}")
+        return real(ctx, **kw)
+
+    monkeypatch.setattr(back_office_dry_run, "post_daily_ledger", post)
+    backfill = {
+        day: (lambda d=day: order.append(f"backfill {d}"))
+        for day in ("2026-10-05", "2026-08-31", "2026-09-30")
+    }
+    # 09-30's backfill reconciled nothing (its reconcile failed): a day without one.
+    dry_run(open_store(str(root), dry_run=True), month="2026-09", now=NOW, backfill=backfill)
+    assert order == [
+        "backfill 2026-08-31",
+        f"post {CLEAN}",
+        f"post {BROKEN}",
+        f"post {LATER}",
+        "backfill 2026-09-30",
+        "backfill 2026-10-05",
+    ]
+
+
+def test_a_month_whose_only_backfill_reconciled_nothing_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="backfilled or stored"):
+        dry_run(
+            open_store(str(tmp_path / "empty"), dry_run=True),
+            month="2026-09",
+            now=NOW,
+            backfill={"2026-09-09": lambda: None},
+        )

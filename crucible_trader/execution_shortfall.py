@@ -43,6 +43,7 @@ import datetime as dt
 import json
 from collections.abc import Sequence
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from crucible.execution import (
     DECISION_PRICE_BASIS,
@@ -66,6 +67,8 @@ __all__ = [
 ]
 
 MODULE = "crucible_trader.execution_shortfall"
+
+NEW_YORK = ZoneInfo("America/New_York")
 
 Side = Literal["buy", "sell"]
 
@@ -258,7 +261,8 @@ def _envelope(
     return {
         "schema_version": EXECUTION_SHORTFALL_SCHEMA_VERSION,
         "trading_day": trading_day,
-        "calendar_date": now.astimezone(dt.UTC).date().isoformat(),
+        # The New York date, like the run's own (`daily_session`, I13447).
+        "calendar_date": now.astimezone(NEW_YORK).date().isoformat(),
         "champion": champion,
         "decision_price_basis": DECISION_PRICE_BASIS,
         "shortfall_scope": "filled_quantity_vs_decision_price",

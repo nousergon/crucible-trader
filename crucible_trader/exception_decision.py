@@ -666,11 +666,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         as_of = as_of_date.isoformat()
         while not is_trading_day(dt.date.fromisoformat(as_of)):
             as_of = (dt.date.fromisoformat(as_of) - dt.timedelta(days=1)).isoformat()
+        proposals = load_proposals(reader, until=as_of)
         document = score(
-            load_proposals(reader, until=as_of),
+            proposals,
             load_decisions(reader),
             as_of=as_of,
             generated_at=_now(),
+            # As the job's step 5f scores (codex 09f52012): without the records
+            # every item's amount, unit, tier and cited records read empty.
+            exceptions=load_exception_records(reader, (str(p["trading_day"]) for p in proposals)),
         )
     except DecisionError as exc:
         sys.stderr.write(f"refused: {exc}\n")

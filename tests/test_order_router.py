@@ -95,6 +95,9 @@ def _config(**overrides) -> RouterConfig:
         address=PAPER,
         max_order_notional_usd=50_000.0,
         max_session_notional_usd=100_000.0,
+        # Every buy at the session start: the timed path is tested in
+        # `test_entry_timing.py`.
+        entry_timing=None,
     )
     return dataclasses.replace(base, **overrides)
 

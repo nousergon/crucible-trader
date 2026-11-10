@@ -64,6 +64,20 @@ fill price the share-weighted mean of the executions; decision prices from
 (v1's fix for a cold data farm that nan'd a whole book), subscription released
 in a `finally`.
 
+**Buys wait for their entry trigger** (`crucible_trader.entry_timing`, Brian
+2026-11-09). Sells go out at the session start; with
+:attr:`RouterConfig.entry_timing` set -- the default, v1's parameters -- the buys
+are held and released one poll at a time by v1's pullback / VWAP discount /
+support bounce / graduated / expiry triggers on streaming IB quotes, so the
+session runs until the last buy is released (at the latest v1's 15:55 ET
+expiry) or the market closes. Each released
+buy is its own batch, so `session_cycle` re-checks the kill switch before it and
+:meth:`PaperOrderRouter.send` before its order, exactly as for the open's batch;
+the watch also re-reads the switch on every poll. The idempotency key is
+unchanged -- one order per name per trading day -- and a buy this day's broker
+already knows is adopted at once rather than watched. :data:`ENTRY_TIMING_VAR`
+``immediate`` restores the old behaviour (every buy at the open).
+
 **Declared scope:** an order still working when the fill wait ends is left
 working (a DAY order), and its record carries the broker status and what filled
 so far. An adopted order's `submitted_at` is its decision instant, because the
@@ -74,10 +88,11 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import itertools
 import math
 import os
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 from crucible.slots.strategy import CASH_TICKER
@@ -86,6 +101,15 @@ from crucible.store import Store
 from crucible_trader.broker_session import GatewayAddress, connect, load_sdk
 from crucible_trader.broker_statement import PAPER_ACCOUNT_PREFIX, IbPaperStatementSource
 from crucible_trader.construction import TargetBook
+from crucible_trader.entry_timing import (
+    NYSE_ZONE,
+    EntryTimingParams,
+    EntryWatch,
+    IbIntradayQuotes,
+    WatchedEntry,
+    entry_trigger,
+    panel_support_levels,
+)
 from crucible_trader.execution_shortfall import (
     Fill,
     SizingDecision,
@@ -101,6 +125,8 @@ from crucible_trader.order_intent import (
     bought_by_this_trader,
     claim_order_intent,
     order_intent_document,
+    order_intent_key,
+    read_order_intent,
 )
 
 __all__ = [
@@ -133,6 +159,13 @@ STAGING_ENVIRONMENT = "staging"
 ACCOUNT_VAR = "CRUCIBLE_TRADER_IB_ACCOUNT"
 MAX_ORDER_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD"
 MAX_SESSION_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD"
+
+#: When the buys go out. Unset or ``v1_triggers``: held for v1's entry triggers
+#: (`crucible_trader.entry_timing`). ``immediate``: at the session start with the
+#: sells, the behaviour before 2026-11-09. Anything else is refused.
+ENTRY_TIMING_VAR = "CRUCIBLE_TRADER_ENTRY_TIMING"
+ENTRY_TIMING_TRIGGERED = "v1_triggers"
+ENTRY_TIMING_IMMEDIATE = "immediate"
 
 #: IB Gateway's PAPER API port (v1 `config/risk.yaml.example`: "4002 = paper
 #: trading"). The only port this router will connect an order session to.
@@ -264,6 +297,8 @@ class RouterConfig:
     address: GatewayAddress | None = None
     max_order_notional_usd: float | None = None
     max_session_notional_usd: float | None = None
+    #: v1's entry triggers, or None to send every buy at the session start.
+    entry_timing: EntryTimingParams | None = EntryTimingParams()
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -293,12 +328,20 @@ class RouterConfig:
         account = (source.get(ACCOUNT_VAR) or "").strip()
         if not account:
             raise RouterSettingsError(f"{ACCOUNT_VAR} is unset; routing names its paper account")
+        timing = (source.get(ENTRY_TIMING_VAR) or "").strip()
+        if timing not in ("", ENTRY_TIMING_TRIGGERED, ENTRY_TIMING_IMMEDIATE):
+            raise RouterSettingsError(
+                f"{ENTRY_TIMING_VAR}={timing!r} is not an entry timing. Unset or "
+                f"{ENTRY_TIMING_TRIGGERED!r} holds buys for v1's triggers; "
+                f"{ENTRY_TIMING_IMMEDIATE!r} sends them at the session start."
+            )
         return cls(
             enabled=True,
             account=account,
             address=GatewayAddress.from_env(dict(source)),
             max_order_notional_usd=_positive_float(source, MAX_ORDER_NOTIONAL_VAR),
             max_session_notional_usd=_positive_float(source, MAX_SESSION_NOTIONAL_VAR),
+            entry_timing=None if timing == ENTRY_TIMING_IMMEDIATE else EntryTimingParams(),
         )
 
 
@@ -712,6 +755,8 @@ class PaperOrderRouter:
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
+        self._watch: EntryWatch | None = None
+        self._intraday: IbIntradayQuotes | None = None
 
     @property
     def records(self) -> tuple[ExecutionRecord, ...]:
@@ -745,7 +790,178 @@ class PaperOrderRouter:
         )
         self._planned = sells + buys
         # Sells first, so their proceeds are cash before the buys go out.
-        return [batch for batch in (sells, buys) if batch]
+        if self._config.entry_timing is None or not buys:
+            return [batch for batch in (sells, buys) if batch]
+        opening = [sells] if sells else []
+        return itertools.chain(opening, self._timed_entries(self._config.entry_timing, buys, sells))
+
+    def _timed_entries(
+        self,
+        params: EntryTimingParams,
+        buys: Sequence[PlannedOrder],
+        sells: Sequence[PlannedOrder],
+    ) -> Iterator[tuple[PlannedOrder, ...]]:
+        """The buys, each released as its own batch when its trigger fires."""
+        now = self._clock()
+        schedule = params.schedule(now.astimezone(NYSE_ZONE).date())
+        by_key = {order.key: order for order in buys}
+        support = panel_support_levels(
+            self._store,
+            self._day,
+            [o.decision.symbol for o in buys],
+            lookback_days=params.support_lookback_days,
+        )
+        watch = EntryWatch(
+            self._store,
+            trading_day=self._day,
+            params=params,
+            schedule=schedule,
+            entries=[
+                WatchedEntry(
+                    symbol=o.decision.symbol,
+                    order_key=o.key,
+                    quantity=int(o.decision.quantity),
+                    reference_price=float(o.decision.decision_price),
+                    decided_at=o.decision.decided_at,
+                    support_level=support.get(o.decision.symbol),
+                )
+                for o in buys
+            ],
+        )
+        self._watch = watch
+        spent = sum(o.decision.quantity * o.decision.decision_price for o in sells)
+        unknown: list[OrderIntentConflictError] = []
+        quotes = IbIntradayQuotes(self._client, self._sdk)
+        self._intraday = quotes
+        try:
+            # A rerun of the day: a buy the broker already knows is adopted now, and
+            # one with an intent the broker does not know is UNKNOWN -- never sent,
+            # and the session fails on it once every other buy has had its chance.
+            known = self._known_refs()
+            adopted: list[WatchedEntry] = []
+            for entry in watch.entries:
+                if entry.order_key in known:
+                    entry.status, entry.trigger = "triggered", "adopted: already at the broker"
+                    adopted.append(entry)
+                elif (
+                    intent := read_order_intent(self._store, self._day, entry.symbol)
+                ) is not None:
+                    entry.status = "not_sent"
+                    entry.trigger = "unknown: an intent exists and the broker has no order"
+                    unknown.append(
+                        OrderIntentConflictError(order_intent_key(self._day, entry.symbol), intent)
+                    )
+            if adopted:
+                watch.write(now)
+                yield tuple(by_key[e.order_key] for e in adopted)
+                for entry in adopted:
+                    entry.status = "sent"
+            quotes.subscribe(e.symbol for e in watch.waiting())
+            watch.write(self._clock())
+            while watch.waiting():
+                # The switch is re-read on every poll, not only before a batch.
+                assert_trading_permitted(self._store, self._day)
+                if not self._client.isConnected():
+                    raise RoutingRefusedError(
+                        f"the gateway connection dropped with {len(watch.waiting())} buy(s) "
+                        "still waiting; they were not sent"
+                    )
+                now = self._clock()
+                watch.polled_at = now
+                if now >= schedule.closes_at:
+                    for entry in watch.waiting():
+                        entry.status, entry.trigger = "not_sent", "market closed before a trigger"
+                    break
+                released: list[tuple[WatchedEntry, PlannedOrder]] = []
+                for entry in watch.waiting():
+                    seen = entry.observe(quotes(entry.symbol))
+                    reason = entry_trigger(
+                        reference_price=entry.reference_price,
+                        quote=seen,
+                        now=now,
+                        schedule=schedule,
+                        params=params,
+                        support_level=entry.support_level,
+                    )
+                    if reason is None:
+                        continue
+                    order = self._release(by_key[entry.order_key], entry, reason, now, spent)
+                    if order is not None:
+                        spent += order.decision.quantity * (entry.release_price or 0.0)
+                        released.append((entry, order))
+                watch.write(now, force=bool(released))
+                if released:
+                    yield tuple(order for _, order in released)
+                    for entry, _ in released:
+                        entry.status = "sent"
+                if watch.waiting():
+                    self._client.sleep(params.poll_interval_s)
+            watch.state = "complete"
+        finally:
+            quotes.close()
+            no_vwap = sorted(
+                e.symbol for e in watch.entries if e.last is not None and e.vwap is None
+            )
+            if no_vwap:
+                # Fail-safe, not silent: the VWAP trigger could not fire for these.
+                print(
+                    f"order_router: no VWAP was streamed for {', '.join(no_vwap)}; "
+                    "the VWAP-discount trigger could not fire for them",
+                    file=sys.stderr,
+                )
+            if watch.state == "watching":
+                watch.state = "stopped"
+            watch.write(self._clock())
+        if unknown:
+            raise UnknownOrderStateError(unknown)
+
+    def _release(
+        self,
+        order: PlannedOrder,
+        entry: WatchedEntry,
+        reason: str,
+        now: dt.datetime,
+        spent: float,
+    ) -> PlannedOrder | None:
+        """The order a fired trigger sends, re-held to the caps at the price now.
+
+        The shares were sized at the session start; the price may have moved since.
+        The per-order and per-session caps are re-checked at the last price seen and
+        the order clipped to them -- never enlarged. The decision (price and instant)
+        is the one taken at the session start, so the shortfall measures the wait.
+        """
+        price = entry.last if entry.last is not None else entry.reference_price
+        room = min(
+            float(self._config.max_order_notional_usd or 0.0),
+            float(self._config.max_session_notional_usd or 0.0) - spent,
+        )
+        quantity = entry.quantity
+        if quantity * price > room:
+            quantity = max(0, math.floor(room / price))
+        entry.trigger, entry.released_at, entry.release_price = reason, now, price
+        if quantity == 0:
+            entry.status = "not_sent"
+            entry.trigger = f"{reason}; the notional caps leave no room at {price:.2f}"
+            return None
+        entry.status, entry.released_quantity = "triggered", quantity
+        if quantity == entry.quantity:
+            return order
+        d = order.decision
+        print(
+            f"order_router: {d.symbol} {entry.quantity} shares at {price} exceeds the caps at "
+            f"its trigger; clipped to {quantity}",
+            file=sys.stderr,
+        )
+        return PlannedOrder(
+            trading_day=order.trading_day,
+            decision=decide(d.symbol, d.side, quantity, price=d.decision_price, now=d.decided_at),
+        )
+
+    def entry_watch_payload(self, now: dt.datetime) -> tuple[str, bytes] | None:
+        """The day's final entry-watch document, or None when no buy was held."""
+        if self._watch is None:
+            return None
+        return self._watch.key, self._watch.payload(now)
 
     def held_weights(self, portfolio_notional_usd: float) -> dict[str, float]:
         """The account's positions as the book held into the session (`held_weights`)."""
@@ -885,6 +1101,8 @@ class PaperOrderRouter:
         )
 
     def close(self) -> None:
+        if self._intraday is not None:
+            self._intraday.close()
         self._client.disconnect()
 
     def hard_risk_facts(self) -> BrokerFacts:

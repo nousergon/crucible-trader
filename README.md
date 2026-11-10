@@ -104,6 +104,14 @@ The box runs from about 08:15 to between 17:10 and 17:50 New York time. The v2
 last closed session are advanced the next morning, and the broker is reconciled
 before the box stops.
 
+**A routed session starts only in market hours** (`alpha-engine-config-I13447`).
+With routing on, a session that starts outside 09:30 ET to the close on a
+trading day (13:00 on an early-close day) is held: the run is `ok`, its
+`trader_session_served` metric is 0 and says "outside market hours", and no
+router or gateway connection is opened. The check is made only at the start.
+Shadow and simulated sessions are not checked. The run's `calendar_date` is the
+New York date.
+
 **A shadow session counts as a served day** (ruling 2). With routing off, the
 session resolves the champion, builds the book, records the day in
 `trader/evidence.json` with `session_modes[day] = "shadow"` and files a
@@ -126,6 +134,16 @@ on the paper port `4002`, and two caps with no defaults:
 every order. It never trades a position its own book does not name. Its
 `orderRef` is keyed by trading day and symbol, so a retried session adopts the
 orders it already sent and does not send them again.
+
+**Buys wait for the right moment** (`crucible_trader.entry_timing`, ported from
+the v1 executor's entry triggers). Sells go out when the session starts. Each
+buy is held and sent when the price pulls back 2% from the day's high, is 0.5%
+below the day's VWAP, or sits within 1% above its 20-session low, or from
+15:30 ET when it is within 1% of the price it was sized at, or unconditionally
+at 15:55 ET (earlier on a half day). The session therefore runs until the last
+buy is sent. While it waits, `trader/entry_watch/{day}.json` lists every
+waiting buy and what released each one. `CRUCIBLE_TRADER_ENTRY_TIMING=immediate`
+sends every buy at the start instead.
 
 ## Where the rest lives
 
