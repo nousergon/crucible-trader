@@ -123,4 +123,6 @@ def session_cycle(
         # Read leniently: a constructor double carries neither.
         "turnover_one_way": getattr(book, "turnover_one_way_ratio", None),
         "turnover_budget": getattr(book, "turnover_budget", None),
+        # v1 parity row 16: why it moved that far, for the churn alarm.
+        "turnover_drivers": getattr(book, "turnover_drivers", None),
     }
