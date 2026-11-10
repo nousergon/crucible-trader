@@ -90,6 +90,26 @@ and each timed buy as soon as its batch returns (`order_router`), so a run
 that fails at 13:00 leaves every name it holds by then protected. The
 end-of-session re-assertion here is the backstop: it keeps what already
 stands, places what the day could not, and is the step that fails the run.
+
+**A routed session starts only inside the regular session**
+(`alpha-engine-config-I13447`). On 2026-11-09 at 20:36 ET a routed session
+started after hours: a changed timer was reloaded on a box that was still up,
+and systemd fired it at once. It held only because the day's feed had not been
+published yet. :func:`outside_market_hours` is checked before the router is
+built or the gateway is connected. Outside 09:30 ET to the close on a trading
+day (13:00 on an early-close day), the session is HELD: the run is `ok`, its
+`trader_session_served` metric is 0 and names the reason, and nothing is routed
+or recorded. The check is made at START only. A session that started in hours
+may run past its start, and later past the close. Shadow and simulated
+sessions are not checked, because they route nothing.
+
+**Its calendar date is the New York date.** The harness stamps
+`calendar_date` from the UTC date, which is the next day after 20:00 ET (19:00
+in winter). So :func:`_bind_new_york_calendar_date` re-stamps it, and the
+manifest and evidence of the 20:36 ET run read 11-09, not 11-10. The
+`trading_day` the run binds to was already New York's: `crucible.runner`
+resolves it through `crucible.calendar.resolve_trading_day`, which converts to
+New York time before it asks which session last closed.
 """
 
 from __future__ import annotations
@@ -110,6 +130,7 @@ from crucible.models import TraderEvidenceBench
 from crucible.portfolio import PortfolioParamsError, load_portfolio_params_from_store
 from crucible.runner import RunContext, run_job
 from crucible.store import Store
+from krepis.trading_calendar import session_close_et
 
 from crucible_trader.broker_session import GatewayAddress, OrderRefusedError, connect, load_sdk
 from crucible_trader.construction import (
@@ -154,6 +175,7 @@ __all__ = [
     "ReadOnlyHoldControl",
     "daily_session_cycle",
     "main",
+    "outside_market_hours",
     "run_daily_session",
     "run_staging_session",
 ]
@@ -167,6 +189,10 @@ METRIC_MODULE = "crucible_trader.daily_session"
 NYSE_ZONE = ZoneInfo("America/New_York")
 
 log = logging.getLogger(__name__)
+
+#: The NYSE regular session's open. A routed session starts at or after it.
+#: `krepis.trading_calendar` holds the same value but does not export it.
+SESSION_OPEN_ET = dt.time(9, 30)
 
 #: The router surface this module relies on beyond `session.OrderRouter`.
 RouterFactory = Callable[..., Any]
@@ -186,6 +212,46 @@ class ReadOnlyHoldControl(IbBrokerControl):
         raise OrderRefusedError(
             f"the session's hold-book control never closes a position ({symbol})"
         )
+
+
+def outside_market_hours(now: dt.datetime) -> str | None:
+    """Why a ROUTED session may not start at ``now``, or None when it may.
+
+    A routed session may start on an NYSE trading day from 09:30 ET until the
+    session's close. The close is 16:00 ET, or 13:00 ET on an early-close day
+    (`krepis.trading_calendar.session_close_et`, the calendar
+    `crucible.calendar` wraps). The open is inclusive and the close is
+    exclusive, so a 09:35 start is in hours and a start at the close is not.
+
+    ``now`` must be timezone-aware. A naive time could be read in either zone,
+    and the incident this guards was a UTC/New York confusion.
+    """
+    if now.tzinfo is None:
+        raise ValueError(f"outside_market_hours needs an aware time, got naive {now.isoformat()}")
+    local = now.astimezone(NYSE_ZONE)
+    day = local.date()
+    stamp = f"{local:%Y-%m-%d %H:%M:%S} ET"
+    if not is_trading_day(day):
+        return f"outside market hours: {stamp} is not on an NYSE trading day"
+    close = session_close_et(day)
+    if not SESSION_OPEN_ET <= local.time() < close:
+        return (
+            f"outside market hours: {stamp} is outside the regular session "
+            f"({SESSION_OPEN_ET:%H:%M}-{close:%H:%M} ET on {day.isoformat()})"
+        )
+    return None
+
+
+def _bind_new_york_calendar_date(ctx: RunContext) -> None:
+    """Re-stamp the run's `calendar_date` with the New York date it started on.
+
+    `crucible.runner.run_job` stamps it from the UTC date. Between 20:00 ET
+    (19:00 in winter) and midnight, that is the next day. The field is
+    provenance only (`run_manifest.v2`), so it may be corrected. It is set on
+    the context the harness writes the manifest from, before any output is
+    recorded.
+    """
+    ctx.calendar_date = ctx.started.astimezone(NYSE_ZONE).date()
 
 
 def _metric(ctx: RunContext, *, served: bool, reason: str) -> dict[str, Any]:
@@ -433,6 +499,26 @@ def run_daily_session(
     opened: list[Any] = []
 
     def body(ctx: RunContext) -> dict[str, Any]:
+        _bind_new_york_calendar_date(ctx)
+        if router_config.enabled:
+            refusal = outside_market_hours(ctx.started)
+            if refusal is not None:
+                # Failure mode swallowed: a routed session started outside the
+                # regular session (I13447: systemd fired one at 20:36 ET). Why
+                # the deliverable survives: no router is built and no gateway
+                # is connected, so no order can be routed, and nothing is
+                # recorded, so the day stays unserved. The timer's next firing
+                # in hours is the real session. Recording surface: the
+                # `trader_session_served` metric (0, naming the reason) and the
+                # returned document. The run is `ok` because a HOLD is not a
+                # failure, so this does not page as one.
+                ctx.record_metric(_metric(ctx, served=False, reason=f"held: {refusal}"))
+                return {
+                    "trading_day": ctx.trading_day.isoformat(),
+                    "session_mode": "live",
+                    "outcome": "held",
+                    "held_reason": refusal,
+                }
         router = router_factory(
             router_config,
             store=ctx.store,
@@ -493,6 +579,7 @@ def run_staging_session(
     """
 
     def body(ctx: RunContext) -> dict[str, object]:
+        _bind_new_york_calendar_date(ctx)
         day = ctx.trading_day.isoformat()
         router: SimulatedFillRouter | ShadowRouter = (
             SimulatedFillRouter(config, store=ctx.store, trading_day=day, clock=clock)
