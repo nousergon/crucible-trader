@@ -395,7 +395,7 @@ def test_backfills_run_in_date_order_between_the_postings(root, monkeypatch):
 
     monkeypatch.setattr(back_office_dry_run, "post_daily_ledger", post)
     backfill = {
-        day: (lambda d=day: order.append(f"backfill {d}"))
+        day: (lambda _store, d=day: order.append(f"backfill {d}"))
         for day in ("2026-10-05", "2026-08-31", "2026-09-30")
     }
     # 09-30's backfill reconciled nothing (its reconcile failed): a day without one.
@@ -416,5 +416,5 @@ def test_a_month_whose_only_backfill_reconciled_nothing_is_refused(tmp_path):
             open_store(str(tmp_path / "empty"), dry_run=True),
             month="2026-09",
             now=NOW,
-            backfill={"2026-09-09": lambda: None},
+            backfill={"2026-09-09": lambda _store: None},
         )
