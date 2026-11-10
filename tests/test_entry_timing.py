@@ -317,6 +317,17 @@ def test_the_watch_document_names_every_waiting_buy(tmp_path) -> None:
     assert row["decided_at_utc"] == "2026-09-08T13:35:00Z" and row["released_at_utc"] is None
 
 
+def test_the_watch_document_names_the_release_that_is_watching(tmp_path, monkeypatch) -> None:
+    """alpha-engine-config-I12024: the market-open notice reads the release here."""
+    store = LocalStore(tmp_path)
+    monkeypatch.setenv("CRUCIBLE_CODE_SHA", "811eb9b0d1")
+    _watch(store).write(et(9, 35))
+    assert json.loads(store.get_bytes(entry_watch_key(DAY)))["code_sha"] == "811eb9b0d1"
+    monkeypatch.delenv("CRUCIBLE_CODE_SHA")
+    _watch(store).write(et(9, 36))
+    assert json.loads(store.get_bytes(entry_watch_key(DAY)))["code_sha"] is None
+
+
 def test_a_heartbeat_write_waits_for_the_heartbeat(tmp_path) -> None:
     store = LocalStore(tmp_path)
     watch = _watch(store)
