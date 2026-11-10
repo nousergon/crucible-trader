@@ -129,6 +129,39 @@ IMPLEMENTED_RULES: Mapping[str, Implementation] = {
             "::test_high_conviction_is_not_throttled"
         ),
     ),
+    # crucible-trader#139 (merged 2026-11-10). Its mirror for sells (#150) is a v2
+    # addition with no v1 row; it rides the same module.
+    "entry_timing": Implementation(
+        location="crucible-trader:crucible_trader/entry_timing.py:entry_trigger",
+        test=(
+            "crucible-trader:tests/test_entry_timing.py"
+            "::test_a_two_percent_pullback_from_the_high_releases_the_buy"
+        ),
+    ),
+    # crucible-trader#140: standing GTC STP SELL on every held long.
+    "broker_stop": Implementation(
+        location="crucible-trader:crucible_trader/order_router.py:PaperOrderRouter.protect_holdings",
+        test=(
+            "crucible-trader:tests/test_nav_sizing_and_stops.py"
+            "::test_every_held_long_gets_one_gtc_stop_after_the_sessions_orders"
+        ),
+    ),
+    # crucible-trader#140: a live session sizes on min(declared notional, NetLiquidation).
+    "nav_sizing": Implementation(
+        location="crucible-trader:crucible_trader/order_router.py:read_net_liquidation",
+        test=(
+            "crucible-trader:tests/test_nav_sizing_and_stops.py"
+            "::test_the_router_sizes_on_the_nav_with_the_declared_notional_as_ceiling"
+        ),
+    ),
+    # crucible-trader#144. Not a money-path rule, so it was never in OWED_RULES.
+    "turnover_tripwire": Implementation(
+        location="crucible-trader:crucible_trader/turnover_tripwire.py:check",
+        test=(
+            "crucible-trader:tests/test_turnover_tripwire.py"
+            "::TestTheBands::test_churn_by_small_moves_is_a_rolling_breach"
+        ),
+    ),
 }
 
 
@@ -145,13 +178,14 @@ CI_ENFORCE_FROM = dt.date(2026, 11, 30)
 #: carrying a `deferred` executor parameter). A PR that implements one moves it
 #: to :data:`IMPLEMENTED_RULES`; a ruling that excludes or supersedes one
 #: drops it here in the same change as the record.
+#:
+#: ``gap_stop_intraday`` stays owed: crucible-trader#143 checks the gap once, at
+#: the session start; v1 polled it every 60 s all day.
 OWED_RULES: frozenset[str] = frozenset(
     {
-        "broker_stop",
         "gap_stop_intraday",
         "position_loss_floor",
         "drawdown_ladder",
-        "nav_sizing",
         "negative_alpha_exit",
         "hard_risk_reentry_lockout",
         "hard_risk_precedence",
@@ -160,7 +194,6 @@ OWED_RULES: frozenset[str] = frozenset(
         "intraday_resolve",
         "stance_caps",
         "rebalance_band",
-        "entry_timing",
     }
 )
 
