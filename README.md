@@ -104,6 +104,14 @@ The box runs from about 08:15 to between 17:10 and 17:50 New York time. The v2
 last closed session are advanced the next morning, and the broker is reconciled
 before the box stops.
 
+**A routed session starts only in market hours** (`alpha-engine-config-I13447`).
+With routing on, a session that starts outside 09:30 ET to the close on a
+trading day (13:00 on an early-close day) is held: the run is `ok`, its
+`trader_session_served` metric is 0 and says "outside market hours", and no
+router or gateway connection is opened. The check is made only at the start.
+Shadow and simulated sessions are not checked. The run's `calendar_date` is the
+New York date.
+
 **A shadow session counts as a served day** (ruling 2). With routing off, the
 session resolves the champion, builds the book, records the day in
 `trader/evidence.json` with `session_modes[day] = "shadow"` and files a

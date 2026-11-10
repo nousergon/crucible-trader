@@ -27,6 +27,7 @@ from ib_fakes import FakeIB, FakeSdk, ctx_for, environ_for
 from test_contract import ARM, _feed, _put
 from test_contract import _serveable as _contract_holds
 from test_order_router import _book as order_book
+from test_order_router import _config as routed_config
 from test_session import SHA, VERSION, _halt, _pin_document
 from test_simulated_broker import write_panel
 
@@ -762,3 +763,260 @@ class TestTheSessionRecordsItsTurnover:
         document = json.loads(store.get_bytes(simulated_positions_key(BOUND)))
         assert document["carried_from"] is None
         assert document["positions"] == {"AAA": 300, "BBB": 400}
+
+
+# -- a routed session starts only in market hours (alpha-engine-config-I13447) --
+
+#: 2026-11-10 01:36:16Z is Monday 2026-11-09 20:36:16 ET (EST, UTC-5). A routed
+#: session started then on the box. It binds to Monday's session, the last one
+#: closed, and its feed was published nine minutes later.
+INCIDENT = dt.datetime(2026, 11, 10, 1, 36, 16, tzinfo=dt.UTC)
+INCIDENT_BOUND = "2026-11-09"
+
+
+def _routed_job(store, *, clock, router=None, connector=None):
+    """Run a ROUTED session job; return the context and how far it got."""
+    built: list[object] = []
+    connected: list[object] = []
+    live = router if router is not None else LiveRouter()
+
+    def factory(config, **kw):
+        built.append(config)
+        return live
+
+    def connect():
+        connected.append("connection")
+        return FakeIB()
+
+    ctx = run_daily_session(
+        store,
+        connector=connector or connect,
+        sdk=FakeSdk(live._client),
+        router_config=routed_config(),
+        installed_version=VERSION,
+        clock=clock,
+        run_mode="live",
+        router_factory=factory,
+    )
+    return ctx, built, connected, live
+
+
+def _full_book(store_, **kwargs):
+    """A constructed book whose metric record validates, so the manifest is `ok`."""
+    return dataclasses.replace(
+        order_book(day=INCIDENT_BOUND),
+        metric={
+            "name": "portfolio_construction",
+            "module": "fixture",
+            "metric_type": "operational",
+            "value": 1.0,
+            "unit": "flag",
+            "n_floor": 1,
+            "status": "OK",
+            "status_reason": "fixture book",
+            "source_path": "fixture",
+            "last_updated_utc": "2026-11-10T14:35:00Z",
+        },
+    )
+
+
+def _served_metric(manifest: dict) -> dict:
+    (metric,) = [m for m in manifest["metrics"] if m["name"] == "trader_session_served"]
+    return metric
+
+
+class TestARoutedSessionStartsOnlyInMarketHours:
+    def test_the_2036_et_start_is_held_even_with_a_feed_and_routes_nothing(
+        self, store, monkeypatch
+    ) -> None:
+        """The incident, replayed with the feed already published (the case
+        that would have routed DAY market orders after hours)."""
+        _serveable(store, trading_day=INCIDENT_BOUND)
+        monkeypatch.setattr(module, "construct_target_book", _full_book)
+
+        ctx, built, connected, router = _routed_job(store, clock=lambda: INCIDENT)
+
+        assert built == [] and connected == []
+        assert router._client.order_calls == []
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, INCIDENT_BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
+        assert manifest["trading_day"] == INCIDENT_BOUND
+        # The New York date (Monday), not the UTC date (Tuesday).
+        assert manifest["calendar_date"] == "2026-11-09"
+        assert ctx.calendar_date == dt.date(2026, 11, 9)
+        metric = _served_metric(manifest)
+        assert metric["value"] == 0.0
+        assert metric["status_reason"] == (
+            "held: outside market hours: 2026-11-09 20:36:16 ET is outside the regular "
+            "session (09:30-16:00 ET on 2026-11-09)"
+        )
+        assert not store.exists(TRADER_EVIDENCE_KEY)
+        assert not store.exists(execution_shortfall_key(INCIDENT_BOUND))
+
+    def test_the_held_document_names_the_reason(self, store, monkeypatch) -> None:
+        captured: list[dict] = []
+        real = module.run_job
+
+        def spy(job, fn, **kw):
+            return real(job, lambda ctx: captured.append(fn(ctx)) or captured[-1], **kw)
+
+        monkeypatch.setattr(module, "run_job", spy)
+        _routed_job(store, clock=lambda: INCIDENT)
+
+        (document,) = captured
+        assert document["outcome"] == "held"
+        assert document["session_mode"] == "live"
+        assert document["held_reason"].startswith("outside market hours")
+
+    def test_a_0935_et_start_is_served(self, store, monkeypatch) -> None:
+        """Draft #139's start time. 09:35 EST is 14:35Z; it binds to Monday."""
+        _serveable(store, trading_day=INCIDENT_BOUND)
+        monkeypatch.setattr(module, "construct_target_book", _full_book)
+        start = dt.datetime(2026, 11, 10, 14, 35, tzinfo=dt.UTC)
+
+        ctx, built, _, router = _routed_job(store, clock=lambda: start)
+
+        assert built == [routed_config()]
+        assert router.closed == 1
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, INCIDENT_BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
+        assert (manifest["trading_day"], manifest["calendar_date"]) == (
+            INCIDENT_BOUND,
+            "2026-11-10",
+        )
+        assert _served_metric(manifest)["value"] == 1.0
+        evidence = json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))
+        assert evidence["session_modes"] == {INCIDENT_BOUND: "live"}
+        assert evidence["calendar_date"] == "2026-11-10"
+        assert ctx.trading_day.isoformat() == INCIDENT_BOUND
+
+    def test_a_session_that_started_in_hours_may_run_past_the_close(
+        self, store, monkeypatch
+    ) -> None:
+        """The guard is on START. Draft #139's all-day session keeps its clock
+        running after the start, and later past the close."""
+        _serveable(store, trading_day=INCIDENT_BOUND)
+        monkeypatch.setattr(module, "construct_target_book", _full_book)
+        start = dt.datetime(2026, 11, 10, 20, 59, 59, tzinfo=dt.UTC)  # 15:59:59 ET
+        later = dt.datetime(2026, 11, 10, 22, 0, tzinfo=dt.UTC)  # 17:00 ET
+        ticks = iter([start])
+
+        _routed_job(store, clock=lambda: next(ticks, later))
+
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, INCIDENT_BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
+        assert _served_metric(manifest)["value"] == 1.0
+
+    def test_a_shadow_session_after_hours_is_not_checked(self, store, monkeypatch) -> None:
+        """Shadow routes nothing, so it runs as before. Its calendar date is
+        New York's too."""
+        _serveable(store, trading_day=INCIDENT_BOUND)
+        monkeypatch.setattr(module, "construct_target_book", _full_book)
+        ib = FakeIB()
+
+        run_daily_session(
+            store,
+            connector=lambda: ib,
+            sdk=FakeSdk(ib),
+            router_config=RouterConfig(enabled=False),
+            installed_version=VERSION,
+            clock=lambda: INCIDENT,
+            run_mode="live",
+            router_factory=lambda config, **kw: build_router(config, **kw),
+        )
+
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, INCIDENT_BOUND)))
+        assert manifest["calendar_date"] == "2026-11-09"
+        assert json.loads(store.get_bytes(TRADER_EVIDENCE_KEY))["session_modes"] == {
+            INCIDENT_BOUND: "shadow"
+        }
+
+    def test_a_staging_simulated_session_after_hours_is_not_checked(
+        self, store, monkeypatch
+    ) -> None:
+        _simulated_world(store, monkeypatch)
+        late = dt.datetime(2026, 9, 12, 0, 30, tzinfo=dt.UTC)  # Fri 09-11 20:30 ET
+
+        code = main(
+            [],
+            environ=_staging_env(store),
+            sdk_loader=_no_sdk,
+            version_reader=lambda: VERSION,
+            clock=lambda: late,
+            printer=lambda line: None,
+        )
+
+        assert code == 0
+        late_bound = "2026-09-11"
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, late_bound)))
+        assert manifest["calendar_date"] == "2026-09-11"
+        assert _served_metric(manifest)["value"] == 0.0  # no feed for 09-11: held as before
+        assert "outside market hours" not in _served_metric(manifest)["status_reason"]
+
+    def test_the_entry_point_holds_an_after_hours_routed_start(self, store) -> None:
+        said: list[str] = []
+        env = environ_for(
+            store.root,
+            CRUCIBLE_TRADER_ORDER_ROUTING="ib_paper",
+            CRUCIBLE_TRADER_IB_ACCOUNT="DU1",
+            CRUCIBLE_TRADER_IB_PORT="4002",
+            CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD="1000",
+            CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD="5000",
+        )
+
+        code = main(
+            [],
+            environ=env,
+            sdk_loader=FakeSdk(FakeIB()),
+            version_reader=lambda: VERSION,
+            clock=lambda: INCIDENT,
+            printer=said.append,
+            router_factory=lambda config, **kw: pytest.fail("a router was built after hours"),
+        )
+
+        assert code == 0
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, INCIDENT_BOUND)))
+        assert manifest["status"] == "ok"
+        assert "outside market hours" in _served_metric(manifest)["status_reason"]
+
+
+def _et(year, month, day, hour, minute, second=0):
+    return dt.datetime(year, month, day, hour, minute, second, tzinfo=module.NYSE_ZONE)
+
+
+class TestOutsideMarketHours:
+    @pytest.mark.parametrize(
+        "now",
+        [
+            _et(2026, 11, 10, 9, 30),  # the open
+            _et(2026, 11, 10, 9, 35),  # draft #139's start
+            _et(2026, 11, 10, 14, 0),  # today's interim start
+            _et(2026, 11, 10, 15, 59, 59),
+            _et(2026, 11, 27, 12, 59, 59),  # day after Thanksgiving, closes 13:00
+            dt.datetime(2026, 7, 1, 13, 35, tzinfo=dt.UTC),  # 09:35 EDT
+        ],
+    )
+    def test_inside_the_regular_session_a_start_is_allowed(self, now) -> None:
+        assert module.outside_market_hours(now) is None
+
+    @pytest.mark.parametrize(
+        ("now", "says"),
+        [
+            (INCIDENT, "2026-11-09 20:36:16 ET is outside the regular session (09:30-16:00"),
+            (_et(2026, 11, 10, 9, 29, 59), "09:29:59 ET is outside"),
+            (_et(2026, 11, 10, 16, 0), "16:00:00 ET is outside"),
+            (_et(2026, 11, 27, 13, 0), "(09:30-13:00 ET on 2026-11-27)"),
+            (_et(2026, 11, 27, 14, 0), "(09:30-13:00 ET on 2026-11-27)"),
+            (_et(2026, 11, 26, 11, 0), "is not on an NYSE trading day"),  # Thanksgiving
+            (_et(2026, 11, 14, 11, 0), "is not on an NYSE trading day"),  # Saturday
+            (dt.datetime(2026, 7, 1, 13, 29, tzinfo=dt.UTC), "09:29:00 ET is outside"),
+        ],
+    )
+    def test_outside_it_a_start_is_refused_with_its_reason(self, now, says) -> None:
+        reason = module.outside_market_hours(now)
+        assert reason is not None and reason.startswith("outside market hours: ")
+        assert says in reason
+
+    def test_a_naive_time_is_refused_rather_than_guessed(self) -> None:
+        with pytest.raises(ValueError, match="aware"):
+            module.outside_market_hours(dt.datetime(2026, 11, 10, 14, 0))  # noqa: DTZ001

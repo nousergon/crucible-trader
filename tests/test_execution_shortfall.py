@@ -329,3 +329,14 @@ class TestASimulatedWeekIsNeverAMeasuredShortfall:
 
         assert not clause.met
         assert "simulated router at the close" in clause.detail
+
+
+def test_the_calendar_date_is_the_new_york_date() -> None:
+    """alpha-engine-config-I13447: 01:36Z on 11-10 is 20:36 ET on 11-09."""
+    document = build_no_orders_document(
+        trading_day="2026-11-09",
+        champion="m:arm:abc",
+        reason="fixture",
+        now=dt.datetime(2026, 11, 10, 1, 36, 16, tzinfo=dt.UTC),
+    )
+    assert document["calendar_date"] == "2026-11-09"
