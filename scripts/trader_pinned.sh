@@ -4,6 +4,7 @@
 #
 #   scripts/trader_pinned.sh daily_session [--run-mode live|replay]
 #   scripts/trader_pinned.sh shadow_books_daily
+#   scripts/trader_pinned.sh order_book_plan
 #
 # Same self-contained shape as `trader_reconcile.sh` and
 # `trader_paper_smoke.sh`: a FRESH virtualenv per invocation, built from the
@@ -20,6 +21,10 @@
 # CRUCIBLE_TRADER_ORDER_ROUTING=ib_paper is set, and nothing in this
 # repository or its box units sets it (`crucible_trader.order_router`).
 # `shadow_books_daily` never connects to the broker.
+# `order_book_plan` writes the day's order book before the open. It places no
+# order and builds no router; with routing on it reads the account's
+# positions through a READ-ONLY gateway session on its own client id
+# (CRUCIBLE_TRADER_PLAN_IB_CLIENT_ID), which it checks itself.
 #
 # Required environment (no defaults, by design): CRUCIBLE_TRADER_STORE_URI,
 # and for daily_session also CRUCIBLE_TRADER_IB_HOST, CRUCIBLE_TRADER_IB_PORT,
@@ -30,8 +35,9 @@ module="${1:-}"
 case "$module" in
   daily_session) required=(CRUCIBLE_TRADER_STORE_URI CRUCIBLE_TRADER_IB_HOST CRUCIBLE_TRADER_IB_PORT CRUCIBLE_TRADER_IB_CLIENT_ID) ;;
   shadow_books_daily) required=(CRUCIBLE_TRADER_STORE_URI) ;;
+  order_book_plan) required=(CRUCIBLE_TRADER_STORE_URI) ;;
   *)
-    echo "usage: $0 daily_session|shadow_books_daily [args...] (got '${module}')" >&2
+    echo "usage: $0 daily_session|shadow_books_daily|order_book_plan [args...] (got '${module}')" >&2
     exit 2
     ;;
 esac
