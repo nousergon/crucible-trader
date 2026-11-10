@@ -442,3 +442,18 @@ class TestQueueEvidence:
         store.put_bytes(f"trader/exceptions/{DAY}.json", json.dumps(document).encode())
         found = ed.load_exception_records(store, [DAY, DAY, "2026-09-14"])
         assert list(found) == ["exc-1"] and found["exc-1"]["amount"] == 107.69
+
+    def test_the_cli_score_carries_the_stored_records(self, store, tmp_path, capsys):
+        """codex 09f52012: the CLI rebuild scores as the job's step 5f does."""
+        put_proposals(store, proposal())
+        document = {
+            "schema_version": "exception.v1",
+            "trading_day": DAY,
+            "records": [exception_record()],
+        }
+        store.put_bytes(f"trader/exceptions/{DAY}.json", json.dumps(document).encode())
+        uri = str(tmp_path / "store")
+        assert ed.main(["--store", uri, "score", "--as-of", DAY]) == 0
+        (item,) = json.loads(capsys.readouterr().out)["queue"]
+        assert (item["amount"], item["unit"], item["tier"]) == (107.69, "usd", "page")
+        assert item["cited_records"]
