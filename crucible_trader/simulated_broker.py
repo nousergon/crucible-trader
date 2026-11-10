@@ -76,6 +76,18 @@ EARLIER trading day: the router plans against those shares and hands the
 daily session the same :func:`~crucible_trader.order_router.held_weights`
 prod derives from the broker statement. No document at all is inception (all
 cash), recorded as such in the next document's ``carried_from``.
+
+**Carried shares follow stock splits** (codex cfff90d3). The book is valued at
+the session's ``close_raw``, which a split rebases; shares carried unchanged
+across a 2:1 split would be valued at half and re-bought. Every split effective
+on a trading day after ``carried_from``, through the session's own day,
+rebases the carried shares (``floor(shares * split_to / split_from)``, the
+fractional share dropped as a broker pays it in cash). The splits come from
+the same Polygon scans the reconciler reads
+(:mod:`crucible_trader.corporate_action_feed`, ``CRUCIBLE_TRADER_CORPORATE_ACTION_SCANS_URI``).
+With that unset nothing is rebased and the document records ``splits: null``,
+never an empty list; with it set, a day whose scan is missing, or a split
+with no ratio on a carried name, refuses the session rather than guess.
 """
 
 from __future__ import annotations
@@ -90,6 +102,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, cast
 
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]  # no pandas-stubs in the lock; the read is cast at its one call
+from crucible.calendar import is_trading_day
 from crucible.keys import data_panel_key
 from crucible.store import Store
 
@@ -172,6 +185,101 @@ SIMULATED_POSITIONS_PREFIX = "trader/simulated_positions/"
 def simulated_positions_key(trading_day: str) -> str:
     """The simulated book's closing positions for a served staging session."""
     return f"{SIMULATED_POSITIONS_PREFIX}{trading_day}.json"
+
+
+#: ``day -> {symbol: ratio or None}`` for the splits effective that day, or
+#: ``None`` when the day's splits cannot be known.
+SplitSource = Callable[[str], Mapping[str, float | None] | None]
+
+
+def scan_split_source(base_uri: str, *, s3_client: object = None) -> SplitSource:
+    """Each day's splits from the corporate-action scans under ``base_uri``."""
+
+    def splits_on(day: str) -> Mapping[str, float | None] | None:
+        # Imported here: the feed imports the reconcile job, which the prod
+        # session never needs for this module's sake.
+        from crucible_trader.corporate_action_feed import (  # noqa: PLC0415
+            actions_from_scan,
+            ib_symbol,
+            read_scan,
+        )
+        from crucible_trader.reconciliation_job import previous_trading_day  # noqa: PLC0415
+
+        read = read_scan(base_uri, day, s3_client=s3_client)
+        if read.document is None:
+            return None
+        raw = read.document.get("splits")
+        rows = cast(list[dict[str, object]], raw if isinstance(raw, list) else [])
+        found = actions_from_scan(  # validates the scan; a bad one raises
+            read.document,
+            day=day,
+            universe=frozenset(ib_symbol(str(r.get("ticker"))) for r in rows),
+            holdings_on=lambda _day: None,  # dividends are not this reader's question
+            previous_trading_day=previous_trading_day,
+            uri=read.uri,
+        )
+        return {a.ticker: a.ratio for a in found.actions if a.kind == "split"}
+
+    return splits_on
+
+
+def split_source_from_env(env: Mapping[str, str] | None = None) -> SplitSource | None:
+    """The scans the box's environment names, or ``None`` when it names none."""
+    value = (env if env is not None else os.environ).get(SPLIT_SCANS_VAR, "").strip()
+    return scan_split_source(value) if value else None
+
+
+#: The reconciler's scans location (`crucible_trader.corporate_action_feed.SCANS_URI_ENV`),
+#: restated so the prod path never imports the feed for this module's sake.
+SPLIT_SCANS_VAR = "CRUCIBLE_TRADER_CORPORATE_ACTION_SCANS_URI"
+
+
+def apply_splits(
+    positions: Mapping[str, int],
+    *,
+    after: str,
+    through: str,
+    splits: SplitSource,
+) -> tuple[dict[str, int], list[dict[str, object]]]:
+    """``positions`` rebased by every split effective after ``after`` through
+    ``through`` (trading days), and what was applied. Raises
+    :class:`SimulatedBrokerError` for a day whose splits are unknown or a
+    carried name's split with no ratio."""
+    book = dict(positions)
+    applied: list[dict[str, object]] = []
+    day = dt.date.fromisoformat(after)
+    end = dt.date.fromisoformat(through)
+    while True:
+        day += dt.timedelta(days=1)
+        if day > end:
+            break
+        if not is_trading_day(day):
+            continue
+        found = splits(day.isoformat())
+        if found is None:
+            raise SimulatedBrokerError(
+                f"the corporate-action scan for {day} is missing; a carried book across an "
+                "unknown split would be valued at the wrong close"
+            )
+        for symbol in sorted(set(found) & set(book)):
+            ratio = found[symbol]
+            if ratio is None or not (math.isfinite(ratio) and ratio > 0):
+                raise SimulatedBrokerError(
+                    f"{symbol} split on {day} with no usable ratio ({ratio!r}); the carried "
+                    "shares cannot be rebased"
+                )
+            before = book[symbol]
+            book[symbol] = math.floor(before * ratio + 1e-9)
+            applied.append(
+                {
+                    "trading_day": day.isoformat(),
+                    "symbol": symbol,
+                    "ratio": ratio,
+                    "shares_before": before,
+                    "shares_after": book[symbol],
+                }
+            )
+    return {s: n for s, n in book.items() if n}, applied
 
 
 def opening_positions(store: Store, trading_day: str) -> tuple[dict[str, int], str | None]:
@@ -392,6 +500,7 @@ class SimulatedFillRouter:
         store: Store,
         trading_day: str,
         clock: Callable[[], dt.datetime] = utcnow,
+        splits: SplitSource | None = None,
     ) -> None:
         if not config.simulated:
             raise SimulatedFillsRefusedError(f"simulated fills are off ({SIMULATED_FILLS_VAR})")
@@ -403,6 +512,14 @@ class SimulatedFillRouter:
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
         self._opening, self._carried_from = opening_positions(store, trading_day)
+        self._splits: list[dict[str, object]] | None = None
+        source = split_source_from_env() if splits is None else splits
+        if source is not None:
+            self._splits = []
+            if self._carried_from is not None and self._opening:
+                self._opening, self._splits = apply_splits(
+                    self._opening, after=self._carried_from, through=trading_day, splits=source
+                )
 
     @property
     def opening(self) -> dict[str, int]:
@@ -443,6 +560,7 @@ class SimulatedFillRouter:
             "trading_day": trading_day,
             "generated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "carried_from": self._carried_from,
+            "splits": self._splits,
             "opening": dict(sorted(self._opening.items())),
             "positions": self.closing_positions(),
         }

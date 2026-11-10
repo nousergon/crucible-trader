@@ -78,6 +78,7 @@ from crucible_trader.broker_statement import BrokerStatement, statement_from_doc
 from crucible_trader.exception_decision import (
     DECISIONS_PREFIX,
     load_decisions,
+    load_exception_records,
     load_proposals,
     score,
 )
@@ -88,6 +89,7 @@ from crucible_trader.exception_proposal import (
     proposal_day_document,
     propose,
 )
+from crucible_trader.exception_record import exceptions_key
 from crucible_trader.ledger import LEDGER_JOURNAL_PREFIX, post_daily_ledger
 from crucible_trader.month_end_close import CloseSource, close_prior_month, month_trading_days
 from crucible_trader.performance_statement import file_statement
@@ -158,8 +160,9 @@ def _statement(store: Store, day: str) -> BrokerStatement:
 
 class _JournalsAsOf(Store):
     """``inner`` as the month's close run day saw it: every ledger journal
-    dated after ``as_of`` is hidden, everything else passes straight through
-    (writes included, so the capturing store still records them).
+    dated after ``as_of`` is hidden (and ``as_of``'s own too unless
+    ``include_as_of``), everything else passes straight through (writes
+    included, so the capturing store still records them).
 
     The dry run replays a past month into a store whose ledger has since moved
     on: the v2 ledger opened 2026-11-03, so October's run reads a store that
@@ -168,18 +171,24 @@ class _JournalsAsOf(Store):
     for the live job and refused every October day here, so the close was
     never attempted. On the run day those later journals did not exist yet,
     and this view is that store (`alpha-engine-config-I13124`).
+
+    The run day's own journal is hidden while the month is booked
+    (``include_as_of=False``): the run day is the next month's first trading
+    day, and once the live ledger has posted it every replayed day of the
+    month would sit behind it and be refused (codex facd7a3e). The close
+    itself runs ON the run day, so it sees that day's journal.
     """
 
-    def __init__(self, inner: Store, as_of: str) -> None:
+    def __init__(self, inner: Store, as_of: str, *, include_as_of: bool = True) -> None:
         self._inner = inner
         self._as_of = as_of
+        self._include_as_of = include_as_of
 
     def _hidden(self, key: str) -> bool:
-        return (
-            key.startswith(LEDGER_JOURNAL_PREFIX)
-            and key.endswith(".json")
-            and key.rsplit("/", 1)[-1].removesuffix(".json") > self._as_of
-        )
+        if not (key.startswith(LEDGER_JOURNAL_PREFIX) and key.endswith(".json")):
+            return False
+        day = key.rsplit("/", 1)[-1].removesuffix(".json")
+        return day > self._as_of or (day == self._as_of and not self._include_as_of)
 
     def put_bytes(
         self,
@@ -224,43 +233,36 @@ def dry_run(
     now: str,
     fills: Mapping[str, Sequence[Fill]] | None = None,
     closes: CloseSource | None = None,
+    backfill: Mapping[str, Callable[[], object]] | None = None,
 ) -> dict[str, object]:
     """Run the month's loop against ``store``, which must be a capturing
     (dry-run) store, and return the summary. Raises only for a store that
-    could write, or a month with nothing stored."""
+    could write, or a month with nothing stored.
+
+    ``backfill`` maps a missing day to the call that reconciles and books it
+    into ``store`` (the close rehearsal of an IB-statement backfill). Each
+    runs in date order between the stored days' postings, never all first: a
+    backfilled day's journal posted ahead of an earlier stored day would have
+    the ledger refuse that day as inserted behind a later journal (codex
+    d411bf68)."""
     capture = capture_ledger_of(store)
     if capture is None:
         raise ValueError("the dry run needs a capturing store: open it with dry_run=True")
     trading_days = month_trading_days(month)
+    pending = dict(sorted((backfill or {}).items()))
     stored = sorted(
-        day
-        for key in store.list_keys(RECONCILIATION_PREFIX)
-        if key.endswith(".json")
-        and (day := key.removeprefix(RECONCILIATION_PREFIX).removesuffix(".json")) in trading_days
+        {
+            day
+            for key in store.list_keys(RECONCILIATION_PREFIX)
+            if key.endswith(".json")
+            and (day := key.removeprefix(RECONCILIATION_PREFIX).removesuffix(".json"))
+            in trading_days
+        }
+        | (set(pending) & set(trading_days))
     )
     if not stored:
         raise ValueError(f"no stored reconciliation for any trading day of {month}")
     fills = fills or {}
-    unused_fills = sorted(set(fills) - set(stored))
-
-    # 1 + 2: export and propose, one day at a time.
-    records: list[dict[str, object]] = []
-    export_failures: list[dict[str, str]] = []
-    for day in stored:
-        try:
-            day_records = export_exceptions(store, since=day, until=day)
-        except Exception as exc:  # noqa: BLE001 - a day that cannot export is a finding
-            export_failures.append({"trading_day": day, "error": f"{exc}"[:400]})
-            continue
-        records.extend(day_records)
-        if day_records:
-            proposals = [propose(r, proposed_at=now) for r in day_records]
-            store.put_bytes(
-                exception_proposals_key(day),
-                json.dumps(
-                    proposal_day_document(day, proposals), indent=2, sort_keys=True
-                ).encode(),
-            )
 
     # 3: book every stored day into the ledger, oldest first. A day is posted
     # against the last statement the ledger accepted, so its fills are every
@@ -269,16 +271,23 @@ def dry_run(
     # into suspense (`alpha-engine-config-I13124`).
     # The first stored day opens against the newest statement before it, as the
     # job would (codex 36dcff7b); without one it opens from its own statement.
-    # Steps 3 and 4 read the store as of the close run day (`_JournalsAsOf`).
+    # Steps 3 and 4 read the store as of the close run day (`_JournalsAsOf`):
+    # step 3 without the run day's own journal, step 4 with it (codex facd7a3e).
     run_day = _next_trading_day(trading_days[-1])
-    as_of = _JournalsAsOf(store, run_day)
+    as_of = _JournalsAsOf(store, run_day, include_as_of=False)
     ledger: list[dict[str, object]] = []
     anchor: BrokerStatement | None = None
     anchor_day: str | None = None
+    while pending and next(iter(pending)) < stored[0]:  # a backfilled day before the month
+        pending.pop(next(iter(pending)))()
     if (prior := latest_anchor(store, stored[0])) is not None:
         anchor, anchor_day = prior[2], prior[2].trading_day
     booked_on: dict[str, str] = {}
     for day in stored:
+        while pending and next(iter(pending)) <= day:
+            pending.pop(next(iter(pending)))()
+        if not store.exists(trader_reconciliation_key(day)):
+            continue  # a backfill whose reconcile failed: a day without one
         ctx = _ctx(as_of, day, now)
         broker = _statement(store, day)
         reconciliation = cast(
@@ -305,9 +314,34 @@ def dry_run(
             # A carried fill is reported booked only once its posting succeeded (codex d8b42301).
             booked_on.update({d: day for d in span if d != day})
             anchor, anchor_day = broker, day
+    for run in pending.values():  # a backfilled day after the month's last
+        run()
+    stored = [d for d in stored if store.exists(trader_reconciliation_key(d))]
+    if not stored:
+        raise ValueError(f"no reconciliation for any trading day of {month}, backfilled or stored")
+    unused_fills = sorted(set(fills) - set(stored))
+
+    # 1 + 2: export and propose, one day at a time, over the booked month.
+    records: list[dict[str, object]] = []
+    export_failures: list[dict[str, str]] = []
+    for day in stored:
+        try:
+            day_records = export_exceptions(store, since=day, until=day)
+        except Exception as exc:  # noqa: BLE001 - a day that cannot export is a finding
+            export_failures.append({"trading_day": day, "error": f"{exc}"[:400]})
+            continue
+        records.extend(day_records)
+        if day_records:
+            proposals = [propose(r, proposed_at=now) for r in day_records]
+            store.put_bytes(
+                exception_proposals_key(day),
+                json.dumps(
+                    proposal_day_document(day, proposals), indent=2, sort_keys=True
+                ).encode(),
+            )
 
     # 4: close the month as the next month's first run would.
-    ctx = _ctx(as_of, run_day, now)
+    ctx = _ctx(_JournalsAsOf(store, run_day), run_day, now)
     account = _statement(store, stored[-1]).account
     close = close_prior_month(
         ctx,
@@ -318,12 +352,18 @@ def dry_run(
         after_close=lambda c: file_statement(ctx, c, now=now, closes=closes),
     )
 
-    # 5: the queue the reviewer would see.
+    # 5: the queue the reviewer would see, with each item's exception record
+    # as the job's step 5f scores it (codex 09f52012): the stored day files,
+    # and this run's own exports, which its step-2 proposals were made from.
+    proposed = load_proposals(store, until=run_day)
+    exceptions = load_exception_records(store, (str(p["trading_day"]) for p in proposed))
+    exceptions.update({str(r["exception_id"]): r for r in records})
     queue = score(
-        load_proposals(store, until=run_day),
+        proposed,
         load_decisions(store),
         as_of=run_day,
         generated_at=now,
+        exceptions=exceptions,
     )
     return {
         "schema_version": SUMMARY_SCHEMA_VERSION,
@@ -367,7 +407,9 @@ def review_evidence_keys(store: Store, *, until: str, written: Iterable[str]) ->
     too or a re-score from it differs from ``score_totals`` (codex
     00e291d3b6264e77). Same selection as
     :func:`~crucible_trader.exception_decision.load_proposals` and
-    :func:`~crucible_trader.exception_decision.load_decisions`.
+    :func:`~crucible_trader.exception_decision.load_decisions`, plus the
+    exception day files the score reads for those proposals' days
+    (:func:`~crucible_trader.exception_decision.load_exception_records`).
     """
     own = set(written)
     proposals = [
@@ -376,7 +418,14 @@ def review_evidence_keys(store: Store, *, until: str, written: Iterable[str]) ->
         if key.endswith(".json") and key.removesuffix(".json").rsplit("/", 1)[-1] <= until
     ]
     decisions = [key for key in store.list_keys(DECISIONS_PREFIX) if key.endswith(".json")]
-    return sorted(set(proposals + decisions) - own)
+    records = [
+        key
+        for key in {
+            exceptions_key(str(p["trading_day"])) for p in load_proposals(store, until=until)
+        }
+        if store.exists(key)
+    ]
+    return sorted(set(proposals + decisions + records) - own)
 
 
 def write_out(store: Store, summary: Mapping[str, object], out: pathlib.Path) -> None:
