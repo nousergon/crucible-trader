@@ -631,12 +631,12 @@ class _CashLedger:
         owed = sum(e.quantity * e.reference_price for e in waiting if e.side == "sell")
         return cap - self.released_notional - owed
 
-    def cash(self, fills: Iterable[Any]) -> float:  # pyright: ignore[reportExplicitAny]  # SDK Fill records
+    def cash(self, executions: Iterable[tuple[str, float, float]]) -> float:
+        """The cash left, from the broker's executions as ``(order ref, shares, price)``."""
         filled: dict[str, float] = {}
-        for record in fills:
-            execution = record.execution
-            key = _REF_SEP.join((execution.orderRef or "").split(_REF_SEP)[:3])
-            filled[key] = filled.get(key, 0.0) + float(execution.shares) * float(execution.price)
+        for ref, shares, price in executions:
+            key = _REF_SEP.join(ref.split(_REF_SEP)[:3])
+            filled[key] = filled.get(key, 0.0) + shares * price
         freed = sum(filled.get(key, 0.0) for key in self._sells)
         spent = sum(max(charged, filled.get(key, 0.0)) for key, charged in self._buys.items())
         return self.start + freed - spent - self._adopted
@@ -1016,7 +1016,14 @@ class PaperOrderRouter:
                     for entry in exits:
                         entry.status = "sent"
                 # The sells sent above have had their fill wait in `send`.
-                cash = ledger.cash(self._client.fills())
+                cash = ledger.cash(
+                    (
+                        f.execution.orderRef or "",
+                        float(f.execution.shares),
+                        float(f.execution.price),
+                    )
+                    for f in self._client.fills()
+                )
                 entries: list[tuple[WatchedEntry, PlannedOrder]] = []
                 for entry in watch.waiting():
                     if entry.side != "buy":
