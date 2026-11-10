@@ -1,4 +1,4 @@
-"""Entry timing: buys wait for v1's intraday triggers instead of going out at the open.
+"""Entry and exit timing: orders wait for an intraday trigger instead of going out at the open.
 
 Brian 2026-11-09: "in V1 ... we wait for right time to trade rather than buying
 and selling everything right at the market open ... it wouldn't trade until
@@ -6,11 +6,26 @@ like right before market close unless the stock price went down a certain
 percentage." Until this module the v2 session sent every order within about two
 minutes of its 09:35 start.
 
-**What waits and what does not.** Sells and reduces go out at the session start,
-exactly as before: an exit is a risk decision and v1's daemon sent its urgent
-EXIT/REDUCE orders at the open too (`crucible-executor` `executor/daemon.py`,
-Phase 0). Buys and increases are held and released by :func:`entry_trigger`,
-which ports `crucible-executor` `executor/entry_triggers.py`:
+**Both sides wait** (sells since Brian 2026-11-10: "we don't need to sell it
+immediately at market open ... we should sell it if the price looks relatively
+good throughout the day"). Sells and reduces are held and released by
+:func:`exit_trigger`, the mirror of the buys' pullback and graduated triggers:
+
+1. **rally** -- the last price is at least :attr:`EntryTimingParams.rally_pct`
+   above the intraday LOW;
+2. **time expiry** -- unconditional at :attr:`EntryTimingParams.expiry_et`, the
+   same 15:55 as the buys, so no exit the book decided is carried overnight;
+3. **graduated** -- from :attr:`EntryTimingParams.graduated_start_et`, the last
+   price is at most :attr:`EntryTimingParams.exit_graduated_max_discount_pct`
+   below the price the sell was sized at.
+
+v1 had no sell-side triggers (its daemon sent EXIT/REDUCE at the open), so these
+are not a port: they are the buys' pullback and graduated rules turned over,
+with the buys' thresholds. VWAP and support have no sell mirror here; a sell that
+neither rallies nor comes back near its sized price goes at the expiry.
+
+Buys and increases are held and released by :func:`entry_trigger`, which ports
+`crucible-executor` `executor/entry_triggers.py`:
 
 1. **pullback** -- the last price is at least :attr:`EntryTimingParams.pullback_pct`
    below the intraday high;
@@ -56,8 +71,9 @@ still waiting when the market closes is not sent, and is recorded as such.
 
 **Visible while it waits.** The watch is written to
 ``trader/entry_watch/{day}.json`` (:data:`ENTRY_WATCH_SCHEMA_VERSION`) at the
-start, on every trigger, and on a heartbeat: every waiting buy, the price it was
-sized at, the last price and high seen, and what released it. Like the order
+start, on every trigger, and on a heartbeat: every waiting order and its side,
+the price it was sized at, the last price, high and low seen, and what released
+it. ``entry_watch.v2`` added the sells; a v1 document held buys only. Like the order
 book, a write that fails never stops the orders; it is logged and counted.
 """
 
@@ -88,13 +104,14 @@ __all__ = [
     "IntradayQuote",
     "WatchedEntry",
     "entry_trigger",
+    "exit_trigger",
     "entry_watch_key",
     "panel_support_levels",
 ]
 
 log = logging.getLogger(__name__)
 
-ENTRY_WATCH_SCHEMA_VERSION = "entry_watch.v1"
+ENTRY_WATCH_SCHEMA_VERSION = "entry_watch.v2"
 ENTRY_WATCH_PREFIX = "trader/entry_watch/"
 
 NYSE_ZONE = ZoneInfo("America/New_York")
@@ -112,6 +129,7 @@ VWAP_GENERIC_TICKS = "233"
 HEARTBEAT_S = 600.0
 
 EntryStatus = Literal["waiting", "triggered", "sent", "not_sent"]
+Side = Literal["buy", "sell"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -134,11 +152,14 @@ class EntryTimingParams:
     expiry_et: dt.time = dt.time(15, 55)
     #: v1 `intraday.poll_interval_sec`.
     poll_interval_s: float = 60.0
+    #: A sell is released this far ABOVE the intraday low (the buys' pullback, turned over).
+    rally_pct: float = 0.02
+    #: From the graduated start, a sell is released at most this far below its sized price
+    #: (the buys' graduated premium, turned over).
+    exit_graduated_max_discount_pct: float = 0.01
 
     def __post_init__(self) -> None:
-        if not (0.0 < self.pullback_pct < 1.0):
-            raise ValueError(f"pullback_pct {self.pullback_pct!r} must be in (0, 1)")
-        for name in ("vwap_discount_pct", "support_pct"):
+        for name in ("pullback_pct", "vwap_discount_pct", "support_pct", "rally_pct"):
             value = getattr(self, name)
             if not (0.0 < value < 1.0):
                 raise ValueError(f"{name} {value!r} must be in (0, 1)")
@@ -146,10 +167,10 @@ class EntryTimingParams:
             raise ValueError(
                 f"support_lookback_days {self.support_lookback_days!r} must be at least 1"
             )
-        if not (0.0 <= self.graduated_max_premium_pct < 1.0):
-            raise ValueError(
-                f"graduated_max_premium_pct {self.graduated_max_premium_pct!r} must be in [0, 1)"
-            )
+        for name in ("graduated_max_premium_pct", "exit_graduated_max_discount_pct"):
+            value = getattr(self, name)
+            if not (0.0 <= value < 1.0):
+                raise ValueError(f"{name} {value!r} must be in [0, 1)")
         if not (REGULAR_OPEN_ET < self.graduated_start_et <= self.expiry_et < REGULAR_CLOSE_ET):
             raise ValueError(
                 f"the graduated start {self.graduated_start_et} and expiry {self.expiry_et} must "
@@ -170,6 +191,8 @@ class EntryTimingParams:
             "graduated_max_premium_pct": self.graduated_max_premium_pct,
             "expiry_et": self.expiry_et.strftime("%H:%M"),
             "poll_interval_s": self.poll_interval_s,
+            "rally_pct": self.rally_pct,
+            "exit_graduated_max_discount_pct": self.exit_graduated_max_discount_pct,
         }
 
     def schedule(
@@ -273,6 +296,40 @@ def entry_trigger(
     return None
 
 
+def exit_trigger(
+    *,
+    reference_price: float,
+    quote: IntradayQuote,
+    now: dt.datetime,
+    schedule: EntrySchedule,
+    params: EntryTimingParams,
+) -> str | None:
+    """Why a waiting sell is released now, or ``None`` to keep waiting.
+
+    The mirror of :func:`entry_trigger`'s pullback and graduated rules, in the
+    same order: a rally off the day's low, then the expiry (which needs no price,
+    so every sell goes by it), then the graduated window near the sized price.
+    """
+    if now < schedule.opens_at or now >= schedule.closes_at:
+        return None
+    last = _valid(quote.last)
+    low = _valid(quote.low)
+    if last is not None and low is not None:
+        rally = (last - low) / low
+        if rally >= params.rally_pct:
+            return f"rally {rally:.2%} off low {low:.2f}"
+    if now >= schedule.expires_at:
+        return "time_expiry"
+    if now >= schedule.graduated_at and last is not None:
+        change = (last - reference_price) / reference_price
+        if change >= -params.exit_graduated_max_discount_pct:
+            return (
+                f"graduated_exit ({change:+.2%} vs sized price {reference_price:.2f}, "
+                f"limit {-params.exit_graduated_max_discount_pct:+.2%})"
+            )
+    return None
+
+
 def entry_watch_key(trading_day: str) -> str:
     dt.date.fromisoformat(trading_day)  # raises on anything but an ISO day
     return f"{ENTRY_WATCH_PREFIX}{trading_day}.json"
@@ -284,7 +341,7 @@ def _stamp(at: dt.datetime) -> str:
 
 @dataclasses.dataclass
 class WatchedEntry:
-    """One buy held for its trigger, and what has been seen of it."""
+    """One order held for its trigger, and what has been seen of it."""
 
     symbol: str
     order_key: str
@@ -292,6 +349,7 @@ class WatchedEntry:
     reference_price: float
     decided_at: dt.datetime
     support_level: float | None = None
+    side: Side = "buy"
     status: EntryStatus = "waiting"
     trigger: str | None = None
     released_at: dt.datetime | None = None
@@ -333,7 +391,7 @@ class WatchedEntry:
         return {
             "symbol": self.symbol,
             "order_key": self.order_key,
-            "side": "buy",
+            "side": self.side,
             "quantity": self.quantity,
             "reference_price": self.reference_price,
             "decided_at_utc": _stamp(self.decided_at),
@@ -352,7 +410,7 @@ class WatchedEntry:
 
 
 class EntryWatch:
-    """The day's waiting buys and the document that shows them. Writes never raise."""
+    """The day's waiting orders and the document that shows them. Writes never raise."""
 
     def __init__(
         self,
@@ -415,16 +473,16 @@ class EntryWatch:
             log.exception("entry watch write failed")
             print(
                 f"entry_timing: the watch document {self.key} was not written "
-                f"({type(exc).__name__}: {exc}); the waiting buys are still watched",
+                f"({type(exc).__name__}: {exc}); the waiting orders are still watched",
                 file=sys.stderr,
             )
         self._written_at = now
-        waiting = ", ".join(f"{e.symbol}@{e.last}" for e in self.waiting()) or "none"
+        waiting = ", ".join(f"{e.side} {e.symbol}@{e.last}" for e in self.waiting()) or "none"
         print(f"entry_timing: {self.state}; waiting: {waiting}", file=sys.stderr)
 
 
 class IbIntradayQuotes:
-    """Streaming IB quotes for the waiting buys (v1 `PriceMonitor`, on `ib_async`).
+    """Streaming IB quotes for the waiting orders (v1 `PriceMonitor`, on `ib_async`).
 
     One `reqMktData` subscription per name, opened once and read on every poll:
     the client's ``sleep`` between polls is what lets the SDK apply the ticks.

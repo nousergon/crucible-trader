@@ -1,4 +1,4 @@
-"""Entry timing: sells at the start, buys held for v1's triggers, nothing sent twice.
+"""Entry and exit timing: buys held for v1's triggers, sells for their mirror, nothing sent twice.
 
 The router tests drive a whole simulated trading day on a fake clock: the fake
 gateway's ``sleep`` advances the clock, its tickers read a scripted price path,
@@ -32,6 +32,7 @@ from crucible_trader.entry_timing import (
     WatchedEntry,
     entry_trigger,
     entry_watch_key,
+    exit_trigger,
     panel_support_levels,
 )
 from crucible_trader.kill_switch import TradingHaltedError
@@ -39,10 +40,12 @@ from crucible_trader.order_intent import claim_order_intent, order_intent_docume
 from crucible_trader.order_router import (
     ENTRY_TIMING_VAR,
     PaperOrderRouter,
+    PriceUnavailableError,
     RouterConfig,
     RouterSettingsError,
     RoutingRefusedError,
     UnknownOrderStateError,
+    book_cash,
     order_key,
 )
 
@@ -70,6 +73,8 @@ def test_the_defaults_are_what_v1_ran() -> None:
         "graduated_max_premium_pct": 0.01,
         "expiry_et": "15:55",
         "poll_interval_s": 60.0,
+        "rally_pct": 0.02,
+        "exit_graduated_max_discount_pct": 0.01,
     }
 
 
@@ -87,6 +92,10 @@ def test_the_defaults_are_what_v1_ran() -> None:
         ("support_lookback_days", 0, "support_lookback_days"),
         ("poll_interval_s", 0.0, "poll_interval_s"),
         ("poll_interval_s", float("nan"), "poll_interval_s"),
+        ("rally_pct", 0.0, "rally_pct"),
+        ("rally_pct", 1.0, "rally_pct"),
+        ("exit_graduated_max_discount_pct", -0.01, "exit_graduated_max_discount_pct"),
+        ("exit_graduated_max_discount_pct", 1.0, "exit_graduated_max_discount_pct"),
     ],
 )
 def test_a_parameter_outside_its_range_is_refused(field, value, match) -> None:
@@ -152,6 +161,44 @@ def test_the_expiry_releases_whatever_the_price_and_without_one() -> None:
 
 def test_a_pullback_is_named_before_the_expiry() -> None:
     assert _fires(90.0, 100.0, et(15, 58)).startswith("pullback")
+
+
+def _exits(last: float | None, low: float | None, at: dt.datetime, ref: float = 100.0):
+    return exit_trigger(
+        reference_price=ref,
+        quote=IntradayQuote(last=last, high=None, low=low),
+        now=at,
+        schedule=SCHEDULE,
+        params=PARAMS,
+    )
+
+
+def test_a_two_percent_rally_off_the_low_releases_the_sell() -> None:
+    assert _exits(102.0, 100.0, et(10)) == "rally 2.00% off low 100.00"
+    assert _exits(101.9, 100.0, et(10)) is None
+    assert _exits(None, 100.0, et(10)) is None
+    assert _exits(102.0, None, et(10)) is None
+
+
+def test_no_sell_is_released_before_the_open_or_at_the_close() -> None:
+    assert _exits(110.0, 100.0, et(9, 29)) is None
+    assert _exits(110.0, 100.0, et(16)) is None
+
+
+def test_the_graduated_exit_takes_a_price_within_one_percent_below_the_sized_price() -> None:
+    assert _exits(99.0, 99.0, et(15, 29)) is None
+    assert _exits(99.0, 99.0, et(15, 30)) == (
+        "graduated_exit (-1.00% vs sized price 100.00, limit -1.00%)"
+    )
+    assert _exits(105.0, 105.0, et(15, 30)).startswith("graduated_exit (+5.00%")
+    assert _exits(98.9, 98.9, et(15, 30)) is None
+    assert _exits(None, 98.9, et(15, 30)) is None
+
+
+def test_the_expiry_releases_every_sell_whatever_the_price_and_without_one() -> None:
+    assert _exits(50.0, 50.0, et(15, 55)) == "time_expiry"
+    assert _exits(None, None, et(15, 55)) == "time_expiry"
+    assert _exits(103.0, 100.0, et(15, 58)).startswith("rally")  # named before the expiry
 
 
 def _quoted(
@@ -438,7 +485,8 @@ def _run_day(router: PaperOrderRouter, book) -> int:
 
 
 #: AAA pulls back 2% at 11:00; BBB drifts within 1% and goes at 15:30; CCC rallies
-#: 5% and only the expiry takes it. DDD is held and sold at the start.
+#: 5% and only the expiry takes it. DDD is held, flat all day, and sold at 15:30 (its
+#: graduated exit).
 PATHS = {
     "AAA": [(dt.time(9, 30), 100.0), (dt.time(10, 0), 101.0), (dt.time(11, 0), 98.9)],
     "BBB": [(dt.time(9, 30), 50.0), (dt.time(12, 0), 50.3)],
@@ -448,14 +496,14 @@ PATHS = {
 BOOK = {"AAA": 0.1, "BBB": 0.1, "CCC": 0.1, "DDD": 0.0}
 
 
-def test_sells_go_at_the_start_and_each_buy_waits_for_its_trigger(store) -> None:
+def test_each_sell_and_each_buy_waits_for_its_trigger(store) -> None:
     ib = TimedIB(PATHS, positions={"DDD": 100})
     router = _timed_router(store, ib)
     batches = _run_day(router, _book(BOOK))
 
     assert ib.placed() == [
-        ("DDD", "SELL", 100, "09:35"),
         ("AAA", "BUY", 100, "11:00"),
+        ("DDD", "SELL", 100, "15:30"),  # the sells of a poll go before its buys
         ("BBB", "BUY", 200, "15:30"),
         ("CCC", "BUY", 500, "15:55"),
     ]
@@ -468,8 +516,12 @@ def test_sells_go_at_the_start_and_each_buy_waits_for_its_trigger(store) -> None
     assert ccc.fill_price == pytest.approx(21.0 * 1.01)
 
     document = json.loads(store.get_bytes(entry_watch_key(DAY)))
-    assert document["state"] == "complete" and document["summary"] == {"sent": 3}
+    assert document["state"] == "complete" and document["summary"] == {"sent": 4}
+    assert document["schema_version"] == "entry_watch.v2"
+    sides = {row["symbol"]: row["side"] for row in document["entries"]}
+    assert sides == {"AAA": "buy", "BBB": "buy", "CCC": "buy", "DDD": "sell"}
     triggers = {row["symbol"]: row["trigger"] for row in document["entries"]}
+    assert triggers["DDD"].startswith("graduated_exit (+0.00%")
     assert triggers["AAA"].startswith("pullback 2.08% from high 101.00")
     assert triggers["BBB"].startswith("graduated_entry (+0.60%")
     assert triggers["CCC"] == "time_expiry"
@@ -478,12 +530,46 @@ def test_sells_go_at_the_start_and_each_buy_waits_for_its_trigger(store) -> None
     assert key == entry_watch_key(DAY) and json.loads(payload)["state"] == "complete"
 
 
-def test_a_book_of_sells_only_is_not_watched(store) -> None:
-    ib = TimedIB(PATHS, positions={"DDD": 100})
+def test_a_book_with_no_order_is_not_watched(store) -> None:
+    ib = TimedIB(PATHS)
     router = _timed_router(store, ib)
-    assert _run_day(router, _book({"DDD": 0.0})) == 1
+    assert _run_day(router, _book({"DDD": 0.0})) == 0
     assert router.entry_watch_payload(ib.clock()) is None
     assert not store.exists(entry_watch_key(DAY))
+
+
+def test_a_sell_is_released_on_a_two_percent_rally_off_the_low(store) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.5), (dt.time(11, 0), 9.7)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100})
+    router = _timed_router(store, ib)
+    assert _run_day(router, _book({"DDD": 0.0})) == 1
+    assert ib.placed() == [("DDD", "SELL", 100, "11:00")]
+    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
+    assert (row["side"], row["status"], row["low"]) == ("sell", "sent", 9.5)
+    assert row["trigger"] == "rally 2.11% off low 9.50"
+    assert (row["released_quantity"], row["release_price"]) == (100, 9.7)
+
+
+def test_a_sell_that_only_falls_goes_at_the_expiry(store) -> None:
+    """The backstop: a sell never rallies or comes back within 1%, and still goes by 15:55."""
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.8), (dt.time(13, 0), 9.5)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100})
+    router = _timed_router(store, ib)
+    _run_day(router, _book({"DDD": 0.0}))
+    assert ib.placed() == [("DDD", "SELL", 100, "15:55")]
+    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
+    assert row["trigger"] == "time_expiry"
+
+
+def test_a_sell_within_one_percent_of_its_sized_price_goes_at_the_graduated_start(store) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.8), (dt.time(13, 0), 9.92)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100})
+    router = _timed_router(store, ib)
+    _run_day(router, _book({"DDD": 0.0}))
+    # 9.8 -> 9.92 is a 1.2% rally (not 2%); at 15:30 9.92 is 0.8% under the sized 10.00.
+    assert ib.placed() == [("DDD", "SELL", 100, "15:30")]
+    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
+    assert row["trigger"].startswith("graduated_exit (-0.80% vs sized price 10.00")
 
 
 def test_a_book_of_buys_only_opens_with_no_batch(store) -> None:
@@ -493,15 +579,15 @@ def test_a_book_of_buys_only_opens_with_no_batch(store) -> None:
     assert ib.placed() == [("CCC", "BUY", 500, "15:55")]
 
 
-def test_the_kill_switch_stops_the_waiting_buys(store) -> None:
+def test_the_kill_switch_stops_the_waiting_orders(store) -> None:
     ib = TimedIB(PATHS, positions={"DDD": 100})
     router = _timed_router(store, ib)
     batches = iter(router.batches(_book(BOOK)))
-    router.send(next(batches))  # the sells
+    router.send(next(batches))  # AAA at its 11:00 pullback
     _halt(store, "freeze")
     with pytest.raises(TradingHaltedError):
         next(batches)
-    assert [c.symbol for c, _ in ib.order_calls] == ["DDD"]
+    assert [c.symbol for c, _ in ib.order_calls] == ["AAA"]  # the waiting sell too
     assert json.loads(store.get_bytes(entry_watch_key(DAY)))["state"] == "stopped"
 
 
@@ -510,7 +596,7 @@ def test_a_dropped_gateway_stops_the_watch_and_sends_nothing_more(store) -> None
     router = _timed_router(store, ib)
     batches = iter(router.batches(_book(BOOK)))
     ib.connected = False
-    with pytest.raises(RoutingRefusedError, match="3 buy"):
+    with pytest.raises(RoutingRefusedError, match="3 order"):
         next(batches)
     assert ib.order_calls == []
     router.close()
@@ -546,8 +632,8 @@ def test_a_buy_the_session_cap_has_no_room_for_is_not_sent(store) -> None:
     # Planned at the cap: DDD's $1,000 sell and EEE's 100 shares at $10. At the
     # expiry EEE is $2,500 and the $1,000 left buys no share.
     assert [s for s, *_ in ib.placed()] == ["DDD"]
-    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
-    assert row["status"] == "not_sent" and "caps leave no room" in row["trigger"]
+    rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
+    assert rows["EEE"]["status"] == "not_sent" and "caps leave no room" in rows["EEE"]["trigger"]
 
 
 def test_a_rerun_adopts_a_buy_the_broker_knows_and_watches_the_rest(store) -> None:
@@ -588,6 +674,115 @@ def test_a_buy_with_an_intent_and_no_broker_order_is_never_sent(store) -> None:
     assert [c.symbol for c, _ in ib.order_calls] == ["AAA", "CCC"]
     rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
     assert rows["BBB"]["status"] == "not_sent" and rows["BBB"]["trigger"].startswith("unknown")
+
+
+def test_a_rerun_adopts_a_sell_the_broker_is_working_and_never_resends_it(store) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.5), (dt.time(11, 0), 9.7)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100}, stall=True)  # the sell never fills
+    first = _timed_router(store, ib)
+    batches = iter(first.batches(_book({"DDD": 0.0})))
+    first.send(next(batches))  # the 11:00 rally; the session then dies
+    assert ib.placed() == [("DDD", "SELL", 100, "11:00")]
+
+    rerun = _timed_router(store, ib)
+    assert _run_day(rerun, _book({"DDD": 0.0})) == 1
+    assert len(ib.order_calls) == 1  # adopted, not re-sent
+    (record,) = rerun.records
+    assert record.disposition == "adopted" and record.order.decision.side == "sell"
+    (row,) = json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]
+    assert (row["status"], row["trigger"]) == ("sent", "adopted: already at the broker")
+
+
+def test_a_rerun_after_a_filled_sell_plans_no_sell(store) -> None:
+    path = [(dt.time(9, 30), 10.0), (dt.time(10, 0), 9.5), (dt.time(11, 0), 9.7)]
+    ib = TimedIB({"DDD": path}, positions={"DDD": 100})
+    first = _timed_router(store, ib)
+    batches = iter(first.batches(_book({"DDD": 0.0})))
+    first.send(next(batches))  # filled: the account no longer holds DDD
+    rerun = _timed_router(store, ib)
+    assert _run_day(rerun, _book({"DDD": 0.0})) == 0
+    assert len(ib.order_calls) == 1
+
+
+def test_a_sell_with_an_intent_and_no_broker_order_is_never_sent(store) -> None:
+    ib = TimedIB(PATHS, positions={"DDD": 100})
+    claim_order_intent(
+        store,
+        order_intent_document(
+            order_key=order_key(DAY, "DDD"),
+            order_ref=f"{order_key(DAY, 'DDD')}|sell|100|10.0|2026-09-08T13:35:00.000000Z",
+            trading_day=DAY,
+            symbol="DDD",
+            side="sell",
+            quantity=100,
+            decision_price=10.0,
+            account=ACCOUNT,
+            intended_at=et(9, 35),
+        ),
+    )
+    router = _timed_router(store, ib)
+    with pytest.raises(UnknownOrderStateError, match="DDD"):
+        _run_day(router, _book({"AAA": 0.1, "DDD": 0.0}))
+    assert ib.placed() == [("AAA", "BUY", 100, "11:00")]
+    rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
+    assert rows["DDD"]["status"] == "not_sent" and rows["DDD"]["trigger"].startswith("unknown")
+
+
+# -- the book's cash: no buy on proceeds a pending sell has not freed ------------------
+
+#: AAA pulls back at 11:00; DDD is flat all day, so its sell goes at 15:30.
+CASH_PATHS = {"AAA": PATHS["AAA"], "CCC": PATHS["CCC"], "DDD": [(dt.time(9, 30), 10.0)]}
+#: Caps wide enough that only the cash binds.
+WIDE = {"max_order_notional_usd": 200_000.0, "max_session_notional_usd": 300_000.0}
+
+
+def test_a_buy_waits_for_the_sell_whose_proceeds_it_needs(store, capsys) -> None:
+    # $95,000 of DDD held in a $100,000 book: $5,000 of cash. AAA needs $9,890 at 11:00.
+    ib = TimedIB(CASH_PATHS, positions={"DDD": 9_500})
+    router = _timed_router(store, ib, **WIDE)
+    _run_day(router, _book({"AAA": 0.1, "DDD": 0.0}))
+    assert ib.placed() == [("DDD", "SELL", 9_500, "15:30"), ("AAA", "BUY", 100, "15:30")]
+    assert "AAA pullback 2.08% from high 101.00; held for sell proceeds: $5,000.00" in (
+        capsys.readouterr().err
+    )
+    rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
+    assert rows["AAA"]["status"] == "sent" and rows["AAA"]["trigger"].startswith("pullback")
+
+
+def test_a_buy_the_book_has_cash_for_does_not_wait_for_a_sell(store) -> None:
+    ib = TimedIB(CASH_PATHS, positions={"DDD": 100})
+    router = _timed_router(store, ib, **WIDE)
+    _run_day(router, _book({"AAA": 0.1, "DDD": 0.0}))
+    assert ib.placed() == [("AAA", "BUY", 100, "11:00"), ("DDD", "SELL", 100, "15:30")]
+
+
+def test_with_no_sell_left_a_buy_is_clipped_to_the_cash(store, capsys) -> None:
+    # DDD carried unchanged ($95,000): $5,000 of cash. CCC sized at $20 to 250
+    # shares; at the 15:55 expiry it is $21, and $5,000 buys 238.
+    ib = TimedIB(CASH_PATHS, positions={"DDD": 9_500})
+    router = _timed_router(store, ib, **WIDE)
+    _run_day(router, _book({"CCC": 0.05, "DDD": 0.95}))
+    assert ib.placed() == [("CCC", "BUY", 238, "15:55")]
+    assert "exceeds the book's cash at its trigger; clipped to 238" in capsys.readouterr().err
+
+
+def test_a_sell_that_has_not_filled_frees_no_cash(store) -> None:
+    # A $100,000 book wholly in DDD: no cash until the 100-share sell fills, and it never does.
+    ib = TimedIB(CASH_PATHS, positions={"DDD": 10_000}, stall=True)
+    router = _timed_router(store, ib, **WIDE)
+    _run_day(router, _book({"CCC": 0.01, "DDD": 0.99}))
+    assert ib.placed() == [("DDD", "SELL", 100, "15:30")]
+    rows = {r["symbol"]: r for r in json.loads(store.get_bytes(entry_watch_key(DAY)))["entries"]}
+    assert rows["CCC"]["status"] == "not_sent"
+    assert rows["CCC"]["trigger"] == "time_expiry; the book's cash ($0.00) buys no share at 21.00"
+
+
+def test_the_book_cash_is_the_notional_less_the_held_book() -> None:
+    prices = {"AAA": 100.0, "DDD": 10.0}
+    assert book_cash(_book(), {"AAA": 300, "DDD": 0}, quote=prices.get) == 70_000.0
+    assert book_cash(_book(), {"AAA": 2_000}, quote=prices.get) == 0.0  # never negative
+    with pytest.raises(PriceUnavailableError, match="ZZZ"):
+        book_cash(_book(), {"ZZZ": 1}, quote=prices.get)
 
 
 # -- configuration --------------------------------------------------------------------
