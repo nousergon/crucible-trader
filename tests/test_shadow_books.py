@@ -8,6 +8,7 @@ subtracts. If this module ever priced a trade itself, those tests fail.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import inspect
 import json
@@ -34,6 +35,7 @@ from crucible_trader.shadow_books import (
     ArmSessionInputs,
     ShadowBookFailure,
     advance_book,
+    held_sessions_from_shadow_books,
     read_previous_books,
     run_shadow_books,
 )
@@ -383,3 +385,88 @@ class TestThePhase4GateGradesTheseBooks:
         clause = phase4_clause(store, self.CLAUSE, DAY2)
         assert clause.met, clause.detail
         assert shadow_books_key(DAY2) in clause.evidence
+
+
+DAY3 = "2026-09-14"
+
+
+def _held_inputs(*, day: str, i: int) -> ArmSessionInputs:
+    """`_inputs` under a parameter set with the minimum hold on (crucible-PR499)."""
+    held = PortfolioParams.from_mapping({**PARAMS, "min_hold_days": 3}, source="<fixture>")
+    return dataclasses.replace(_inputs(FLAT, day=day, i=i), params=held)
+
+
+class TestTheMinimumHoldsClockTravelsWithTheBook:
+    """alpha-engine-config-I12024: with `min_hold_days` set, `construct_book`
+    refuses a held book handed no ages. Each shadow advance passes the ages its
+    own earlier documents show, so shadow S arms keep advancing."""
+
+    def _three_sessions(self, tmp_path, monkeypatch) -> tuple[LocalStore, str, list]:
+        store, (arm,) = _registered(tmp_path, ["shadow_a"])
+        seen: list = []
+        real = shadow_module.construct_book
+
+        def spy(*, held_sessions=None, **kwargs):
+            seen.append(held_sessions)
+            return real(held_sessions=held_sessions, **kwargs)
+
+        monkeypatch.setattr(shadow_module, "construct_book", spy)
+        for i, (day, prev) in enumerate([(DAY1, None), (DAY2, DAY1), (DAY3, DAY2)]):
+            run_shadow_books(
+                store,
+                trading_day=day,
+                previous_trading_day=prev,
+                inputs={arm: _held_inputs(day=day, i=i)},
+                now=NOW,
+            )
+        return store, arm, seen
+
+    def test_a_held_shadow_book_advances_with_the_hold_on(self, tmp_path, monkeypatch) -> None:
+        store, arm, seen = self._three_sessions(tmp_path, monkeypatch)
+        assert read_previous_books(store, DAY3)[arm]["days_advanced"] == [DAY1, DAY2, DAY3]
+
+        def names(day: str) -> set[str]:
+            weights = read_previous_books(store, day)[arm]["weights"]
+            return {t for t, w in weights.items() if w > 0.0 and t in ("AAA", "BBB")}
+
+        assert names(DAY1) and names(DAY2), "the fixture's book holds nothing"
+        # Inception has no clock; each later session counts the sessions held.
+        assert seen[0] is None
+        assert seen[1] == dict.fromkeys(names(DAY1), 1)
+        assert seen[2] == {t: 1 + seen[1].get(t, 0) for t in names(DAY2)}
+        assert max(seen[2].values()) == 2
+
+    def test_without_the_clock_the_engine_refuses_the_held_book(self) -> None:
+        first = advance_book(arm_id="s:x:1", inputs=_held_inputs(day=DAY1, i=0), previous=None)
+        later = _held_inputs(day=DAY2, i=1)
+        w_prev = np.array([first["weights"][t] for t in later.universe.tickers])
+        with pytest.raises(ValueError, match="no held_sessions were given"):
+            construct_book(
+                recipe=later.recipe,
+                params=later.params,
+                universe=later.universe,
+                sessions=[later.session],
+                portfolio_notional=NOTIONAL,
+                w_initial=w_prev,
+            )
+
+    def test_the_walk_ends_at_a_gap_an_unreadable_record_or_the_cap(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        store, arm, _ = self._three_sessions(tmp_path, monkeypatch)
+        latest = read_previous_books(store, DAY3)[arm]
+        names = {t for t, w in latest["weights"].items() if w > 0.0 and t in ("AAA", "BBB")}
+
+        def walk(**kwargs):
+            return held_sessions_from_shadow_books(
+                store, arm, latest, universe=_universe(), **kwargs
+            )
+
+        assert walk() == dict.fromkeys(names, 3)
+        assert walk(max_books=2) == dict.fromkeys(names, 2)
+        cache = {DAY2: {}}  # the arm did not advance on DAY2
+        assert walk(cache=cache) == dict.fromkeys(names, 1)
+        store.put_bytes(shadow_books_key(DAY2), b"{not json")
+        assert walk() == dict.fromkeys(names, 1)
+        cash_only = {**latest, "weights": {"CASH": 1.0}}
+        assert held_sessions_from_shadow_books(store, arm, cash_only, universe=_universe()) == {}

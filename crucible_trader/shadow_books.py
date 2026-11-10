@@ -34,6 +34,16 @@ is look-ahead — so it is never constructed here. It is still LISTED: its entry
 carries `CONTROL_NON_BOOK_STATUS` and a `non_book_reason`, never dropped and
 never a failed book, and the phase-4 coverage reading holds it to exactly that.
 
+**The minimum hold's clock travels with the book** (`alpha-engine-config-I12024`;
+crucible-PR499). With `PortfolioParams.min_hold_days` set, `construct_book`
+refuses a held book handed no ages, so each advance passes, by held name, the
+consecutive sessions the arm's book has held it
+(:func:`held_sessions_from_shadow_books`): one from the previous document the
+advance already reads, then one earlier document per further session, at most
+`HELD_SESSIONS_WALK_LIMIT`. `shadow_books.v1` admits no extra book field, so the
+count is walked, not stamped. A missing document or a session the arm did not
+advance ends the run.
+
 **Evidence, not a promotion input.** Nothing here moves a champion pointer.
 Whether realized edge ever does is a champion-challenger-policy change,
 out of scope by decision (I10653 deliverable 5).
@@ -66,11 +76,15 @@ from crucible.slots.arms import read_register
 from crucible.slots.strategy import BookUniverse, SessionInputs, StrategyRecipe, construct_book
 from crucible.store import Store
 
+from crucible_trader.construction import held_sessions_kwargs
+from crucible_trader.order_book import HELD_SESSIONS_WALK_LIMIT
+
 __all__ = [
     "ArmSessionInputs",
     "ShadowBookFailure",
     "advance_book",
     "build_shadow_books_document",
+    "held_sessions_from_shadow_books",
     "read_previous_books",
     "run_shadow_books",
 ]
@@ -108,11 +122,14 @@ def advance_book(
     arm_id: str,
     inputs: ArmSessionInputs,
     previous: Mapping[str, Any] | None,
+    held_sessions: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Advance one arm's book by one session and return its `shadow_books.v1` entry.
 
     ``previous`` is this arm's advanced entry from the last session's document,
-    or None at inception. Raises whatever `construct_book` raises — including
+    or None at inception. ``held_sessions`` is, by name ``previous`` holds, the
+    sessions the book has held it (:func:`held_sessions_from_shadow_books`).
+    Raises whatever `construct_book` raises — including
     `CostModelInputError` for a participation-aware model with no ADV.
     """
     universe = inputs.universe
@@ -155,6 +172,7 @@ def advance_book(
         sessions=[inputs.session],
         portfolio_notional=inputs.portfolio_notional,
         w_initial=w_prev,
+        **held_sessions_kwargs(construct_book, None if previous is None else held_sessions),
     )
     book = constructed.book
     gross = float(book.portfolio_returns[0])
@@ -262,7 +280,9 @@ def build_shadow_books_document(
     return validate_shadow_books(document, origin=shadow_books_key(trading_day))
 
 
-def read_previous_books(store: Store, previous_trading_day: str | None) -> dict[str, dict]:
+def read_previous_books(
+    store: Store, previous_trading_day: str | None
+) -> dict[str, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]  # JSON entries
     """Each arm's ADVANCED entry from the previous session's document, by arm id.
 
     Absent previous document (first session) → empty: every book incepts. A
@@ -275,6 +295,59 @@ def read_previous_books(store: Store, previous_trading_day: str | None) -> dict[
         return {}
     document = validate_shadow_books(json.loads(store.get_bytes(key).decode("utf-8")), origin=key)
     return {b["arm_id"]: b for b in document["books"] if b["status"] == "advanced"}
+
+
+def _held(weights: Mapping[str, float]) -> set[str]:
+    """An entry's held names. A shadow book's weights include its two sentinels,
+    which the engine never reads an age for (`construct_book` ignores them), so
+    no age is computed for anything but a positive weight here, and the caller
+    keeps only names its universe holds."""
+    return {t for t, w in weights.items() if w > 0.0}
+
+
+def held_sessions_from_shadow_books(
+    store: Store,
+    arm_id: str,
+    previous: Mapping[str, Any],  # pyright: ignore[reportExplicitAny]  # a JSON entry
+    *,
+    universe: BookUniverse,
+    max_books: int = HELD_SESSIONS_WALK_LIMIT,
+    cache: dict[str, dict[str, dict[str, Any]]] | None = None,  # pyright: ignore[reportExplicitAny]
+) -> dict[str, int]:
+    """By name ``previous`` holds, how many consecutive sessions the arm's book held it.
+
+    ``previous`` is the arm's advanced entry from the last session (count 1 for
+    each name it holds). Each earlier session in its ``days_advanced`` adds one
+    for a name still held there, read from that session's document; a document
+    that is absent, or in which the arm did not advance, ends the run. At most
+    ``max_books`` sessions are counted. ``cache`` shares the documents read
+    between arms. Sentinels are excluded: `construct_book` reads no age for
+    them.
+    """
+    sentinels = {
+        universe.tickers[universe.cash_idx],
+        universe.tickers[universe.benchmark_idx],
+    }
+    run = _held(previous["weights"]) - sentinels
+    counts = dict.fromkeys(run, 1)
+    documents = cache if cache is not None else {}
+    books = 1
+    for day in reversed(list(previous["days_advanced"])[:-1]):
+        if not run or books >= max_books:
+            break
+        if day not in documents:
+            try:
+                documents[day] = read_previous_books(store, day)
+            except Exception:  # noqa: BLE001 - an unreadable record ends the run, not the book
+                documents[day] = {}
+        entry = documents[day].get(arm_id)
+        if entry is None:
+            break
+        books += 1
+        run &= _held(entry["weights"])
+        for ticker in run:
+            counts[ticker] += 1
+    return counts
 
 
 def run_shadow_books(
@@ -316,6 +389,7 @@ def run_shadow_books(
             f"arms; a control is recorded as {CONTROL_NON_BOOK_STATUS!r}, never constructed"
         )
     previous = read_previous_books(store, previous_trading_day)
+    documents: dict[str, dict[str, dict[str, Any]]] = {}  # pyright: ignore[reportExplicitAny]
     books: list[dict[str, Any]] = []
     for arm_id in active:
         if arm_id in controls:
@@ -332,8 +406,16 @@ def run_shadow_books(
             )
             continue
         try:
+            prior = previous.get(arm_id)
+            ages = (
+                None
+                if prior is None
+                else held_sessions_from_shadow_books(
+                    store, arm_id, prior, universe=arm_inputs.universe, cache=documents
+                )
+            )
             books.append(
-                advance_book(arm_id=arm_id, inputs=arm_inputs, previous=previous.get(arm_id))
+                advance_book(arm_id=arm_id, inputs=arm_inputs, previous=prior, held_sessions=ages)
             )
         except Exception as exc:
             # Failure mode swallowed HERE: one arm's construction raising (e.g.
