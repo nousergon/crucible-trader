@@ -3,6 +3,7 @@ is the one `crucible release.pin --target trader` selects on."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 
 import crucible.release
@@ -210,3 +211,46 @@ def test_main_reads_the_process_environment_by_default(tmp_path, monkeypatch) ->
         monkeypatch.setenv(var, value)
     ib = FakeIB()
     assert main(["--release", SHA], sdk_loader=FakeSdk(ib), version_reader=lambda: VERSION) == 0
+
+
+class TestThePinSmokeIsNotASession:
+    """alpha-engine-config-I13447. The routed session refuses to start outside
+    market hours. The pin smoke (`alpha-engine-trader-pin-smoke`, 15:00 ET, or
+    16:10 ET under crucible-executor#659) runs `paper_smoke.main` instead: its
+    own `trader.smoke` job, a READ-ONLY gateway session, and no router. So the
+    guard never sees it, and it runs at any hour."""
+
+    def test_it_never_imports_the_session_or_a_router(self) -> None:
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(paper_smoke))
+        imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert not {m for m in imported if m and m.endswith(("daily_session", "order_router"))}
+
+    @pytest.mark.parametrize(
+        "now",
+        [
+            dt.datetime(2026, 11, 10, 21, 10, tzinfo=dt.UTC),  # 16:10 ET, after the close
+            dt.datetime(2026, 11, 10, 1, 36, 16, tzinfo=dt.UTC),  # 20:36 ET on 11-09
+        ],
+    )
+    def test_it_passes_outside_market_hours_and_places_no_order(
+        self, store, monkeypatch, now
+    ) -> None:
+        monkeypatch.setattr(
+            paper_smoke, "run_job", lambda job, fn, **kw: run_job(job, fn, **{**kw, "now": now})
+        )
+        ib = FakeIB(positions={"AAA": 1})
+
+        run_smoke(store, SHA, connector=lambda: ib, installed_version=VERSION, run_mode="live")
+
+        assert ib.order_calls == [] and ib.disconnected == 1
+        day = "2026-11-10" if now.hour == 21 else "2026-11-09"
+        manifest = read_manifest(store, TRADER_SMOKE_JOB, day, discriminator=SHA[:12])
+        assert manifest["status"] == "ok", manifest.get("reason")
