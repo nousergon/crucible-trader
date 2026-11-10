@@ -155,13 +155,10 @@ OWED_RULES: frozenset[str] = frozenset(
         "negative_alpha_exit",
         "hard_risk_reentry_lockout",
         "hard_risk_precedence",
-        "sector_cap",
-        "predictor_veto",
         "research_exit_signal",
         "expectancy_derisk_gate",
         "intraday_resolve",
         "stance_caps",
-        "score_floor",
         "rebalance_band",
         "entry_timing",
     }
