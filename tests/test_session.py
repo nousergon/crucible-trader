@@ -129,9 +129,13 @@ def test_a_clear_session_constructs_and_sends_every_batch(store) -> None:
         "alpha_bench": None,
         "turnover_one_way": None,
         "turnover_budget": None,
+        "turnover_drivers": None,
     }
     assert constructed[0]["trading_day"] == "2026-09-08" and constructed[0]["now"] == ib.clock()
     assert [m["name"] for m in ctx.metrics] == [
+        # `alpha-engine-config-I12024`: the v1-rules guard reports first. No
+        # record in this store, so it reads UNMEASURABLE and the session trades.
+        "v1_trading_rules_outstanding",
         "hold_book_engaged",
         "portfolio_construction",
         "trader_order_book_written",

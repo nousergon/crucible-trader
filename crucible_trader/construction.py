@@ -82,6 +82,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import inspect
+import math
 from collections.abc import Callable, Mapping
 from typing import Any, cast
 
@@ -115,6 +116,8 @@ from crucible_trader.contract import ContractRefusal, ContractUnavailable, read_
 
 __all__ = [
     "STRATEGY_SLOT",
+    "SessionSizing",
+    "TURNOVER_DRIVER_KEYS",
     "TargetBook",
     "construct_target_book",
     "engine_held_sessions",
@@ -127,6 +130,49 @@ __all__ = [
 
 #: The slot whose champion decides how the book is constructed.
 STRATEGY_SLOT = "s"
+
+
+#: How a session's book notional was chosen (see :class:`SessionSizing`).
+SIZING_BASIS_BROKER_NAV = "broker_net_liquidation"
+
+
+@dataclasses.dataclass(frozen=True)
+class SessionSizing:
+    """The notional a LIVE session sizes its book on, and where it came from.
+
+    v2 sized every session on the S slot's declared ``book_notional_usd`` (a
+    fixed $1M), so after a loss the account was sized past what it held and
+    went on margin, and after a gain capital sat idle (the 2026-11-09 v1/v2
+    trading-parity audit, row 5). A live session now sizes on
+    ``min(book_notional_usd, broker NetLiquidation)`` read at session start:
+    the declared notional is the CEILING, never a floor, and a NAV that cannot
+    be read refuses the session (`crucible_trader.order_router`). Shadow,
+    simulated and grading paths carry no sizing and keep the declared notional.
+    """
+
+    ceiling_usd: float
+    nav_usd: float
+    basis: str = SIZING_BASIS_BROKER_NAV
+
+    def __post_init__(self) -> None:
+        for name in ("ceiling_usd", "nav_usd"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0):
+                raise ContractRefusal(f"session sizing {name}={value!r} is not a positive amount")
+
+    @property
+    def notional_usd(self) -> float:
+        """What the book is sized on: the NAV, capped at the declared notional."""
+        return min(self.ceiling_usd, self.nav_usd)
+
+    def record(self) -> dict[str, float | str]:
+        """The sizing as it is filed on the order book and the run manifest."""
+        return {
+            "basis": self.basis,
+            "nav_usd": self.nav_usd,
+            "ceiling_usd": self.ceiling_usd,
+            "notional_usd": self.notional_usd,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,10 +200,33 @@ class TargetBook:
     #: not carry them (test doubles).
     alpha: dict[str, float] | None = None
     eligible: dict[str, bool] | None = None
+    #: The live session's NAV-based sizing, or ``None`` when the book is sized
+    #: on the declared notional (shadow, simulated, grading).
+    sizing: SessionSizing | None = None
     #: The one-way turnover the session may trade before it counts as churn
     #: (:func:`session_turnover_budget`). ``None`` when the parameter set
     #: disables the budget, or from a test double (`alpha-engine-config-I13305`).
     turnover_budget: float | None = None
+    #: The construction's own account of WHY the book moved as far as it did
+    #: (:data:`TURNOVER_DRIVER_KEYS` of the engine's diagnostics), read by the
+    #: churn alarm (`crucible_trader.turnover_tripwire`). ``None`` from a test
+    #: double (v1 parity audit 2026-11-09, row 16).
+    turnover_drivers: dict[str, object] | None = None
+
+
+#: The diagnostics a session's turnover is attributed from. Copied verbatim;
+#: an absent key stays absent, never zero.
+TURNOVER_DRIVER_KEYS: tuple[str, ...] = (
+    "turnover_mandatory_floor",
+    "turnover_mandatory_floor_by_cause",
+    "turnover_budget_configured",
+    "turnover_budget_discretionary",
+    "turnover_constraint_binding",
+    "conviction_ir_xs",
+    "conviction_budget_multiplier",
+    "conviction_gate_applied",
+    "conviction_gate_reason",
+)
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -418,6 +487,7 @@ def construct_target_book(
     previous_weights: Mapping[str, float] | None,
     now: dt.datetime,
     feature_version: str | None = None,
+    sizing: SessionSizing | None = None,
     held_sessions: Mapping[str, int] | None = None,
 ) -> TargetBook:
     """Construct the book for ``trading_day`` through `construct_book`, or refuse.
@@ -433,6 +503,11 @@ def construct_target_book(
     session, no panel), :class:`ContractRefusal` when something exists and must
     not be traded, and lets the engine's own refusals (e.g.
     `CostModelInputError`) propagate unchanged.
+
+    ``sizing`` (a live session only) sizes the book on
+    :attr:`SessionSizing.notional_usd`; its ceiling must be the S slot's
+    declared ``book_notional_usd``, or the session is refused. ``None`` sizes
+    on the declared notional.
     """
     s_pointer = read_slot_champion(store, STRATEGY_SLOT)
     m_pointer = read_slot_champion(store, "m")
@@ -442,6 +517,14 @@ def construct_target_book(
         params = load_portfolio_params_from_store(STRATEGY_SLOT, store=store)
     except PortfolioParamsError as exc:
         raise ContractRefusal(f"the S slot's portfolio parameter set is unusable: {exc}") from exc
+    notional = float(params.book_notional_usd)
+    if sizing is not None:
+        if sizing.ceiling_usd != notional:
+            raise ContractRefusal(
+                f"the session was sized under a ${sizing.ceiling_usd:,.2f} ceiling; the S "
+                f"slot's book_notional_usd is ${notional:,.2f}"
+            )
+        notional = sizing.notional_usd
 
     try:
         inputs = resolve_strategy_sessions(
@@ -476,7 +559,7 @@ def construct_target_book(
         params=params,
         universe=inputs.universe,
         sessions=inputs.sessions,
-        portfolio_notional=params.book_notional_usd,
+        portfolio_notional=notional,
         w_initial=w_initial,
         **held_sessions_kwargs(construct_book, ages),
     )
@@ -493,8 +576,9 @@ def construct_target_book(
         weights={t: float(w) for t, w in zip(inputs.universe.tickers, weights, strict=True)},
         turnover_one_way_ratio=float(book.turnover[0]),
         turnover_budget=session_turnover_budget(diagnostics),
+        turnover_drivers={k: diagnostics[k] for k in TURNOVER_DRIVER_KEYS if k in diagnostics},
         cost_bps=float(book.cost_bps[0]),
-        portfolio_notional_usd=float(params.book_notional_usd),
+        portfolio_notional_usd=notional,
         evidence=constructed.evidence,
         metric=_portfolio_metric_record(
             constructed.evidence,
@@ -510,4 +594,5 @@ def construct_target_book(
             t: bool(e)
             for t, e in zip(inputs.universe.tickers, inputs.sessions[0].eligibility, strict=True)
         },
+        sizing=sizing,
     )

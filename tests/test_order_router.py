@@ -40,6 +40,10 @@ from crucible_trader.order_intent import (
     order_intent_key,
     read_order_intent,
 )
+from crucible_trader.order_intent_reconciliation import (
+    RECONCILIATION_SCHEMA_VERSION,
+    order_intent_reconciliation_key,
+)
 from crucible_trader.order_router import (
     ORDER_REF_PREFIX,
     PAPER_GATEWAY_PORT,
@@ -173,7 +177,9 @@ class RoutingIB(FakeIB):
             return
         for trade in self._trades:
             ref = trade.order.orderRef or ""
-            if trade.orderStatus.status != "Submitted" or not ref.startswith(ORDER_REF_PREFIX):
+            if trade.orderStatus.status != "Submitted" or not ref.startswith(
+                ORDER_REF_PREFIX + "|"
+            ):
                 continue
             symbol, qty = trade.contract.symbol, int(trade.order.totalQuantity)
             buy = trade.order.action == "BUY"
@@ -718,6 +724,24 @@ def test_the_router_still_sells_its_own_name_after_a_partly_filled_sell(store) -
     # sell does not make the shares it left behind foreign.
     _own_intent(store, "2026-09-03", "SNDK")
     _own_intent(store, "2026-09-04", "SNDK", side="sell", filled=4)
+    # Codex 609afe10: a sell's shortfall snapshot can predate later fills, so a
+    # partly filled sell counts only once the reconcile job has settled it.
+    store.put_bytes(
+        order_intent_reconciliation_key("2026-09-08"),
+        json.dumps(
+            {
+                "schema_version": RECONCILIATION_SCHEMA_VERSION,
+                "book_day": "2026-09-04",
+                "rows": [
+                    {
+                        "order_key": order_key("2026-09-04", "SNDK"),
+                        "class": "closed_partial",
+                        "filled_quantity": 4.0,
+                    }
+                ],
+            }
+        ).encode(),
+    )
     ib = RoutingIB(positions={"SNDK": 6}, prices={**PRICES, "SNDK": 1_000.0})
     _route(_router(store, ib), _book())
     placed = [(c.symbol, o.action, o.totalQuantity) for c, o in ib.order_calls]
@@ -892,6 +916,13 @@ def test_the_refusal_carries_the_quote_sources_miss() -> None:
         PriceUnavailableError, match=r"\[AAA: no tick within 18s; .*354 not subscribed\]"
     ):
         _plan(_book(), quote=quote)
+
+
+def test_the_routers_refusal_carries_its_quote_sources_miss(store) -> None:
+    """The router memoises its quotes per plan and still passes the source's miss through."""
+    router = _router(store, RoutingIB(), quote=_Missing({"BBB": 50.0}))
+    with pytest.raises(PriceUnavailableError, match=r"\[AAA: no tick within 18s\]"):
+        list(router.batches(_book()))
 
 
 # -- the book-day close fallback --------------------------------------------------------

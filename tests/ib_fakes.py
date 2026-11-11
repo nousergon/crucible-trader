@@ -102,11 +102,15 @@ class FakeIB:
         fills: bool = True,
         broker_fills: tuple = (),
         connect_error: BaseException | None = None,
+        nav: float | None = 10_000_000.0,
     ) -> None:
         self.clock = clock or FakeClock()
         self.accounts = list(accounts)
         self.book = dict(positions or {})
         self.cash = cash
+        #: The account's `NetLiquidation` (None: IB reports no row).
+        self.nav = nav
+        self.cancelled_orders: list[int] = []
         #: `reconcile_entrypoint.fills_from_ib` reads this through the real
         #: `.reqExecutions()` method below -- kept distinct from `_simulate_fills`
         #: (the order-fill-simulation toggle) so a method and a bool don't
@@ -153,11 +157,21 @@ class FakeIB:
         ]
 
     def accountSummary(self):  # noqa: N802 - SDK spelling
-        return [
+        rows = [
             SimpleNamespace(
                 account=self.accounts[0], tag="TotalCashValue", currency="USD", value=str(self.cash)
             )
         ]
+        if self.nav is not None:
+            rows.append(
+                SimpleNamespace(
+                    account=self.accounts[0],
+                    tag="NetLiquidation",
+                    currency="USD",
+                    value=str(self.nav),
+                )
+            )
+        return rows
 
     def openTrades(self):  # noqa: N802 - SDK spelling
         return [t for t in self._trades if t.orderStatus.status in ("PreSubmitted", "Submitted")]
@@ -181,6 +195,13 @@ class FakeIB:
     def placeOrder(self, contract, order):  # noqa: N802 - SDK spelling
         self.order_calls.append((contract, order))
         return self._add(contract, order, "Submitted", self.clock())
+
+    def cancelOrder(self, order):  # noqa: N802 - SDK spelling
+        self.cancelled_orders.append(order.orderId)
+        for trade in self._trades:
+            if trade.order is order and trade.orderStatus.status in ("PreSubmitted", "Submitted"):
+                trade.orderStatus.status = "Cancelled"
+                trade.log.append(_entry(self.clock(), "Cancelled"))
 
     def fills(self):
         """The session's own fills (the order router reads these)."""
@@ -226,7 +247,7 @@ class FakeIB:
         trade = SimpleNamespace(
             contract=contract,
             order=order,
-            orderStatus=SimpleNamespace(status=status),
+            orderStatus=SimpleNamespace(status=status, filled=0.0),
             log=[_entry(at, status)],
         )
         self._trades.append(trade)
@@ -252,6 +273,17 @@ class FakeSdk:
     @staticmethod
     def MarketOrder(action, quantity):  # noqa: N802 - SDK spelling
         return SimpleNamespace(action=action, totalQuantity=quantity, orderRef="", tif="")
+
+    @staticmethod
+    def StopOrder(action, quantity, stopPrice):  # noqa: N802, N803 - SDK spelling
+        return SimpleNamespace(
+            action=action,
+            totalQuantity=quantity,
+            orderType="STP",
+            auxPrice=stopPrice,
+            orderRef="",
+            tif="",
+        )
 
 
 def ctx_for(store, job: str, *, day: dt.date = DAY, started: dt.datetime = T0) -> RunContext:
