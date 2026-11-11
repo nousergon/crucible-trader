@@ -181,6 +181,7 @@ from crucible_trader.gap_stop import (
 )
 from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
+from crucible_trader.order_book import ShareBasis
 from crucible_trader.order_intent import (
     OrderIntentConflictError,
     bought_by_this_trader,
@@ -731,6 +732,10 @@ class _MemoQuote:
             self._seen[symbol] = self._source(symbol)
         return self._seen[symbol]
 
+    def priced(self) -> dict[str, float]:
+        """Every usable price answered so far: the prices the plan sized at."""
+        return {s: p for s, p in self._seen.items() if p is not None and math.isfinite(p) and p > 0}
+
 
 class _CashLedger:
     """What a timed session's buys may spend: the book's cash plus what its sells FILLED.
@@ -1015,6 +1020,7 @@ class PaperOrderRouter:
         self._live_quote = live_quote or quote
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
+        self._share_basis: ShareBasis | None = None
         self._records: list[ExecutionRecord] = []
         self._nav: float | None = None
         #: The names this session may protect: the book's, inherited and owned.
@@ -1073,6 +1079,9 @@ class PaperOrderRouter:
             inherited=inherited,
             owned=owned,
         )
+        # For the order book's share columns only (`order_book.ShareBasis`):
+        # the positions and the memoised prices the plan above was sized at.
+        self._share_basis = ShareBasis(positions=dict(statement.positions), prices=quote.priced())
         gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:
             sells, buys, gapped = self._gap_stop(statement.positions, sells, buys)
@@ -1444,6 +1453,10 @@ class PaperOrderRouter:
         if self._watch is None:
             return None
         return self._watch.key, self._watch.payload(now)
+
+    def share_basis(self) -> ShareBasis | None:
+        """The positions and prices this session's plan sized at; None before :meth:`batches`."""
+        return self._share_basis
 
     def held_weights(self, portfolio_notional_usd: float) -> dict[str, float]:
         """The account's positions as the book held into the session (`held_weights`)."""
