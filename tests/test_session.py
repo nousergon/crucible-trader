@@ -180,3 +180,68 @@ def test_a_wheel_disagreement_fails_the_run_before_anything(tmp_path, pin, match
     with pytest.raises(RunningWheelMismatchError, match=match):
         _run(store, ib, router, constructed=constructed)
     assert router.sent == [] and constructed == [] and ib.order_calls == []
+
+
+class PlanningRouter(Router):
+    """A router whose plan records a share basis, or refuses."""
+
+    def __init__(self, *, refuse: bool = False) -> None:
+        super().__init__(n_batches=1)
+        self.refuse = refuse
+        self.planned = False
+
+    def batches(self, book):
+        self.planned = True
+        if self.refuse:
+            raise RuntimeError("plan refused")
+        return super().batches(book)
+
+    def share_basis(self):
+        assert self.planned, "the order book asked for shares before the plan"
+        return None
+
+
+def test_the_order_book_is_written_after_the_plan_and_before_any_order(store) -> None:
+    """alpha-engine-config-I13578: the book's share columns are the plan's, so
+    the router plans first; nothing is sent until the book is on the record."""
+    ib, router = FakeIB(), PlanningRouter()
+    seen: list[int] = []
+    router.on_send = lambda: seen.append(len(ctx_metrics()))
+    ctx = ctx_for(store, "trader.session")
+
+    def ctx_metrics():
+        return [m for m in ctx.metrics if m["name"] == "trader_order_book_written"]
+
+    session_cycle(
+        ctx,
+        broker=IbBrokerControl(ib, FakeSdk(ib)),
+        router=router,
+        installed_version=VERSION,
+        previous_weights=None,
+        clock=ib.clock,
+        contract_resolver=_contract(HEALTHY),
+        construct=lambda store_, **kw: SimpleNamespace(
+            s_champion="s", metric={"name": "portfolio_construction"}, alpha_bench=None
+        ),
+    )
+    assert router.sent == [["order-0"]] and seen == [1]
+
+
+def test_a_refused_plan_still_saves_the_order_book(store) -> None:
+    ib, router = FakeIB(), PlanningRouter(refuse=True)
+    ctx = ctx_for(store, "trader.session")
+    with pytest.raises(RuntimeError, match="plan refused"):
+        session_cycle(
+            ctx,
+            broker=IbBrokerControl(ib, FakeSdk(ib)),
+            router=router,
+            installed_version=VERSION,
+            previous_weights=None,
+            clock=ib.clock,
+            contract_resolver=_contract(HEALTHY),
+            construct=lambda store_, **kw: SimpleNamespace(
+                s_champion="s", metric={"name": "portfolio_construction"}, alpha_bench=None
+            ),
+        )
+    assert [m["name"] for m in ctx.metrics][-1] == "trader_order_book_written"
+    assert router.sent == []

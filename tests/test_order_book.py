@@ -5,7 +5,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import pandas as pd
 import pytest
+from crucible.features import DEFAULT_FEATURE_VERSION
+from crucible.keys import features_key
 from crucible.slots.strategy import BookUniverse
 from crucible.store import LocalStore
 
@@ -13,9 +16,11 @@ from crucible_trader.books_retention import is_books_key
 from crucible_trader.construction import TargetBook
 from crucible_trader.order_book import (
     ORDER_BOOK_METRIC,
+    ShareBasis,
     order_book_document,
     order_book_key,
     record_order_book,
+    sector_labels,
 )
 
 NOW = dt.datetime(2026, 11, 5, 15, 0, tzinfo=dt.UTC)
@@ -136,3 +141,118 @@ def test_a_metric_that_cannot_be_recorded_does_not_raise(tmp_path) -> None:
     assert record_order_book(
         NoMetrics(LocalStore(tmp_path)), _book(), previous_weights=None, now=NOW
     )
+
+
+def _write_sectors(store, day: str, labels: dict[str, object]) -> str:
+    key = features_key(DEFAULT_FEATURE_VERSION, day)
+    frame = pd.DataFrame(
+        {
+            "trading_day": [day] * len(labels),
+            "ticker": list(labels),
+            "sector_raw": list(labels.values()),
+        }
+    )
+    store.put_bytes(key, frame.to_parquet(index=False))
+    return key
+
+
+def test_each_row_carries_its_gics_sector_label_beside_the_engine_sector(tmp_path) -> None:
+    """alpha-engine-config-I13578: Brian read every holding as `__unsectored__`.
+    The label is display only; ``sector`` stays the engine's own value."""
+    ctx = _Ctx(LocalStore(tmp_path))
+    source = _write_sectors(
+        ctx.store,
+        "2026-11-05",
+        {"AAA": "Information Technology", "BBB": " Financials ", "CCC": None, "SPY": None},
+    )
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW)
+    doc = json.loads(ctx.store.get_bytes(key))
+    labels = {r["ticker"]: r["sector_label"] for r in doc["rows"]}
+    assert labels == {
+        "AAA": "Information Technology",
+        "BBB": "Financials",
+        "CCC": None,  # the feature layer left it unlabelled
+        "DDD": None,  # not in the feature artifact
+        "SPY": None,
+        "$CASH": None,
+    }
+    assert {r["ticker"]: r["sector"] for r in doc["rows"]}["AAA"] == "t"
+    assert doc["sector_label_source"] == source
+
+
+def test_no_feature_artifact_leaves_the_sector_labels_null_and_the_book_written(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW)
+    doc = json.loads(ctx.store.get_bytes(key))
+    assert {r["sector_label"] for r in doc["rows"]} == {None}
+    assert doc["sector_label_source"] is None and ctx.metrics[-1]["status"] == "OK"
+
+
+def test_an_unreadable_feature_artifact_never_costs_the_book(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+    ctx.store.put_bytes(features_key(DEFAULT_FEATURE_VERSION, "2026-11-05"), b"not parquet")
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW)
+    assert key is not None and ctx.metrics[-1]["status"] == "OK"
+    doc = json.loads(ctx.store.get_bytes(key))
+    assert {r["sector_label"] for r in doc["rows"]} == {None}
+
+
+def test_each_held_row_carries_the_shares_the_session_sized(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+    basis = ShareBasis(
+        positions={"AAA": 500, "BBB": 100},
+        prices={"AAA": 110.0, "BBB": 50.0, "CCC": 33.0},
+    )
+    key = record_order_book(
+        ctx,
+        _book(),
+        previous_weights={"AAA": 0.55, "BBB": 0.05},
+        now=NOW,
+        share_basis=lambda: basis,
+    )
+    doc = json.loads(ctx.store.get_bytes(key))
+    rows = {r["ticker"]: r for r in doc["rows"]}
+    # AAA 0.6 * 100k / 110 = 545.45 -> 545; CCC 0.3 * 100k / 33 = 909.09 -> 909.
+    assert (rows["AAA"]["previous_shares"], rows["AAA"]["target_shares"]) == (500, 545)
+    assert rows["AAA"]["share_price_usd"] == 110.0
+    assert (rows["BBB"]["previous_shares"], rows["BBB"]["target_shares"]) == (100, 0)
+    assert (rows["CCC"]["previous_shares"], rows["CCC"]["target_shares"]) == (0, 909)
+    assert (rows["DDD"]["previous_shares"], rows["DDD"]["target_shares"]) == (0, 0)
+    for sentinel in ("SPY", "$CASH"):
+        assert rows[sentinel]["target_shares"] is None
+        assert rows[sentinel]["previous_shares"] is None
+    assert doc["share_basis"] == "router_plan"
+
+
+def test_without_a_share_basis_the_share_columns_are_null() -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
+    assert {(r["previous_shares"], r["target_shares"]) for r in doc["rows"]} == {(None, None)}
+    assert doc["share_basis"] is None
+
+
+def test_a_failing_share_basis_never_costs_the_book(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+
+    def broken() -> ShareBasis:
+        raise RuntimeError("router state unreadable")
+
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW, share_basis=broken)
+    assert key is not None and ctx.metrics[-1]["status"] == "OK"
+    doc = json.loads(ctx.store.get_bytes(key))
+    assert doc["share_basis"] is None
+
+
+def test_a_weighted_name_with_no_usable_price_has_no_target_shares() -> None:
+    basis = ShareBasis(positions={}, prices={"AAA": float("nan")})
+    assert basis.target_shares("AAA", 0.5, 100_000.0) is None
+    assert basis.target_shares("BBB", 0.5, 100_000.0) is None
+    assert basis.target_shares("BBB", 0.0, 100_000.0) == 0
+
+
+def test_a_feature_artifact_without_a_sector_column_labels_nothing(tmp_path) -> None:
+    store = LocalStore(tmp_path)
+    frame = pd.DataFrame({"trading_day": ["2026-11-05"], "ticker": ["AAA"]})
+    store.put_bytes(
+        features_key(DEFAULT_FEATURE_VERSION, "2026-11-05"), frame.to_parquet(index=False)
+    )
+    assert sector_labels(store, "2026-11-05", ["AAA"]) == ({}, None)

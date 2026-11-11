@@ -111,6 +111,7 @@ from crucible_trader.broker_statement import BrokerStatement
 from crucible_trader.construction import TargetBook
 from crucible_trader.execution_shortfall import build_no_orders_document, build_shortfall_document
 from crucible_trader.kill_switch import AcceptedOrder, assert_trading_permitted, utcnow
+from crucible_trader.order_book import ShareBasis
 from crucible_trader.order_router import (
     MAX_ORDER_NOTIONAL_VAR,
     MAX_SESSION_NOTIONAL_VAR,
@@ -510,6 +511,8 @@ class SimulatedFillRouter:
         self._clock = clock
         self._closes = PanelCloseSource(store, trading_day)
         self._planned: tuple[PlannedOrder, ...] = ()
+        #: The names the plan priced, for the order book's share columns.
+        self._sized_names: frozenset[str] | None = None
         self._records: list[ExecutionRecord] = []
         self._opening, self._carried_from = opening_positions(store, trading_day)
         self._splits: list[dict[str, object]] | None = None
@@ -587,7 +590,21 @@ class SimulatedFillRouter:
             max_session_notional_usd=session_cap,
         )
         self._planned = sells + buys
+        self._sized_names = frozenset(t for t, w in book.weights.items() if w > 0) | set(
+            self._opening
+        )
         return [batch for batch in (sells, buys) if batch]
+
+    def share_basis(self) -> ShareBasis | None:
+        """The opening book and the panel closes the plan sized at (`order_book.ShareBasis`).
+
+        None before :meth:`batches`. The closes are the same cached panel the
+        plan read, so pricing here again reads nothing new.
+        """
+        if self._sized_names is None:
+            return None
+        prices = {s: p for s in sorted(self._sized_names) if (p := self._closes(s)) is not None}
+        return ShareBasis(positions=dict(self._opening), prices=prices)
 
     def send(self, batch: Sequence[PlannedOrder]) -> None:
         for order in batch:
