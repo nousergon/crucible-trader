@@ -398,6 +398,38 @@ def test_a_book_is_routed_sells_first_and_every_order_is_recorded(store) -> None
     assert document["outcome"] == "computed" and document["summary"]["n_filled"] == 3
 
 
+def test_the_order_book_share_basis_is_what_the_plan_sized_at(store) -> None:
+    """`order_book.ShareBasis` (alpha-engine-config-I13578): the broker's shares
+    held into the session and the plan's own prices, so each order book row's
+    ``target_shares - previous_shares`` is the order the plan made for it."""
+    ib = RoutingIB(positions={"BBB": 500, "CCC": 100})
+    router = _router(store, ib)
+    assert router.share_basis() is None  # nothing planned yet
+    book = _book()
+    sells, buys = list(router.batches(book))
+    basis = router.share_basis()
+    assert basis is not None
+    assert basis.positions == {"BBB": 500, "CCC": 100}
+    assert basis.prices == {"AAA": 100.0, "BBB": 50.0, "CCC": 20.0}
+    planned = {
+        o.decision.symbol: (1 if o.decision.side == "buy" else -1) * int(o.decision.quantity)
+        for o in (*sells, *buys)
+    }
+    for symbol, delta in planned.items():
+        target = basis.target_shares(
+            symbol, book.weights.get(symbol, 0.0), book.portfolio_notional_usd
+        )
+        assert target is not None
+        assert target - basis.positions.get(symbol, 0) == delta
+    assert ib.order_calls == []  # planning sent nothing
+
+
+def test_the_order_book_share_epsilon_is_the_plans() -> None:
+    from crucible_trader import order_book, order_router
+
+    assert order_book._SHARE_EPSILON == order_router._SHARE_EPSILON
+
+
 def test_a_book_already_held_sends_nothing_and_says_so(store) -> None:
     ib = RoutingIB(positions={"AAA": 300, "BBB": 400})
     router = _router(store, ib)

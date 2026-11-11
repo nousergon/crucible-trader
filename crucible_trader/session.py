@@ -99,18 +99,33 @@ def session_cycle(
         held_sessions=held_sessions,
     )
     ctx.record_metric(book.metric)
-    # The day's order book, saved before any order is sent so the record of
-    # what was decided exists whatever the broker then does. Never raises.
-    record_order_book(
-        ctx,
-        book,
-        previous_weights=None if previous_weights is None else dict(previous_weights),
-        now=clock(),
-        held_sessions=held_sessions,
-    )
+
+    def save_order_book() -> None:
+        # The day's order book, saved before any order is sent so the record of
+        # what was decided exists whatever the broker then does. Never raises.
+        record_order_book(
+            ctx,
+            book,
+            previous_weights=None if previous_weights is None else dict(previous_weights),
+            now=clock(),
+            held_sessions=held_sessions,
+            share_basis=getattr(router, "share_basis", None),
+            feature_version=feature_version,
+        )
+
+    # The router plans first -- reading the account and pricing each name, and
+    # sending nothing -- so the book's share columns carry the shares the plan
+    # sized at (`order_book.ShareBasis`). A refused plan still saves the book,
+    # without shares, before the refusal fails the run.
+    try:
+        batches = router.batches(book)
+    except BaseException:
+        save_order_book()
+        raise
+    save_order_book()
 
     sent = 0
-    for batch in router.batches(book):
+    for batch in batches:
         assert_trading_permitted(ctx.store, day)
         router.send(batch)
         sent += 1
