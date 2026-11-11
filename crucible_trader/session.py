@@ -13,7 +13,11 @@ broker by a route that skips one:
    `hold` mode for the day. An engaged hold is then refused immediately through
    `kill_switch.assert_trading_permitted`, so nothing is constructed on a
    forecast the safeguard has just called degenerate.
-3. **Before every order batch**, `kill_switch.assert_trading_permitted` raises
+3. **Before the contract is resolved**, `v1_rules_guard.enforce_v1_rules`
+   (`alpha-engine-config-I12024`): every v1 trading rule the private record
+   still owes is named on the run. It never holds a session: from the
+   record's ``enforce_from`` the debt fails CI instead.
+4. **Before every order batch**, `kill_switch.assert_trading_permitted` raises
    :class:`~crucible_trader.kill_switch.TradingHaltedError` when flatten or
    freeze is engaged or a hold covers the day. It is re-read per batch, so a
    switch fired mid-session stops the next batch.
@@ -42,6 +46,7 @@ from crucible_trader.hold_book import enforce_hold_book
 from crucible_trader.kill_switch import BrokerControl, assert_trading_permitted, utcnow
 from crucible_trader.order_book import record_order_book
 from crucible_trader.paper_smoke import RunningWheelMismatchError, running_wheel_disagreement
+from crucible_trader.v1_rules_guard import enforce_v1_rules
 
 SESSION_SCHEMA_VERSION = "trader_session.v1"
 
@@ -66,11 +71,13 @@ def session_cycle(
     feature_version: str | None = None,
     contract_resolver: Callable[[Store, str], ResolvedContract] = resolve,
     construct: Callable[..., TargetBook] = construct_target_book,
+    rules_guard: Callable[[RunContext], object] = enforce_v1_rules,
 ) -> dict[str, Any]:
     """Run one trading session's decision and orders. Raises on every refusal."""
     disagreement = running_wheel_disagreement(ctx.store, installed_version)
     if disagreement is not None:
         raise RunningWheelMismatchError(disagreement)
+    rules_guard(ctx)  # reports only; never raises (no trading holds)
 
     day = ctx.trading_day.isoformat()
     contract = contract_resolver(ctx.store, day)
