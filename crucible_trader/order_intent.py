@@ -192,17 +192,62 @@ def _filled_by_order(store: Store, day: str) -> dict[str, float]:
     return {str(o["order_id"]): float(o["filled_quantity"]) for o in orders}
 
 
+#: Reconciliation classes whose ``filled_quantity`` is the broker's FINAL count
+#: for the order: the broker closed it (or filled it whole, or over), and the
+#: executions under its key were each admitted once by ``execId``.
+_SETTLED_CLASSES: frozenset[str] = frozenset(
+    {"filled", "overfilled", "closed_partial", "closed_unfilled"}
+)
+
+
+def _settled_by_order(store: Store, book_day: str) -> dict[str, float]:
+    """The broker's final filled shares per order key for the BOOK ``book_day``.
+
+    Read from the ``order_intent_reconciliation`` document the reconcile job
+    files after the execution day's close (the session after ``book_day``,
+    `alpha-engine-config-I13261`), from the broker's own executions. Only rows
+    in :data:`_SETTLED_CLASSES` are returned; an order still working, unknown to
+    the broker or in a break that makes its count untrustworthy is absent, and
+    so is every order when no document names ``book_day``. A document that
+    cannot be read raises.
+    """
+    # Imported here: `order_intent_reconciliation` imports this module.
+    from crucible.calendar import next_trading_day
+
+    from crucible_trader.order_intent_reconciliation import (
+        RECONCILIATION_SCHEMA_VERSION,
+        order_intent_reconciliation_key,
+    )
+
+    executed = next_trading_day(dt.date.fromisoformat(book_day)).isoformat()
+    key = order_intent_reconciliation_key(executed)
+    if not store.exists(key):
+        return {}
+    try:
+        document = json.loads(store.get_bytes(key))
+        if document.get("schema_version") != RECONCILIATION_SCHEMA_VERSION:
+            raise ValueError(f"schema_version {document.get('schema_version')!r}")
+        if document.get("book_day") != book_day:
+            return {}  # a document about another book says nothing about this one
+        return {
+            str(row["order_key"]): float(row["filled_quantity"])
+            for row in document["rows"]
+            if row["class"] in _SETTLED_CLASSES
+        }
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise OrderIntentError(f"{key!r} is not a readable reconciliation: {exc}") from exc
+
+
 def bought_by_this_trader(
     store: Store, symbols: Iterable[str], *, account: str, before: str
 ) -> frozenset[str]:
     """Of ``symbols``, the names this trader itself still holds shares of in ``account``.
 
     A name counts when the shares its own orders FILLED on book days before
-    ``before`` -- bought minus sold, from each session's ``execution_shortfall``
-    record, matched by order key -- are still positive. The router's own
-    position is not foreign to it: on 2026-11-04 the trader bought SNDK (book
-    2026-11-03), and SNDK is neither one of v1's declared inherited names nor
-    certain to be in the next book, so
+    ``before`` -- bought minus sold, matched by order key -- are certainly
+    still positive. The router's own position is not foreign to it: on
+    2026-11-04 the trader bought SNDK (book 2026-11-03), and SNDK is neither
+    one of v1's declared inherited names nor certain to be in the next book, so
     :func:`~crucible_trader.order_router.plan_orders` would refuse the whole
     next session over the trader's own holding (``ForeignPositionError``,
     alpha-engine-config-I13164) the first time the champion rotated out of it.
@@ -210,16 +255,24 @@ def bought_by_this_trader(
     An intent alone is not a holding: it is written BEFORE the submit, so a buy
     that never filled owns nothing, and a sell that trimmed or partly filled
     leaves the trader's remaining shares its own (alpha-engine-config-I13237).
-    A buy with no fill on record counts as nothing filled -- at worst the name
-    stays refused. A sell with no fill on record raises
-    :class:`OrderIntentError`: counting it as unfilled would call shares owned
-    that the trader may already have sold. So does an intent or session record
-    that cannot be read: a name is never called owned on a guess, and a name
-    never called owned stays refused.
+
+    **What an order filled is the broker's count, once it is final.** The
+    session's ``execution_shortfall`` record is a snapshot taken at the end of
+    the router's bounded fill wait, with no cancel first, so a DAY order can
+    keep filling after it (codex 609afe10). An order the reconcile job has
+    settled against the broker's executions (:func:`_settled_by_order`) counts
+    exactly what the broker reports. An order not yet settled counts at the
+    bound that never calls a share owned that might not be: a buy at what the
+    snapshot saw filled (fills only grow), a sell at its whole intended
+    quantity (it may have finished selling). So a late-filling sell never
+    leaves phantom owned shares, and a late-filling buy is owned as soon as the
+    reconciliation that saw it fill is filed. An intent or record that cannot
+    be read raises :class:`OrderIntentError`: a name is never called owned on
+    a guess, and a name never called owned stays refused.
 
     Only ``symbols`` are read (one list of the prefix, the intents per wanted
-    name, and one session record per day they span), so the cost tracks the
-    names the book dropped, not the whole intent history.
+    name, and one session record and one reconciliation per day they span), so
+    the cost tracks the names the book dropped, not the whole intent history.
     """
     wanted = set(symbols)
     if not wanted:
@@ -235,6 +288,7 @@ def bought_by_this_trader(
         if symbol in wanted and _ISO_DAY.match(day) and day < before:
             days_by_symbol.setdefault(symbol, []).append(day)
     sessions: dict[str, dict[str, float]] = {}
+    settled: dict[str, dict[str, float]] = {}
     owned: set[str] = set()
     for symbol, days in days_by_symbol.items():
         held = 0.0
@@ -244,19 +298,18 @@ def bought_by_this_trader(
                 raise OrderIntentError(f"intent for {day}/{symbol} vanished while read")
             if intent["account"] != account or intent["symbol"] != symbol:
                 continue
-            if day not in sessions:
-                sessions[day] = _filled_by_order(store, day)
-            filled = sessions[day].get(str(intent["order_key"]))
-            if intent["side"] == "buy":
-                held += filled or 0.0
-            elif filled is None:
-                raise OrderIntentError(
-                    f"sell intent {day}/{symbol} has no fill on record in "
-                    f"{execution_shortfall_key(day)!r}; what it sold is unknown, so the name "
-                    "is not called owned. Reconcile it against the broker's executions."
-                )
-            else:
-                held -= filled
+            if day not in settled:
+                settled[day] = _settled_by_order(store, day)
+            order = str(intent["order_key"])
+            final = settled[day].get(order)
+            if final is None:
+                if day not in sessions:
+                    sessions[day] = _filled_by_order(store, day)
+                seen = sessions[day].get(order) or 0.0
+                # Not settled: a buy counts what was seen filled, a sell
+                # everything it could have sold.
+                final = seen if intent["side"] == "buy" else max(float(intent["quantity"]), seen)
+            held += final if intent["side"] == "buy" else -final
         if held > 0:
             owned.add(symbol)
     return frozenset(owned)
