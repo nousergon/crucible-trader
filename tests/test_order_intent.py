@@ -27,6 +27,13 @@ from crucible_trader.order_intent import (
     order_intent_key,
     read_order_intent,
 )
+from crucible_trader.order_intent_reconciliation import (
+    BrokerExecution,
+    BrokerOrder,
+    intents_for_day,
+    order_intent_reconciliation_key,
+    reconcile_order_intents,
+)
 
 DAY = "2026-09-08"
 WHEN = dt.datetime(2026, 9, 8, 13, 30, tzinfo=dt.UTC)
@@ -174,6 +181,36 @@ def _session(store, day: str, *orders: tuple[str, str, int, int]) -> None:
     )
 
 
+def _reconcile(store, book_day: str, executed: str, *orders: tuple[str, str, int, str]) -> None:
+    """The reconcile job's document for ``book_day``, run on execution day ``executed``:
+    (symbol, side, shares the broker executed, final broker status) per order."""
+    intents = intents_for_day(store, book_day)
+    ref = {i["symbol"]: i["order_ref"] for i in intents}
+    broker_orders = [BrokerOrder(order_ref=ref[sym], status=status) for sym, _, _, status in orders]
+    executions = [
+        BrokerExecution(
+            order_ref=ref[sym],
+            shares=float(shares),
+            exec_id=f"e-{book_day}-{sym}",
+            account="DU1",
+            symbol=sym,
+            side={"buy": "BOT", "sell": "SLD"}[side],
+        )
+        for sym, side, shares, _ in orders
+        if shares
+    ]
+    document = reconcile_order_intents(
+        trading_day=executed,
+        book_day=book_day,
+        intents=intents,
+        orders=broker_orders,
+        executions=executions,
+        key_prefix="crucible-trader",
+        now=WHEN,
+    )
+    store.put_bytes(order_intent_reconciliation_key(executed), json.dumps(document).encode())
+
+
 def test_a_sell_that_left_shares_held_does_not_revoke_ownership(store) -> None:
     """Codex bf44c6c0: a trim, or a partly filled sell, leaves the trader's own shares."""
     _claim(store, "2026-09-03", "AAA")
@@ -182,6 +219,14 @@ def test_a_sell_that_left_shares_held_does_not_revoke_ownership(store) -> None:
     _claim(store, "2026-09-04", "AAA", side="sell", quantity=4)
     _claim(store, "2026-09-04", "BBB", side="sell")
     _session(store, "2026-09-04", ("AAA", "sell", 4, 4), ("BBB", "sell", 10, 3))
+    # The broker closed BBB's sell with 3 of 10 sold: settled, so 7 are still ours.
+    _reconcile(
+        store,
+        "2026-09-04",
+        "2026-09-08",
+        ("AAA", "sell", 4, "Filled"),
+        ("BBB", "sell", 3, "Cancelled"),
+    )
     owned = bought_by_this_trader(store, {"AAA", "BBB"}, account="DU1", before=DAY)
     assert owned == frozenset({"AAA", "BBB"})
 
@@ -224,11 +269,77 @@ def test_a_session_record_without_fills_counts_a_buy_as_nothing_filled(store) ->
     assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
 
 
-def test_a_sell_with_no_fill_on_record_is_refused_not_read_as_unfilled(store) -> None:
+def test_a_sell_with_no_fill_on_record_counts_as_sold_whole_not_unfilled(store) -> None:
     _claim(store, "2026-09-03", "AAA")
     _session(store, "2026-09-03", ("AAA", "buy", 10, 10))
     _claim(store, "2026-09-04", "AAA", side="sell")  # the session filed no record
-    with pytest.raises(OrderIntentError, match="no fill on record"):
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+# -- codex 609afe10: the session snapshot is not the final fill ----------------------
+
+
+def test_a_buy_that_filled_after_the_snapshot_is_owned_once_reconciled(store) -> None:
+    """The router's fill wait ended with 0 filled; the DAY order filled later."""
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 0))
+    _reconcile(store, "2026-09-03", "2026-09-04", ("AAA", "buy", 10, "Filled"))
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset({"AAA"})
+
+
+def test_a_sell_that_finished_after_the_snapshot_leaves_no_phantom_shares(store) -> None:
+    """The snapshot saw 3 of 10 sold; the rest sold later. Nothing of ours is left."""
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 10))
+    _claim(store, "2026-09-04", "AAA", side="sell")
+    _session(store, "2026-09-04", ("AAA", "sell", 10, 3))
+    _reconcile(store, "2026-09-04", "2026-09-08", ("AAA", "sell", 10, "Filled"))
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+def test_an_unsettled_sell_never_reads_as_shares_still_owned(store) -> None:
+    """No reconciliation yet: the sell may have finished, so nothing is called owned."""
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 10))
+    _claim(store, "2026-09-04", "AAA", side="sell")
+    _session(store, "2026-09-04", ("AAA", "sell", 10, 3))
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+def test_an_order_still_working_at_reconciliation_counts_as_unsettled(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 0))
+    _reconcile(store, "2026-09-03", "2026-09-04", ("AAA", "buy", 4, "Submitted"))
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+def test_a_settled_order_does_not_need_its_session_record(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    store.put_bytes(execution_shortfall_key("2026-09-03"), b"not json")
+    _reconcile(store, "2026-09-03", "2026-09-04", ("AAA", "buy", 10, "Filled"))
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset({"AAA"})
+
+
+def test_a_reconciliation_of_another_book_is_not_read_as_this_one(store) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 0))
+    _reconcile(store, "2026-09-03", "2026-09-04", ("AAA", "buy", 10, "Filled"))
+    key = order_intent_reconciliation_key("2026-09-04")
+    document = json.loads(store.get_bytes(key))
+    document["book_day"] = "2026-09-02"
+    store.put_bytes(key, json.dumps(document).encode())
+    assert bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"not json", b"[]", json.dumps({"schema_version": "order_intent_reconciliation.v1"}).encode()],
+)
+def test_an_unreadable_reconciliation_is_refused_not_skipped(store, payload) -> None:
+    _claim(store, "2026-09-03", "AAA")
+    _session(store, "2026-09-03", ("AAA", "buy", 10, 10))
+    store.put_bytes(order_intent_reconciliation_key("2026-09-04"), payload)
+    with pytest.raises(OrderIntentError, match="not a readable reconciliation"):
         bought_by_this_trader(store, {"AAA"}, account="DU1", before=DAY)
 
 

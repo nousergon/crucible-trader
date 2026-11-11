@@ -40,6 +40,10 @@ from crucible_trader.order_intent import (
     order_intent_key,
     read_order_intent,
 )
+from crucible_trader.order_intent_reconciliation import (
+    RECONCILIATION_SCHEMA_VERSION,
+    order_intent_reconciliation_key,
+)
 from crucible_trader.order_router import (
     ORDER_REF_PREFIX,
     PAPER_GATEWAY_PORT,
@@ -718,6 +722,24 @@ def test_the_router_still_sells_its_own_name_after_a_partly_filled_sell(store) -
     # sell does not make the shares it left behind foreign.
     _own_intent(store, "2026-09-03", "SNDK")
     _own_intent(store, "2026-09-04", "SNDK", side="sell", filled=4)
+    # Codex 609afe10: a sell's shortfall snapshot can predate later fills, so a
+    # partly filled sell counts only once the reconcile job has settled it.
+    store.put_bytes(
+        order_intent_reconciliation_key("2026-09-08"),
+        json.dumps(
+            {
+                "schema_version": RECONCILIATION_SCHEMA_VERSION,
+                "book_day": "2026-09-04",
+                "rows": [
+                    {
+                        "order_key": order_key("2026-09-04", "SNDK"),
+                        "class": "closed_partial",
+                        "filled_quantity": 4.0,
+                    }
+                ],
+            }
+        ).encode(),
+    )
     ib = RoutingIB(positions={"SNDK": 6}, prices={**PRICES, "SNDK": 1_000.0})
     _route(_router(store, ib), _book())
     placed = [(c.symbol, o.action, o.totalQuantity) for c, o in ib.order_calls]
