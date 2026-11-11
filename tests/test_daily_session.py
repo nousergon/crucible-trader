@@ -34,6 +34,7 @@ from test_simulated_broker import write_panel
 from crucible_trader import daily_session as module
 from crucible_trader import simulated_broker as simulated_broker_module
 from crucible_trader.broker_session import OrderRefusedError
+from crucible_trader.construction import SessionSizing
 from crucible_trader.contract import ContractRefusal, ContractUnavailable
 from crucible_trader.daily_session import (
     SESSION_JOB,
@@ -716,6 +717,97 @@ class TestTheBookHeldIntoTheSession:
         monkeypatch.setattr(module, "load_portfolio_params_from_store", broken)
         with pytest.raises(ContractRefusal, match="parameter set is unusable"):
             _cycle(store, HoldingRouter({}))
+
+
+class SizingRouter(HoldingRouter):
+    """A live router that sizes on its NAV and protects what it holds."""
+
+    def __init__(self, held, *, nav: float, protect_fail: BaseException | None = None) -> None:
+        super().__init__(held)
+        self.nav = nav
+        self.protect_fail = protect_fail
+        self.protected = 0
+
+    def session_sizing(self, ceiling: float) -> SessionSizing:
+        return SessionSizing(ceiling_usd=ceiling, nav_usd=self.nav)
+
+    def protect_holdings(self):
+        self.protected += 1
+        if self.protect_fail is not None:
+            raise self.protect_fail
+        return ({"symbol": "PLTR", "disposition": "placed"},)
+
+
+class TestALiveSessionSizesOnNavAndProtectsItsHoldings:
+    """2026-11-09 parity audit rows 5 and 1."""
+
+    @pytest.fixture(autouse=True)
+    def _params(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            module,
+            "load_portfolio_params_from_store",
+            lambda slot, *, store: SimpleNamespace(book_notional_usd=1_000_000.0),
+        )
+
+    def test_the_book_and_the_held_weights_are_sized_on_the_nav(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        sizings: list[object] = []
+
+        def construct(store_, **kwargs):
+            sizings.append(kwargs.get("sizing"))
+            return _construct(store_, **kwargs)
+
+        router = SizingRouter({"PLTR": 0.25, "__CASH__": 0.75}, nav=850_000.0)
+        _, result, _ = _cycle(store, router, construct=construct)
+        assert router.notionals == [850_000.0]
+        assert sizings == [SessionSizing(ceiling_usd=1_000_000.0, nav_usd=850_000.0)]
+        assert result["sizing"] == {
+            "basis": "broker_net_liquidation",
+            "nav_usd": 850_000.0,
+            "ceiling_usd": 1_000_000.0,
+            "notional_usd": 850_000.0,
+        }
+        assert router.protected == 1
+        assert result["protective_stops"] == [{"symbol": "PLTR", "disposition": "placed"}]
+
+    def test_a_router_without_nav_or_stops_keeps_the_declared_notional(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        _, result, _ = _cycle(store, LiveRouter())
+        assert result["sizing"] is None and result["protective_stops"] is None
+        assert result["protective_stops_in_session"] == []
+
+    def test_the_stops_the_all_day_session_placed_are_on_the_record(self, store) -> None:
+        _serveable(store, trading_day=DAY.isoformat())
+        router = SizingRouter({"PLTR": 0.25, "__CASH__": 0.75}, nav=850_000.0)
+        event = {"moment": "after the timed buy of PLTR", "symbol": "PLTR"}
+        router.protective_stop_events = (event,)
+        _, result, _ = _cycle(store, router)
+        assert result["protective_stops_in_session"] == [event]
+
+    def test_an_unreadable_nav_fails_the_session_before_anything_is_built(self, store) -> None:
+        from crucible_trader.order_router import NavUnavailableError
+
+        _serveable(store, trading_day=DAY.isoformat())
+
+        class Blind(SizingRouter):
+            def session_sizing(self, ceiling: float) -> SessionSizing:
+                raise NavUnavailableError("no NetLiquidation")
+
+        router = Blind({}, nav=1.0)
+        with pytest.raises(NavUnavailableError):
+            _cycle(store, router)
+        assert router.notionals == [] and router.protected == 0
+        assert not store.exists(TRADER_EVIDENCE_KEY)
+
+    def test_a_name_left_unprotected_fails_the_run_after_filing_the_orders(self, store) -> None:
+        from crucible_trader.order_router import ProtectiveStopError
+
+        _serveable(store, trading_day=DAY.isoformat())
+        router = SizingRouter({}, nav=1e6, protect_fail=ProtectiveStopError("AAA unprotected"))
+        with pytest.raises(ProtectiveStopError):
+            _cycle(store, router)
+        assert store.exists(execution_shortfall_key(DAY.isoformat()))
+        assert not store.exists(TRADER_EVIDENCE_KEY)
 
 
 class TestTheSessionRecordsItsTurnover:

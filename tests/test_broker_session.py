@@ -327,7 +327,7 @@ class TestReadOnlyBroker:
         broker = ReadOnlyBroker(ib)
         assert broker.managedAccounts() == ["DU1"]
         assert [p.contract.symbol for p in broker.positions()] == ["AAA"]
-        assert [r.tag for r in broker.accountSummary()] == ["TotalCashValue"]
+        assert [r.tag for r in broker.accountSummary()] == ["TotalCashValue", "NetLiquidation"]
 
     @pytest.mark.parametrize("name", ["placeOrder", "cancelOrder", "reqGlobalCancel", "client"])
     def test_every_other_attribute_is_refused(self, name) -> None:
