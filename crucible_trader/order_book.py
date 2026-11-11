@@ -20,6 +20,12 @@ and cash sentinels included and labelled, with:
 * ``book_position`` -- the row's place, largest target first (positions,
   then the rest by alpha rank), and the weights again in percent;
 * ``action`` -- what the book says about the name (see :func:`_action`);
+* ``held_sessions`` -- for a name the book holds, how many consecutive
+  sessions' books (this one included) have held it; 0 for a name it does not
+  hold, ``null`` on the two sentinels. It is the minimum hold's clock
+  (`crucible.portfolio.PortfolioParams.min_hold_days`,
+  `alpha-engine-config-I12024`): tomorrow's session reads it straight off this
+  book (:func:`held_sessions_from_order_books`).
 * ``sector_label`` -- the name's GICS sector for a reader (see
   :func:`sector_labels`), ``null`` when the feature layer does not label it
   and on the two sentinels. A DISPLAY field: ``sector`` stays the engine's own
@@ -53,6 +59,7 @@ from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.features.compute import read_features
 from crucible.keys import features_key
 from crucible.store import Store
+from krepis.trading_calendar import previous_trading_day
 
 from crucible_trader.books_retention import lock_books_records
 from crucible_trader.construction import TargetBook
@@ -60,9 +67,11 @@ from crucible_trader.construction import TargetBook
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "HELD_SESSIONS_WALK_LIMIT",
     "ORDER_BOOKS_PREFIX",
     "ORDER_BOOK_METRIC",
     "ORDER_BOOK_SCHEMA_VERSION",
+    "held_sessions_from_order_books",
     "SECTOR_LABEL_COLUMN",
     "ShareBasis",
     "order_book_document",
@@ -78,6 +87,15 @@ ORDER_BOOK_METRIC = "trader_order_book_written"
 #: Weights at or below this are no position (float noise from the engine).
 _ZERO = 1e-9
 
+#: The most books :func:`held_sessions_from_order_books` reads walking back
+#: through books that predate the ``held_sessions`` row field. A name held
+#: longer than this is reported as held this many sessions: every minimum hold
+#: worth ruling is far shorter, so the bound changes no decision and caps the
+#: reads a session start can make.
+HELD_SESSIONS_WALK_LIMIT = 30
+
+#: The two sentinel rows' ``action`` values; neither is a held name.
+_SENTINEL_ACTIONS = frozenset({"cash", "benchmark"})
 #: The compiled feature column a row's ``sector_label`` is read from
 #: (`crucible.features.registry` `sector_raw`: the GICS sector of the newest
 #: constituents snapshot fetched before the session). The same feature artifact
@@ -174,11 +192,17 @@ def order_book_document(
     *,
     previous_weights: dict[str, float] | None,
     written_at_utc: str,
+    held_sessions: Mapping[str, int] | None = None,
     sectors: Mapping[str, str] | None = None,
     sectors_source: str | None = None,
     shares: ShareBasis | None = None,
 ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # JSON document
     """The `order_book.v1` document for ``book``.
+
+    ``held_sessions`` is the session's INPUT clock
+    (:func:`held_sessions_from_order_books`: sessions each name had been held
+    into before this one). A name this book holds is stamped one more than that,
+    since this book holds it too; a name it does not hold is stamped 0.
 
     ``sectors`` (:func:`sector_labels`, read from ``sectors_source``) fills each
     row's ``sector_label``; ``shares`` (:class:`ShareBasis`) fills its share
@@ -192,6 +216,7 @@ def order_book_document(
     # No previous book is an all-cash book (construction's w_initial), so the
     # cash row's previous weight is 1.0, not 0 (codex ac64b346aa382999).
     previous = previous_weights if previous_weights is not None else {cash: 1.0}
+    ages = held_sessions or {}
     labels = sectors or {}
 
     ranked = sorted(
@@ -225,6 +250,13 @@ def order_book_document(
                     target=target,
                     eligible=bool(eligible.get(ticker, False)),
                     sentinel=sentinel,
+                ),
+                "held_sessions": (
+                    None
+                    if sentinel is not None
+                    else int(ages.get(ticker, 0)) + 1
+                    if target > _ZERO
+                    else 0
                 ),
                 "sector_label": None if sentinel is not None else labels.get(ticker),
                 "previous_shares": None if basis is None else int(basis.positions.get(ticker, 0)),
@@ -305,16 +337,18 @@ def record_order_book(
     *,
     previous_weights: dict[str, float] | None,
     now: dt.datetime,
+    held_sessions: Mapping[str, int] | None = None,
     share_basis: Callable[[], ShareBasis | None] | None = None,
     feature_version: str | None = None,
 ) -> str | None:
     """Write and lock the day's order book, and record one metric. Never raises.
 
-    ``share_basis`` is the router's (`PaperOrderRouter.share_basis`), called
-    once here; ``feature_version`` the version the session constructed under
-    (None: the default). A share basis or a sector read that fails leaves those
-    columns ``null`` and the book is written anyway -- the display columns are
-    never a reason to lose the record.
+    ``held_sessions`` is the clock the session constructed under (see
+    :func:`order_book_document`). ``share_basis`` is the router's
+    (`PaperOrderRouter.share_basis`), called once here; ``feature_version`` the
+    version the session constructed under (None: the default). A share basis or
+    a sector read that fails leaves those columns ``null`` and the book is
+    written anyway -- the display columns are never a reason to lose the record.
 
     Returns the key written, or ``None`` when the write failed.
     """
@@ -328,6 +362,7 @@ def record_order_book(
             book,
             previous_weights=previous_weights,
             written_at_utc=stamp,
+            held_sessions=held_sessions,
             sectors=sectors,
             sectors_source=sectors_source,
             shares=shares,
@@ -361,3 +396,95 @@ def record_order_book(
     except Exception:  # noqa: BLE001
         log.exception("order book metric not recorded")
     return key
+
+
+def _read_book(store: Store, trading_day: str) -> list[dict[str, Any]] | None:  # pyright: ignore[reportExplicitAny]  # JSON rows
+    """``trading_day``'s order-book rows, or ``None`` when there is no usable book.
+
+    A book that is absent, unreadable, or filed for another day ends a holding
+    run (:func:`held_sessions_from_order_books`); it never stops the session.
+    The cost is a shorter clock -- the hold protects a name for fewer sessions,
+    the behaviour before the hold existed -- never a refused day.
+    """
+    key = order_book_key(trading_day)
+    try:
+        if not store.exists(key):
+            return None
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        if document.get("trading_day") != trading_day or not isinstance(document["rows"], list):
+            raise ValueError(f"not the {trading_day} order book")
+        return [r for r in document["rows"] if isinstance(r, dict)]
+    except Exception as exc:  # noqa: BLE001 - a holding run ends; the session goes on
+        log.warning("order book %s unreadable, ending the holding run: %s", key, exc)
+        return None
+
+
+def _held_names(rows: list[dict[str, Any]]) -> set[str]:  # pyright: ignore[reportExplicitAny]
+    """The names a book holds: a positive target, sentinels excluded."""
+    return {
+        str(r["ticker"])
+        for r in rows
+        if r.get("action") not in _SENTINEL_ACTIONS
+        and isinstance(r.get("target_weight"), (int, float))
+        and r["target_weight"] > _ZERO
+    }
+
+
+def _stamped(rows: list[dict[str, Any]], held: set[str]) -> dict[str, int] | None:  # pyright: ignore[reportExplicitAny]
+    """The book's own ``held_sessions`` stamps for its held names, or ``None``
+    when any held name lacks a whole count >= 1 (a book written before the
+    field existed)."""
+    stamps: dict[str, int] = {}
+    for row in rows:
+        ticker = str(row["ticker"])
+        if ticker not in held:
+            continue
+        count = row.get("held_sessions")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            return None
+        stamps[ticker] = count
+    return stamps
+
+
+def held_sessions_from_order_books(
+    store: Store, trading_day: str, *, max_books: int = HELD_SESSIONS_WALK_LIMIT
+) -> dict[str, int]:
+    """By ticker, how many consecutive sessions' books held each name into ``trading_day``.
+
+    The minimum hold's clock (`alpha-engine-config-I12024`;
+    `crucible.slots.strategy.construct_book`'s ``held_sessions``): 1 for a name
+    the previous session's book entered, and so on back. Only names the
+    previous session's book holds (``target_weight > 0``) appear.
+
+    One read in steady state: the previous session's book stamps each row with
+    its own count. A book written before that field existed is counted by
+    walking back one trading session at a time, at most ``max_books`` books; a
+    stamped book met on the way finishes the count. A session with no usable
+    book is a GAP and ends every run at it -- a held day with no book, or a
+    record that cannot be read, is not evidence the name was held.
+    """
+    day = previous_trading_day(dt.date.fromisoformat(trading_day))
+    rows = _read_book(store, day.isoformat())
+    if rows is None:
+        return {}
+    run = _held_names(rows)
+    stamps = _stamped(rows, run)
+    if stamps is not None:
+        return stamps
+    counts = dict.fromkeys(run, 1)
+    books = 1
+    while run and books < max_books:
+        day = previous_trading_day(day)
+        rows = _read_book(store, day.isoformat())
+        if rows is None:
+            break
+        books += 1
+        run &= _held_names(rows)
+        stamps = _stamped(rows, run)
+        if stamps is not None:
+            for ticker in run:
+                counts[ticker] += stamps[ticker]
+            break
+        for ticker in run:
+            counts[ticker] += 1
+    return counts

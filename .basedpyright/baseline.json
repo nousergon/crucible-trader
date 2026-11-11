@@ -1746,46 +1746,6 @@
                 }
             },
             {
-                "code": "reportUnknownParameterType",
-                "range": {
-                    "startColumn": 4,
-                    "endColumn": 23,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingTypeArgument",
-                "range": {
-                    "startColumn": 85,
-                    "endColumn": 89,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownVariableType",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 17,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownVariableType",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 17,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownVariableType",
-                "range": {
-                    "startColumn": 11,
-                    "endColumn": 83,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportExplicitAny",
                 "range": {
                     "startColumn": 15,
@@ -1794,60 +1754,10 @@
                 }
             },
             {
-                "code": "reportUnknownVariableType",
-                "range": {
-                    "startColumn": 4,
-                    "endColumn": 12,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportExplicitAny",
                 "range": {
                     "startColumn": 26,
                     "endColumn": 29,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownMemberType",
-                "range": {
-                    "startColumn": 72,
-                    "endColumn": 84,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownArgumentType",
-                "range": {
-                    "startColumn": 72,
-                    "endColumn": 92,
-                    "lineCount": 1
-                }
-            }
-        ],
-        "./crucible_trader/shadow_inputs.py": [
-            {
-                "code": "reportUnknownVariableType",
-                "range": {
-                    "startColumn": 59,
-                    "endColumn": 78,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownVariableType",
-                "range": {
-                    "startColumn": 4,
-                    "endColumn": 12,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownArgumentType",
-                "range": {
-                    "startColumn": 20,
-                    "endColumn": 79,
                     "lineCount": 1
                 }
             }

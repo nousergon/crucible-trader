@@ -24,7 +24,11 @@ broker by a route that skips one:
 
 The book is `construction.construct_target_book` -- the grade's engine on the
 grade's inputs -- and its `portfolio_construction` metric record is recorded on
-the run. Turning the book into orders is the :class:`OrderRouter` handed in;
+the run. It is handed the minimum hold's clock, each held name's consecutive
+sessions in the trader's own order books
+(`order_book.held_sessions_from_order_books`, `alpha-engine-config-I12024`),
+and the day's order book is stamped with the clock it carries forward.
+Turning the book into orders is the :class:`OrderRouter` handed in;
 this module sizes and prices nothing.
 
 `session_cycle` is a job body (like `paper_smoke.smoke_cycle`): the caller runs
@@ -44,7 +48,7 @@ from crucible_trader.construction import TargetBook, construct_target_book
 from crucible_trader.contract import ResolvedContract, resolve
 from crucible_trader.hold_book import enforce_hold_book
 from crucible_trader.kill_switch import BrokerControl, assert_trading_permitted, utcnow
-from crucible_trader.order_book import record_order_book
+from crucible_trader.order_book import held_sessions_from_order_books, record_order_book
 from crucible_trader.paper_smoke import RunningWheelMismatchError, running_wheel_disagreement
 from crucible_trader.v1_rules_guard import enforce_v1_rules
 
@@ -85,12 +89,14 @@ def session_cycle(
     if decision.hold:
         assert_trading_permitted(ctx.store, day)  # raises: the hold covers this day
 
+    held_sessions = held_sessions_from_order_books(ctx.store, day)
     book = construct(
         ctx.store,
         trading_day=day,
         previous_weights=previous_weights,
         now=clock(),
         feature_version=feature_version,
+        held_sessions=held_sessions,
     )
     ctx.record_metric(book.metric)
 
@@ -102,6 +108,7 @@ def session_cycle(
             book,
             previous_weights=None if previous_weights is None else dict(previous_weights),
             now=clock(),
+            held_sessions=held_sessions,
             share_basis=getattr(router, "share_basis", None),
             feature_version=feature_version,
         )

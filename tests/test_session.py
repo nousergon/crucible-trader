@@ -13,6 +13,7 @@ from crucible.serving import PredictionsFeed
 from crucible.store import LocalStore
 from ib_fakes import FakeIB, FakeSdk, ctx_for
 
+import crucible_trader.session as session_module
 from crucible_trader.kill_switch import (
     KILL_SWITCH_KEY,
     IbBrokerControl,
@@ -20,6 +21,7 @@ from crucible_trader.kill_switch import (
     halt_document,
     read_state,
 )
+from crucible_trader.order_book import order_book_key
 from crucible_trader.paper_smoke import RunningWheelMismatchError
 from crucible_trader.session import SESSION_SCHEMA_VERSION, session_cycle
 
@@ -180,6 +182,42 @@ def test_a_wheel_disagreement_fails_the_run_before_anything(tmp_path, pin, match
     with pytest.raises(RunningWheelMismatchError, match=match):
         _run(store, ib, router, constructed=constructed)
     assert router.sent == [] and constructed == [] and ib.order_calls == []
+
+
+def test_the_session_hands_the_minimum_holds_clock_to_construction_and_the_order_book(
+    store, monkeypatch
+) -> None:
+    """alpha-engine-config-I12024: with `min_hold_days` set the engine refuses a
+    held book handed no ages, so the session derives them from its own order
+    books (the previous session, 2026-09-04, across Labor Day) and passes the
+    same clock to the construction and to the order book that stamps it."""
+    store.put_bytes(
+        order_book_key("2026-09-04"),
+        json.dumps(
+            {
+                "trading_day": "2026-09-04",
+                "rows": [
+                    {"ticker": "T1", "target_weight": 0.4, "action": "hold", "held_sessions": 3},
+                    {"ticker": "T2", "target_weight": 0.3, "action": "enter", "held_sessions": 1},
+                    {"ticker": "T3", "target_weight": 0.0, "action": "exit", "held_sessions": 0},
+                ],
+            }
+        ).encode(),
+    )
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        session_module, "record_order_book", lambda ctx, book, **kwargs: recorded.append(kwargs)
+    )
+    constructed: list[dict] = []
+    _run(store, FakeIB(), Router(), constructed=constructed)
+    assert constructed[0]["held_sessions"] == {"T1": 3, "T2": 1}
+    assert recorded[0]["held_sessions"] == {"T1": 3, "T2": 1}
+
+
+def test_with_no_order_book_history_the_clock_is_empty(store) -> None:
+    constructed: list[dict] = []
+    _run(store, FakeIB(), Router(), constructed=constructed)
+    assert constructed[0]["held_sessions"] == {}
 
 
 class PlanningRouter(Router):

@@ -26,6 +26,7 @@ from conftest import (
     IMPACT_COST,
     M_CHAMPION,
     NEXT,
+    PARAMS_YAML,
     TICKERS,
     U_CHAMPION,
     put,
@@ -52,6 +53,8 @@ from crucible_trader.construction import (
     SessionSizing,
     _previous_weights,
     construct_target_book,
+    engine_held_sessions,
+    held_sessions_kwargs,
     held_tickers,
     initial_weights,
     session_turnover_budget,
@@ -532,3 +535,96 @@ class TestTheSessionTurnoverBudget:
             },
         }
         assert session_turnover_budget(diagnostics) == pytest.approx(0.2 + 2 * 0.244)
+
+
+class TestTheMinimumHoldsClockReachesTheEngine:
+    """alpha-engine-config-I12024 (crucible-PR499): with `min_hold_days` set the
+    engine refuses a held book that arrives without ages. The trader hands
+    `construct_book` an age for every held name, so that refusal is never
+    reached on a trading day."""
+
+    def _held_world(self, world, monkeypatch):
+        world.store.put_bytes(
+            strategy_slot_key("s"), (PARAMS_YAML + "  min_hold_days: 3\n").encode()
+        )
+        world.record_session(world.arm_id, D_PREV)
+        first = construct_target_book(
+            world.store, trading_day=D_PREV.isoformat(), previous_weights=None, now=NOW
+        )
+        world.record_session(world.arm_id, AS_OF)
+        held = {t: w for t, w in first.weights.items() if w != 0.0}
+        seen: list[object] = []
+        real = construction.construct_book
+
+        def spy(*, held_sessions=None, **kwargs):
+            seen.append(held_sessions)
+            return real(held_sessions=held_sessions, **kwargs)
+
+        monkeypatch.setattr(construction, "construct_book", spy)
+        return held, seen
+
+    def test_without_ages_the_engine_refuses_a_held_book(self, world, monkeypatch) -> None:
+        held, _ = self._held_world(world, monkeypatch)
+        recipe = construction.resolve_strategy_arm(
+            world.store, arm_id=world.arm_id, trading_day=DAY
+        ).recipe
+        params = load_portfolio_params_from_store("s", store=world.store)
+        assert params.min_hold_days == 3
+        inputs = resolve_strategy_sessions(
+            world.store,
+            arm_id=world.arm_id,
+            benchmark=recipe.benchmark,
+            decision_days=[DAY],
+            as_of=DAY,
+            unsettled_last=True,
+            held_tickers=held_tickers(held, benchmark=recipe.benchmark),
+        )
+        with pytest.raises(ValueError, match="no held_sessions were given"):
+            construct_book(
+                recipe=recipe,
+                params=params,
+                universe=inputs.universe,
+                sessions=inputs.sessions,
+                portfolio_notional=params.book_notional_usd,
+                w_initial=_previous_weights(inputs.universe, held, trading_day=DAY),
+            )
+
+    def test_the_sessions_ages_are_handed_to_the_engine(self, world, monkeypatch) -> None:
+        held, seen = self._held_world(world, monkeypatch)
+        names = {t: 1 for t in held if t in TICKERS}
+        book = construct_target_book(
+            world.store, trading_day=DAY, previous_weights=held, now=NOW, held_sessions=names
+        )
+        assert seen == [names]
+        assert book.weights
+
+    def test_a_held_name_the_books_do_not_show_is_aged_out_not_refused(
+        self, world, monkeypatch
+    ) -> None:
+        held, seen = self._held_world(world, monkeypatch)
+        construct_target_book(world.store, trading_day=DAY, previous_weights=held, now=NOW)
+        assert seen == [{t: 3 for t in held if t in TICKERS}]
+
+    def test_ages_for_names_the_book_does_not_hold_are_not_passed(self) -> None:
+        universe = harness_strategy.BookUniverse(
+            tickers=("AAA", "BBB", "SPY", "__CASH__"),
+            sectors=("t", "t", "__benchmark__", "__cash__"),
+            benchmark_idx=2,
+            cash_idx=3,
+        )
+        w_prev = np.array([0.5, 0.0, 0.1, 0.4])
+        ages = {"AAA": 2, "BBB": 5, "SPY": 9}
+        assert engine_held_sessions(universe, w_prev, ages, min_hold_days=None) == {"AAA": 2}
+        assert engine_held_sessions(universe, w_prev, {}, min_hold_days=None) == {"AAA": 1}
+        assert engine_held_sessions(universe, w_prev, {}, min_hold_days=4) == {"AAA": 4}
+
+    def test_an_engine_without_the_clock_is_not_handed_it(self) -> None:
+        """The box runs the release wheel `trader/release_pin` names, which may
+        predate crucible-PR499: an unknown keyword would fail every session."""
+
+        def older_engine(*, recipe, params, universe, sessions, portfolio_notional, w_initial):
+            return None
+
+        assert held_sessions_kwargs(older_engine, {"AAA": 1}) == {}
+        assert held_sessions_kwargs(construct_book, None) == {}
+        assert held_sessions_kwargs(construct_book, {"AAA": 1}) == {"held_sessions": {"AAA": 1}}
