@@ -190,6 +190,15 @@ class TestAShadowSessionIsAServedDay:
         assert ctx.metrics[-1]["name"] == "trader_session_served"
         assert ctx.metrics[-1]["value"] == 1.0
 
+    def test_the_churn_alarm_is_filed_on_every_served_session(self, store) -> None:
+        # v1 parity row 16. The fixture store carries no tripwire parameters, so the
+        # alarm says so on the record rather than reading as a quiet week.
+        _serveable(store, trading_day=DAY.isoformat())
+        ctx, _, _ = _cycle(store, ShadowRouter())
+
+        (alarm,) = [m for m in ctx.metrics if m["name"] == "trader_turnover_tripwire"]
+        assert alarm["status"] == "unmeasurable"
+
     def test_nothing_touches_the_book(self, store) -> None:
         _serveable(store, trading_day=DAY.isoformat())
         _, _, ib = _cycle(store, ShadowRouter())

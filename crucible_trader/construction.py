@@ -103,6 +103,7 @@ from crucible_trader.contract import ContractRefusal, ContractUnavailable, read_
 __all__ = [
     "STRATEGY_SLOT",
     "SessionSizing",
+    "TURNOVER_DRIVER_KEYS",
     "TargetBook",
     "construct_target_book",
     "session_turnover_budget",
@@ -190,6 +191,26 @@ class TargetBook:
     #: (:func:`session_turnover_budget`). ``None`` when the parameter set
     #: disables the budget, or from a test double (`alpha-engine-config-I13305`).
     turnover_budget: float | None = None
+    #: The construction's own account of WHY the book moved as far as it did
+    #: (:data:`TURNOVER_DRIVER_KEYS` of the engine's diagnostics), read by the
+    #: churn alarm (`crucible_trader.turnover_tripwire`). ``None`` from a test
+    #: double (v1 parity audit 2026-11-09, row 16).
+    turnover_drivers: dict[str, object] | None = None
+
+
+#: The diagnostics a session's turnover is attributed from. Copied verbatim;
+#: an absent key stays absent, never zero.
+TURNOVER_DRIVER_KEYS: tuple[str, ...] = (
+    "turnover_mandatory_floor",
+    "turnover_mandatory_floor_by_cause",
+    "turnover_budget_configured",
+    "turnover_budget_discretionary",
+    "turnover_constraint_binding",
+    "conviction_ir_xs",
+    "conviction_budget_multiplier",
+    "conviction_gate_applied",
+    "conviction_gate_reason",
+)
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -484,6 +505,7 @@ def construct_target_book(
         weights={t: float(w) for t, w in zip(inputs.universe.tickers, weights, strict=True)},
         turnover_one_way_ratio=float(book.turnover[0]),
         turnover_budget=session_turnover_budget(diagnostics),
+        turnover_drivers={k: diagnostics[k] for k in TURNOVER_DRIVER_KEYS if k in diagnostics},
         cost_bps=float(book.cost_bps[0]),
         portfolio_notional_usd=notional,
         evidence=constructed.evidence,

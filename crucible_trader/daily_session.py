@@ -132,6 +132,7 @@ from crucible.runner import RunContext, run_job
 from crucible.store import Store
 from krepis.trading_calendar import session_close_et
 
+from crucible_trader import turnover_tripwire
 from crucible_trader.broker_session import GatewayAddress, OrderRefusedError, connect, load_sdk
 from crucible_trader.construction import (
     STRATEGY_SLOT,
@@ -430,6 +431,7 @@ def daily_session_cycle(
     shortfall = _file_shortfall(ctx, router, champion=contract.arm_id, clock=clock)
     _record_entry_watch(ctx, router, clock=clock)
     _record_turnover(ctx, result)
+    _check_turnover_tripwire(ctx, result)
     shadow_days = len(evidence.shadow_days())
     ctx.record_metric(
         _metric(
@@ -481,6 +483,25 @@ def _record_turnover(ctx: RunContext, result: Mapping[str, object]) -> None:
     record(
         value=value,
         budget=float(budget) if isinstance(budget, (int, float)) else UNBOUNDED_TURNOVER_BUDGET,
+    )
+
+
+def _check_turnover_tripwire(ctx: RunContext, result: Mapping[str, object]) -> None:
+    """File the churn alarm on the run (v1 parity audit 2026-11-09, row 16).
+
+    `crucible_trader.turnover_tripwire.check` never raises; a tripwire that
+    could not run files an ``unmeasurable`` metric naming why, so the alarm
+    being dead is itself on the record.
+    """
+    day = ctx.trading_day.isoformat()
+    block = turnover_tripwire.check(ctx.store, trading_day=day, result=result)
+    ctx.record_metric(
+        turnover_tripwire.metric_record(
+            block,
+            trading_day=day,
+            now_utc=ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            module=METRIC_MODULE,
+        )
     )
 
 
