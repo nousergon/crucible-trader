@@ -13,6 +13,7 @@ from crucible.serving import PredictionsFeed
 from crucible.store import LocalStore
 from ib_fakes import FakeIB, FakeSdk, ctx_for
 
+import crucible_trader.session as session_module
 from crucible_trader.kill_switch import (
     KILL_SWITCH_KEY,
     IbBrokerControl,
@@ -20,6 +21,7 @@ from crucible_trader.kill_switch import (
     halt_document,
     read_state,
 )
+from crucible_trader.order_book import order_book_key
 from crucible_trader.paper_smoke import RunningWheelMismatchError
 from crucible_trader.session import SESSION_SCHEMA_VERSION, session_cycle
 
@@ -182,3 +184,104 @@ def test_a_wheel_disagreement_fails_the_run_before_anything(tmp_path, pin, match
     with pytest.raises(RunningWheelMismatchError, match=match):
         _run(store, ib, router, constructed=constructed)
     assert router.sent == [] and constructed == [] and ib.order_calls == []
+
+
+def test_the_session_hands_the_minimum_holds_clock_to_construction_and_the_order_book(
+    store, monkeypatch
+) -> None:
+    """alpha-engine-config-I12024: with `min_hold_days` set the engine refuses a
+    held book handed no ages, so the session derives them from its own order
+    books (the previous session, 2026-09-04, across Labor Day) and passes the
+    same clock to the construction and to the order book that stamps it."""
+    store.put_bytes(
+        order_book_key("2026-09-04"),
+        json.dumps(
+            {
+                "trading_day": "2026-09-04",
+                "rows": [
+                    {"ticker": "T1", "target_weight": 0.4, "action": "hold", "held_sessions": 3},
+                    {"ticker": "T2", "target_weight": 0.3, "action": "enter", "held_sessions": 1},
+                    {"ticker": "T3", "target_weight": 0.0, "action": "exit", "held_sessions": 0},
+                ],
+            }
+        ).encode(),
+    )
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        session_module, "record_order_book", lambda ctx, book, **kwargs: recorded.append(kwargs)
+    )
+    constructed: list[dict] = []
+    _run(store, FakeIB(), Router(), constructed=constructed)
+    assert constructed[0]["held_sessions"] == {"T1": 3, "T2": 1}
+    assert recorded[0]["held_sessions"] == {"T1": 3, "T2": 1}
+
+
+def test_with_no_order_book_history_the_clock_is_empty(store) -> None:
+    constructed: list[dict] = []
+    _run(store, FakeIB(), Router(), constructed=constructed)
+    assert constructed[0]["held_sessions"] == {}
+
+
+class PlanningRouter(Router):
+    """A router whose plan records a share basis, or refuses."""
+
+    def __init__(self, *, refuse: bool = False) -> None:
+        super().__init__(n_batches=1)
+        self.refuse = refuse
+        self.planned = False
+
+    def batches(self, book):
+        self.planned = True
+        if self.refuse:
+            raise RuntimeError("plan refused")
+        return super().batches(book)
+
+    def share_basis(self):
+        assert self.planned, "the order book asked for shares before the plan"
+        return None
+
+
+def test_the_order_book_is_written_after_the_plan_and_before_any_order(store) -> None:
+    """alpha-engine-config-I13578: the book's share columns are the plan's, so
+    the router plans first; nothing is sent until the book is on the record."""
+    ib, router = FakeIB(), PlanningRouter()
+    seen: list[int] = []
+    router.on_send = lambda: seen.append(len(ctx_metrics()))
+    ctx = ctx_for(store, "trader.session")
+
+    def ctx_metrics():
+        return [m for m in ctx.metrics if m["name"] == "trader_order_book_written"]
+
+    session_cycle(
+        ctx,
+        broker=IbBrokerControl(ib, FakeSdk(ib)),
+        router=router,
+        installed_version=VERSION,
+        previous_weights=None,
+        clock=ib.clock,
+        contract_resolver=_contract(HEALTHY),
+        construct=lambda store_, **kw: SimpleNamespace(
+            s_champion="s", metric={"name": "portfolio_construction"}, alpha_bench=None
+        ),
+    )
+    assert router.sent == [["order-0"]] and seen == [1]
+
+
+def test_a_refused_plan_still_saves_the_order_book(store) -> None:
+    ib, router = FakeIB(), PlanningRouter(refuse=True)
+    ctx = ctx_for(store, "trader.session")
+    with pytest.raises(RuntimeError, match="plan refused"):
+        session_cycle(
+            ctx,
+            broker=IbBrokerControl(ib, FakeSdk(ib)),
+            router=router,
+            installed_version=VERSION,
+            previous_weights=None,
+            clock=ib.clock,
+            contract_resolver=_contract(HEALTHY),
+            construct=lambda store_, **kw: SimpleNamespace(
+                s_champion="s", metric={"name": "portfolio_construction"}, alpha_bench=None
+            ),
+        )
+    assert [m["name"] for m in ctx.metrics][-1] == "trader_order_book_written"
+    assert router.sent == []

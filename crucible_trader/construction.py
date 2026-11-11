@@ -52,6 +52,19 @@ same book the settled grade walk constructs for that day. A held name the price
 panel has no return for raises `MissingArtifactError` in the resolver (a hold:
 an exit with no price is not a fillable trade).
 
+**The minimum hold's clock is passed to the engine** (`alpha-engine-config-I12024`;
+crucible-PR499's ``held_sessions``). With `PortfolioParams.min_hold_days` set,
+the engine REFUSES a held book that arrives without each held name's age, so
+:func:`construct_target_book` hands `construct_book` an age for every name the
+book holds: the count the session derived from its own order books, and for a
+held name those books never show holding (an inherited position, an exit that
+did not fill, a run cut by a missing book) the minimum hold itself -- aged out,
+because the hold protects a name the BOOK entered, and nothing in the record
+says the book entered that one. :func:`held_sessions_kwargs` passes the clock
+only to an engine that accepts it: the box runs the release wheel
+`trader/release_pin` names, which may predate it, and an unexpected keyword
+would fail every session.
+
 **What this returns** is the target book and the `portfolio_construction.v1`
 evidence the engine produced beside it, plus that evidence as a `MetricRecord`
 (`crucible.portfolio.portfolio_metric_record`) — the record the grading
@@ -68,8 +81,9 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import inspect
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import numpy as np
@@ -107,6 +121,8 @@ __all__ = [
     "TURNOVER_DRIVER_KEYS",
     "TargetBook",
     "construct_target_book",
+    "engine_held_sessions",
+    "held_sessions_kwargs",
     "session_turnover_budget",
     "held_tickers",
     "initial_weights",
@@ -396,6 +412,46 @@ def _previous_weights(
     return np.array([float(previous.get(t, 0.0)) for t in universe.tickers], dtype=np.float64)
 
 
+def held_sessions_kwargs(
+    engine: Callable[..., object], held_sessions: Mapping[str, int] | None
+) -> dict[str, Mapping[str, int]]:
+    """``{"held_sessions": ...}`` when ``engine`` takes the minimum hold's clock, else ``{}``.
+
+    The box runs the release wheel `trader/release_pin` names, which moves only
+    through the trader's own smoke and may predate crucible-PR499. Handing
+    that engine an unknown keyword would raise on every session; a wheel that
+    predates the clock also predates the hold it feeds, so omitting it changes
+    nothing that wheel can do.
+    """
+    if held_sessions is None or "held_sessions" not in inspect.signature(engine).parameters:
+        return {}
+    return {"held_sessions": held_sessions}
+
+
+def engine_held_sessions(
+    universe: BookUniverse,
+    w_prev: np.ndarray,
+    held_sessions: Mapping[str, int],
+    *,
+    min_hold_days: int | None,
+) -> dict[str, int]:
+    """The clock `construct_book` is handed: an age for every name ``w_prev`` holds.
+
+    The derived count where the order books show one. A held name they do not
+    show (count 0) is given ``min_hold_days`` -- aged out -- or 1 when no hold
+    is set: the engine requires a whole session count >= 1 for every held name,
+    and the hold protects a name the book ENTERED, which the record does not
+    say of this one. Sentinels and names the book does not hold carry no age.
+    """
+    sentinels = {universe.cash_idx, universe.benchmark_idx}
+    floor = max(1, min_hold_days or 1)
+    return {
+        ticker: int(held_sessions.get(ticker, 0)) or floor
+        for i, ticker in enumerate(universe.tickers)
+        if i not in sentinels and w_prev[i] > 0.0
+    }
+
+
 def session_turnover_budget(diagnostics: Mapping[str, object]) -> float | None:
     """The turnover a session may trade before it counts as churn (I13305).
 
@@ -437,6 +493,7 @@ def construct_target_book(
     now: dt.datetime,
     feature_version: str | None = None,
     sizing: SessionSizing | None = None,
+    held_sessions: Mapping[str, int] | None = None,
     hard_risk: HardRiskInputs | None = None,
 ) -> TargetBook:
     """Construct the book for ``trading_day`` through `construct_book`, or refuse.
@@ -447,7 +504,12 @@ def construct_target_book(
     `SessionInputs.hard_exit` and its drawdown rung as `buy_multiplier`.
 
     ``previous_weights`` is the book held into the session by ticker (None at
-    inception: all cash). Raises :class:`ContractUnavailable` when a half the
+    inception: all cash). ``held_sessions`` is the minimum hold's clock the
+    session derived from its order books
+    (`order_book.held_sessions_from_order_books`); see
+    :func:`engine_held_sessions` for the age of a held name it does not cover.
+
+    Raises :class:`ContractUnavailable` when a half the
     construction needs has not been published yet (no champion, no recorded
     session, no panel), :class:`ContractRefusal` when something exists and must
     not be traded, and lets the engine's own refusals (e.g.
@@ -495,6 +557,14 @@ def construct_target_book(
         store, session, trading_day=trading_day, m_champion=m_pointer.arm_id, u_champion=u_champion
     )
 
+    w_initial = _previous_weights(inputs.universe, previous_weights, trading_day=trading_day)
+    ages = engine_held_sessions(
+        inputs.universe,
+        w_initial,
+        held_sessions or {},
+        # Read leniently: a release wheel predating crucible-PR499 has no field.
+        min_hold_days=getattr(params, "min_hold_days", None),
+    )
     sessions = inputs.sessions
     decision: HardRiskDecision | None = None
     if hard_risk is not None:
@@ -520,7 +590,8 @@ def construct_target_book(
         universe=inputs.universe,
         sessions=sessions,
         portfolio_notional=notional,
-        w_initial=_previous_weights(inputs.universe, previous_weights, trading_day=trading_day),
+        w_initial=w_initial,
+        **held_sessions_kwargs(construct_book, ages),
     )
     (weights,) = constructed.weights
     (diagnostics,) = constructed.diagnostics

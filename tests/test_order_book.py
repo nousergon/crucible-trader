@@ -5,17 +5,24 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import pandas as pd
 import pytest
+from crucible.features import DEFAULT_FEATURE_VERSION
+from crucible.keys import features_key
 from crucible.slots.strategy import BookUniverse
 from crucible.store import LocalStore
 
 from crucible_trader.books_retention import is_books_key
 from crucible_trader.construction import TargetBook
 from crucible_trader.order_book import (
+    HELD_SESSIONS_WALK_LIMIT,
     ORDER_BOOK_METRIC,
+    ShareBasis,
+    held_sessions_from_order_books,
     order_book_document,
     order_book_key,
     record_order_book,
+    sector_labels,
 )
 
 NOW = dt.datetime(2026, 11, 5, 15, 0, tzinfo=dt.UTC)
@@ -136,3 +143,247 @@ def test_a_metric_that_cannot_be_recorded_does_not_raise(tmp_path) -> None:
     assert record_order_book(
         NoMetrics(LocalStore(tmp_path)), _book(), previous_weights=None, now=NOW
     )
+
+
+# -- the minimum hold's clock (alpha-engine-config-I12024) -----------------------
+
+
+def _write_book(store, day: str, held: dict[str, float], *, stamps: dict | None = None) -> None:
+    """A minimal `order_book.v1` for ``day``: ``held`` names at a positive target,
+    one not-held name and the two sentinels. ``stamps`` adds `held_sessions`."""
+    rows = [
+        {"ticker": t, "target_weight": w, "action": "hold"} for t, w in sorted(held.items())
+    ] + [
+        {"ticker": "ZZZ", "target_weight": 0.0, "action": "not_selected"},
+        {"ticker": "SPY", "target_weight": 0.0, "action": "benchmark"},
+        {"ticker": "$CASH", "target_weight": 0.05, "action": "cash"},
+    ]
+    if stamps is not None:
+        for row in rows:
+            if row["ticker"] in stamps:
+                row["held_sessions"] = stamps[row["ticker"]]
+    store.put_bytes(
+        order_book_key(day), json.dumps({"trading_day": day, "rows": rows}).encode("utf-8")
+    )
+
+
+#: Consecutive NYSE sessions, oldest first. 2026-11-11 (Veterans Day) is a
+#: trading day; 2026-11-07/08 are a weekend.
+D1, D2, D3, D4, D5 = "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10"
+TODAY = "2026-11-11"
+
+
+class TestTheClockIsDerivedFromTheTradersOwnBooks:
+    def test_no_previous_book_is_no_clock(self, tmp_path) -> None:
+        assert held_sessions_from_order_books(LocalStore(tmp_path), TODAY) == {}
+
+    def test_consecutive_books_count_and_a_gap_ends_the_run(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_book(store, D1, {"AAA": 0.3, "OLD": 0.2})  # before the gap: never counted
+        # D2 has no book (a held day): the gap.
+        _write_book(store, D3, {"AAA": 0.3, "BBB": 0.2})
+        _write_book(store, D4, {"AAA": 0.3, "BBB": 0.2, "CCC": 0.1})
+        _write_book(store, D5, {"AAA": 0.3, "BBB": 0.2, "CCC": 0.1, "DDD": 0.1})
+        assert held_sessions_from_order_books(store, TODAY) == {
+            "AAA": 3,
+            "BBB": 3,
+            "CCC": 2,
+            "DDD": 1,
+        }
+
+    def test_a_name_that_left_the_book_restarts_its_count(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_book(store, D3, {"AAA": 0.3})
+        _write_book(store, D4, {"BBB": 0.3})  # AAA sold
+        _write_book(store, D5, {"AAA": 0.3, "BBB": 0.3})  # AAA bought back
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 1, "BBB": 2}
+
+    def test_a_stamped_book_is_read_alone(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        _write_book(store, D4, {"AAA": 0.3})
+        _write_book(store, D5, {"AAA": 0.3, "BBB": 0.2}, stamps={"AAA": 7, "BBB": 1, "ZZZ": 0})
+        reads: list[str] = []
+        real = store.get_bytes
+        monkeypatch.setattr(store, "get_bytes", lambda key: reads.append(key) or real(key))
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 7, "BBB": 1}
+        assert reads == [order_book_key(D5)]
+
+    def test_the_walk_finishes_on_an_older_stamped_book(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_book(store, D3, {"AAA": 0.3}, stamps={"AAA": 4})
+        _write_book(store, D4, {"AAA": 0.3, "BBB": 0.2})
+        _write_book(store, D5, {"AAA": 0.3, "BBB": 0.2})
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 6, "BBB": 2}
+
+    @pytest.mark.parametrize("bad", [0, None, True, "3"])
+    def test_a_held_row_without_a_whole_count_is_walked_not_trusted(self, tmp_path, bad) -> None:
+        store = LocalStore(tmp_path)
+        _write_book(store, D4, {"AAA": 0.3})
+        _write_book(store, D5, {"AAA": 0.3}, stamps={"AAA": bad})
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 2}
+
+    def test_the_walk_is_capped(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        for day in (D1, D2, D3, D4, D5):
+            _write_book(store, day, {"AAA": 0.3})
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 5}
+        assert held_sessions_from_order_books(store, TODAY, max_books=2) == {"AAA": 2}
+        assert HELD_SESSIONS_WALK_LIMIT == 30
+
+    def test_an_unreadable_or_misfiled_book_ends_the_run(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_book(store, D3, {"AAA": 0.3})
+        store.put_bytes(order_book_key(D4), b"{not json")
+        _write_book(store, D5, {"AAA": 0.3})
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 1}
+        _write_book(store, D4, {"AAA": 0.3})
+        doc = json.loads(store.get_bytes(order_book_key(D4)))
+        store.put_bytes(order_book_key(D4), json.dumps({**doc, "trading_day": D3}).encode())
+        assert held_sessions_from_order_books(store, TODAY) == {"AAA": 1}
+        store.put_bytes(order_book_key(D5), json.dumps({"trading_day": D5}).encode())
+        assert held_sessions_from_order_books(store, TODAY) == {}
+
+
+class TestTheBookStampsTheClockItCarriesForward:
+    def test_each_row_carries_its_count(self) -> None:
+        doc = order_book_document(
+            _book(),
+            previous_weights={"BBB": 0.2, "AAA": 0.6},
+            written_at_utc="t",
+            held_sessions={"AAA": 4, "BBB": 2},
+        )
+        stamps = {r["ticker"]: r["held_sessions"] for r in doc["rows"]}
+        # AAA held four sessions and held again: five. CCC entered here: one.
+        # BBB exited and DDD was never held: zero. The sentinels carry none.
+        assert stamps == {"AAA": 5, "BBB": 0, "CCC": 1, "DDD": 0, "SPY": None, "$CASH": None}
+
+    def test_with_no_clock_every_held_name_starts_at_one(self) -> None:
+        doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
+        assert {r["ticker"]: r["held_sessions"] for r in doc["rows"]}["AAA"] == 1
+
+    def test_tomorrows_clock_is_one_read_of_todays_book(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        key = record_order_book(
+            _Ctx(store),
+            _book(),
+            previous_weights={"AAA": 0.6},
+            now=NOW,
+            held_sessions={"AAA": 2},
+        )
+        assert key == order_book_key("2026-11-05")
+        assert held_sessions_from_order_books(store, "2026-11-06") == {"AAA": 3, "CCC": 1}
+
+
+def _write_sectors(store, day: str, labels: dict[str, object]) -> str:
+    key = features_key(DEFAULT_FEATURE_VERSION, day)
+    frame = pd.DataFrame(
+        {
+            "trading_day": [day] * len(labels),
+            "ticker": list(labels),
+            "sector_raw": list(labels.values()),
+        }
+    )
+    store.put_bytes(key, frame.to_parquet(index=False))
+    return key
+
+
+def test_each_row_carries_its_gics_sector_label_beside_the_engine_sector(tmp_path) -> None:
+    """alpha-engine-config-I13578: Brian read every holding as `__unsectored__`.
+    The label is display only; ``sector`` stays the engine's own value."""
+    ctx = _Ctx(LocalStore(tmp_path))
+    source = _write_sectors(
+        ctx.store,
+        "2026-11-05",
+        {"AAA": "Information Technology", "BBB": " Financials ", "CCC": None, "SPY": None},
+    )
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW)
+    doc = json.loads(ctx.store.get_bytes(key))
+    labels = {r["ticker"]: r["sector_label"] for r in doc["rows"]}
+    assert labels == {
+        "AAA": "Information Technology",
+        "BBB": "Financials",
+        "CCC": None,  # the feature layer left it unlabelled
+        "DDD": None,  # not in the feature artifact
+        "SPY": None,
+        "$CASH": None,
+    }
+    assert {r["ticker"]: r["sector"] for r in doc["rows"]}["AAA"] == "t"
+    assert doc["sector_label_source"] == source
+
+
+def test_no_feature_artifact_leaves_the_sector_labels_null_and_the_book_written(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW)
+    doc = json.loads(ctx.store.get_bytes(key))
+    assert {r["sector_label"] for r in doc["rows"]} == {None}
+    assert doc["sector_label_source"] is None and ctx.metrics[-1]["status"] == "OK"
+
+
+def test_an_unreadable_feature_artifact_never_costs_the_book(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+    ctx.store.put_bytes(features_key(DEFAULT_FEATURE_VERSION, "2026-11-05"), b"not parquet")
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW)
+    assert key is not None and ctx.metrics[-1]["status"] == "OK"
+    doc = json.loads(ctx.store.get_bytes(key))
+    assert {r["sector_label"] for r in doc["rows"]} == {None}
+
+
+def test_each_held_row_carries_the_shares_the_session_sized(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+    basis = ShareBasis(
+        positions={"AAA": 500, "BBB": 100},
+        prices={"AAA": 110.0, "BBB": 50.0, "CCC": 33.0},
+    )
+    key = record_order_book(
+        ctx,
+        _book(),
+        previous_weights={"AAA": 0.55, "BBB": 0.05},
+        now=NOW,
+        share_basis=lambda: basis,
+    )
+    doc = json.loads(ctx.store.get_bytes(key))
+    rows = {r["ticker"]: r for r in doc["rows"]}
+    # AAA 0.6 * 100k / 110 = 545.45 -> 545; CCC 0.3 * 100k / 33 = 909.09 -> 909.
+    assert (rows["AAA"]["previous_shares"], rows["AAA"]["target_shares"]) == (500, 545)
+    assert rows["AAA"]["share_price_usd"] == 110.0
+    assert (rows["BBB"]["previous_shares"], rows["BBB"]["target_shares"]) == (100, 0)
+    assert (rows["CCC"]["previous_shares"], rows["CCC"]["target_shares"]) == (0, 909)
+    assert (rows["DDD"]["previous_shares"], rows["DDD"]["target_shares"]) == (0, 0)
+    for sentinel in ("SPY", "$CASH"):
+        assert rows[sentinel]["target_shares"] is None
+        assert rows[sentinel]["previous_shares"] is None
+    assert doc["share_basis"] == "router_plan"
+
+
+def test_without_a_share_basis_the_share_columns_are_null() -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
+    assert {(r["previous_shares"], r["target_shares"]) for r in doc["rows"]} == {(None, None)}
+    assert doc["share_basis"] is None
+
+
+def test_a_failing_share_basis_never_costs_the_book(tmp_path) -> None:
+    ctx = _Ctx(LocalStore(tmp_path))
+
+    def broken() -> ShareBasis:
+        raise RuntimeError("router state unreadable")
+
+    key = record_order_book(ctx, _book(), previous_weights=None, now=NOW, share_basis=broken)
+    assert key is not None and ctx.metrics[-1]["status"] == "OK"
+    doc = json.loads(ctx.store.get_bytes(key))
+    assert doc["share_basis"] is None
+
+
+def test_a_weighted_name_with_no_usable_price_has_no_target_shares() -> None:
+    basis = ShareBasis(positions={}, prices={"AAA": float("nan")})
+    assert basis.target_shares("AAA", 0.5, 100_000.0) is None
+    assert basis.target_shares("BBB", 0.5, 100_000.0) is None
+    assert basis.target_shares("BBB", 0.0, 100_000.0) == 0
+
+
+def test_a_feature_artifact_without_a_sector_column_labels_nothing(tmp_path) -> None:
+    store = LocalStore(tmp_path)
+    frame = pd.DataFrame({"trading_day": ["2026-11-05"], "ticker": ["AAA"]})
+    store.put_bytes(
+        features_key(DEFAULT_FEATURE_VERSION, "2026-11-05"), frame.to_parquet(index=False)
+    )
+    assert sector_labels(store, "2026-11-05", ["AAA"]) == ({}, None)

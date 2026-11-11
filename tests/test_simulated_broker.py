@@ -328,6 +328,20 @@ class TestSimulatedFills:
             router.send(batch)
         assert router.records == ()
 
+    def test_the_order_book_share_basis_is_the_plans_closes(self, store) -> None:
+        """`order_book.ShareBasis` (alpha-engine-config-I13578): staging's share
+        columns come from the same panel closes its plan was sized at."""
+        router = _router(store)
+        assert router.share_basis() is None  # nothing planned yet
+        book = _book({"AAA": 0.3})
+        (batch,) = router.batches(book)
+        basis = router.share_basis()
+        assert basis is not None and basis.positions == {}
+        (order,) = batch
+        assert basis.prices["AAA"] == order.decision.decision_price
+        target = basis.target_shares("AAA", 0.3, book.portfolio_notional_usd)
+        assert target == order.decision.quantity
+
     def test_a_book_already_flat_plans_nothing(self, store) -> None:
         assert _router(store).batches(_book({"AAA": 0.0})) == []
 

@@ -29,7 +29,11 @@ broker by a route that skips one:
 
 The book is `construction.construct_target_book` -- the grade's engine on the
 grade's inputs -- and its `portfolio_construction` metric record is recorded on
-the run. Turning the book into orders is the :class:`OrderRouter` handed in;
+the run. It is handed the minimum hold's clock, each held name's consecutive
+sessions in the trader's own order books
+(`order_book.held_sessions_from_order_books`, `alpha-engine-config-I12024`),
+and the day's order book is stamped with the clock it carries forward.
+Turning the book into orders is the :class:`OrderRouter` handed in;
 this module sizes and prices nothing.
 
 `session_cycle` is a job body (like `paper_smoke.smoke_cycle`): the caller runs
@@ -58,7 +62,7 @@ from crucible_trader.hard_risk import (
 )
 from crucible_trader.hold_book import enforce_hold_book
 from crucible_trader.kill_switch import BrokerControl, assert_trading_permitted, utcnow
-from crucible_trader.order_book import record_order_book
+from crucible_trader.order_book import held_sessions_from_order_books, record_order_book
 from crucible_trader.paper_smoke import RunningWheelMismatchError, running_wheel_disagreement
 from crucible_trader.v1_rules_guard import enforce_v1_rules
 
@@ -110,12 +114,14 @@ def session_cycle(
         extra["hard_risk"] = HardRiskInputs(
             facts=hard_risk_facts, carried=carried_state(ctx.store, day)
         )
+    held_sessions = held_sessions_from_order_books(ctx.store, day)
     book = construct(
         ctx.store,
         trading_day=day,
         previous_weights=previous_weights,
         now=clock(),
         feature_version=feature_version,
+        held_sessions=held_sessions,
         **extra,
     )
     ctx.record_metric(book.metric)
@@ -128,17 +134,34 @@ def session_cycle(
             json.dumps(cut.to_document(), indent=2, sort_keys=True).encode("utf-8"),
             HARD_RISK_SCHEMA_VERSION,
         )
-    # The day's order book, saved before any order is sent so the record of
-    # what was decided exists whatever the broker then does. Never raises.
-    record_order_book(
-        ctx,
-        book,
-        previous_weights=None if previous_weights is None else dict(previous_weights),
-        now=clock(),
-    )
+
+    def save_order_book() -> None:
+        # The day's order book, saved before any order is sent so the record of
+        # what was decided exists whatever the broker then does. Never raises.
+        record_order_book(
+            ctx,
+            book,
+            previous_weights=None if previous_weights is None else dict(previous_weights),
+            now=clock(),
+            held_sessions=held_sessions,
+            share_basis=getattr(router, "share_basis", None),
+            feature_version=feature_version,
+        )
+
+    # The router plans first -- reading the account and pricing each name, and
+    # sending nothing -- so the book's share columns carry the shares the plan
+    # sized at (`order_book.ShareBasis`). A refused plan still saves the book,
+    # without shares, before the refusal fails the run. The hard-risk
+    # chokepoint then holds the planned batches to the cut's precedence.
+    try:
+        batches = router.batches(book)
+    except BaseException:
+        save_order_book()
+        raise
+    save_order_book()
 
     sent = 0
-    for batch in enforce_precedence(router.batches(book), cut):
+    for batch in enforce_precedence(batches, cut):
         assert_trading_permitted(ctx.store, day)
         router.send(batch)
         sent += 1
