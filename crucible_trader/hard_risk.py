@@ -35,7 +35,7 @@ import datetime as dt
 import json
 import math
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Protocol, cast
 
 from crucible.hard_risk import (
@@ -286,7 +286,7 @@ def enforce_precedence(
     """The session's one chokepoint between the plan and the broker.
 
     A BUY of a name the hard-risk layer forced out today (cut or locked out)
-    RAISES :class:`HardRiskPrecedenceError` before anything is sent: the
+    RAISES :class:`HardRiskPrecedenceError` before it is sent: the
     construction pins such a name to zero, so a BUY of it is a defect, not a
     market condition (v1's SMCI case, 2026-10-15). While the circuit breaker
     is engaged every BUY is DROPPED rather than refused, so the forced SELLS
@@ -294,17 +294,42 @@ def enforce_precedence(
     there, and a BUY can only come from a quote that moved between valuing the
     book and planning it.
 
+    A plan handed over whole (a list or tuple of batches) is checked whole, so
+    nothing is sent when any batch offends. A timed plan (a generator,
+    `order_router.PaperOrderRouter` with entry timing) is never materialized --
+    each step of it runs only after the batch before it was sent -- so each
+    batch is checked as it is released; the live router already refuses such
+    a BUY at plan time (`order_router.hard_risk_exits`), before any order.
+
     An order is read by its ``action`` (``BUY``/``SELL``) and
     ``decision.symbol``, the `order_router.PlannedOrder` surface.
     """
     if decision is None:
         return batches  # the layer is off: the router's batches, untouched
-    materialized = [tuple(batch) for batch in batches]
+    if isinstance(batches, (list, tuple)):
+        materialized = [tuple(batch) for batch in batches]
+        for batch in materialized:
+            _refuse_forced_buys(batch, decision)
+        return [kept for batch in materialized if (kept := _admit(batch, decision, log))]
+    return _admit_each(batches, decision, log)
+
+
+def _admit_each(
+    batches: Iterable[Sequence[object]],
+    decision: HardRiskDecision,
+    log: Callable[[str], None],
+) -> Iterator[Sequence[object]]:
+    for batch in batches:
+        released = tuple(batch)
+        _refuse_forced_buys(released, decision)
+        kept = _admit(released, decision, log)
+        if kept:
+            yield kept
+
+
+def _refuse_forced_buys(batch: Sequence[object], decision: HardRiskDecision) -> None:
     offending = sorted(
-        _symbol(order)
-        for batch in materialized
-        for order in batch
-        if _is_buy(order) and _symbol(order) in decision.forced
+        _symbol(order) for order in batch if _is_buy(order) and _symbol(order) in decision.forced
     )
     if offending:
         raise HardRiskPrecedenceError(
@@ -312,21 +337,22 @@ def enforce_precedence(
             f"forced out today ({ {t: decision.forced[t] for t in offending} }). Hard risk "
             "outranks eligibility, the optimizer and timing; nothing is sent."
         )
+
+
+def _admit(
+    batch: Sequence[object], decision: HardRiskDecision, log: Callable[[str], None]
+) -> tuple[object, ...]:
+    """``batch`` as it may go: every BUY dropped while the circuit breaker is engaged."""
     if not decision.circuit_breaker:
-        return [batch for batch in materialized if batch]
-    kept: list[Sequence[object]] = []
-    for batch in materialized:
-        dropped = sorted(_symbol(o) for o in batch if _is_buy(o))
-        if dropped:
-            log(
-                f"hard_risk: circuit breaker engaged on {decision.trading_day} (drawdown "
-                f"{decision.drawdown.drawdown if decision.drawdown else float('nan'):.2%}); "
-                f"BUY order(s) dropped: {dropped}"
-            )
-        remaining = tuple(o for o in batch if not _is_buy(o))
-        if remaining:
-            kept.append(remaining)
-    return kept
+        return tuple(batch)
+    dropped = sorted(_symbol(o) for o in batch if _is_buy(o))
+    if dropped:
+        log(
+            f"hard_risk: circuit breaker engaged on {decision.trading_day} (drawdown "
+            f"{decision.drawdown.drawdown if decision.drawdown else float('nan'):.2%}); "
+            f"BUY order(s) dropped: {dropped}"
+        )
+    return tuple(o for o in batch if not _is_buy(o))
 
 
 def _is_buy(order: object) -> bool:

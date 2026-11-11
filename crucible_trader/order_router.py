@@ -64,6 +64,39 @@ fill price the share-weighted mean of the executions; decision prices from
 (v1's fix for a cold data farm that nan'd a whole book), subscription released
 in a `finally`.
 
+**The book is sized on the account's live NAV** (2026-11-09 v1/v2 parity
+audit, row 5). :meth:`PaperOrderRouter.session_sizing` reads the broker's
+``NetLiquidation`` once at session start (:func:`read_net_liquidation`) and the
+book is constructed on ``min(book_notional_usd, NAV)``: the declared notional
+is the ceiling. An unreadable NAV refuses the session, and :meth:`batches`
+refuses a book sized past the NAV it read, so a session can never size past
+the money the account has. This read is for SIZING only; the ledger and the
+reconciler still never read ``NetLiquidation`` (`broker_statement.CASH_TAG`).
+
+**Every held long carries a standing GTC protective stop** (parity audit row
+1). After the session's orders, :meth:`PaperOrderRouter.protect_holdings`
+re-asserts exactly one ``STP`` SELL, ``tif="GTC"``, per held name at
+:attr:`RouterConfig.stop_distance_pct` (default 20%, v1's bracket distance)
+below the session's reference price. A stop already standing for today at the
+right size is kept, so a rerun places nothing; a stale one (another day, or a
+size the holdings no longer match) is cancelled -- confirmed -- before its
+replacement goes. The size is the shares held LESS every other working sell
+on the name, so stops never exceed the holding. Before a session SELL the
+name's own stops are cancelled, so a sell and a stop can never both fill.
+
+**With timed orders the stops are placed as the day goes**, not only at its
+end: every name held at the session start before any order is released, and
+the names again right after each timed batch returns (:meth:`_protect_in_session`),
+so a bought name gets its stop and a trimmed name's stop is re-sized. A name
+whose sell is still waiting keeps its stop while it waits. A sell goes only after
+its name's stops are confirmed cancelled, and is clipped to the shares still
+held then, so a stop that fired while the sell waited never leaves the book
+short. A buy never released holds nothing and gets no stop. A stop that cannot be
+placed mid-day is logged and left to the final :meth:`protect_holdings`, which
+fails the run; the waiting orders are not stopped for it. A name the watch
+streams takes its stop reference from the stream, never a fresh snapshot that
+would cancel the stream's subscription.
+
 **Every order waits for its trigger** (`crucible_trader.entry_timing`; buys
 Brian 2026-11-09, sells Brian 2026-11-10). With :attr:`RouterConfig.entry_timing`
 set -- the default -- the buys are held for v1's pullback / VWAP discount /
@@ -90,6 +123,20 @@ for in full keeps waiting while any sell is still waiting (one key per name per
 day means a short buy can never be topped up); with no sell left, or at the
 expiry -- when every sell has just gone first -- it is clipped to the cash.
 
+**A held name that gapped down is sold whole at the session start**
+(`crucible_trader.gap_stop`, v1's catastrophic gap stop): priced live, never from
+the close fallback, against the book day's close; at
+:attr:`RouterConfig.gap_stop_pct` (v1's 0.15) or more below it, the name's planned
+sell becomes a full exit and any buy of it is dropped. Hard risk outranks timing:
+with timed orders the gap exits are the session's first batch, sent at once and
+never held for an exit trigger; immediately, they lead the opening sells.
+
+**A name the hard-risk layer forced out is sold the same way**
+(`crucible_trader.hard_risk`, :func:`hard_risk_exits`): whole, right after any gap
+exit, at once and ahead of every timed order. Like every sell, :meth:`PaperOrderRouter.send`
+cancels its standing stop first and clips it to the shares still held. A BUY of a
+forced name is refused at plan time; at the circuit breaker every BUY is dropped.
+
 **Declared scope:** an order still working when the fill wait ends is left
 working (a DAY order), and its record carries the broker status and what filled
 so far. An adopted order's `submitted_at` is its decision instant, because the
@@ -111,7 +158,7 @@ from crucible.store import Store
 
 from crucible_trader.broker_session import GatewayAddress, connect, load_sdk
 from crucible_trader.broker_statement import PAPER_ACCOUNT_PREFIX, IbPaperStatementSource
-from crucible_trader.construction import TargetBook
+from crucible_trader.construction import SessionSizing, TargetBook
 from crucible_trader.entry_timing import (
     NYSE_ZONE,
     EntryTimingParams,
@@ -129,7 +176,21 @@ from crucible_trader.execution_shortfall import (
     build_shortfall_document,
     decide,
 )
-from crucible_trader.hard_risk import BrokerFacts, read_broker_facts
+from crucible_trader.gap_stop import (
+    DEFAULT_GAP_STOP_PCT,
+    GAP_STOP_EXIT,
+    apply_gap_exits,
+    check_gaps,
+    exit_decision,
+    gap_stop_document,
+    write_gap_stop_document,
+)
+from crucible_trader.hard_risk import (
+    BrokerFacts,
+    HardRiskDecision,
+    HardRiskPrecedenceError,
+    read_broker_facts,
+)
 from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
 from crucible_trader.order_intent import (
@@ -142,9 +203,12 @@ from crucible_trader.order_intent import (
 )
 
 __all__ = [
+    "DEFAULT_STOP_DISTANCE_PCT",
     "ExecutionRecord",
+    "NavUnavailableError",
     "PaperOrderRouter",
     "PlannedOrder",
+    "ProtectiveStopError",
     "RouterConfig",
     "ShadowRouter",
     "StagingRoutingRefusedError",
@@ -156,6 +220,8 @@ __all__ = [
     "is_staging",
     "open_paper_router",
     "plan_orders",
+    "read_net_liquidation",
+    "stop_price_for",
 ]
 
 #: The one switch. Unset or ``off``: shadow, nothing is sent.
@@ -178,6 +244,10 @@ MAX_SESSION_NOTIONAL_VAR = "CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD"
 #: ``immediate``: every order at the session start, sells first, the behaviour
 #: before 2026-11-09. Anything else is refused.
 ENTRY_TIMING_VAR = "CRUCIBLE_TRADER_ENTRY_TIMING"
+
+#: The catastrophic gap stop (`crucible_trader.gap_stop`). Unset: v1's 0.15.
+#: A fraction in (0, 1) overrides it; ``off`` disables it.
+GAP_STOP_VAR = "CRUCIBLE_TRADER_GAP_STOP_PCT"
 ENTRY_TIMING_TRIGGERED = "v1_triggers"
 ENTRY_TIMING_IMMEDIATE = "immediate"
 
@@ -186,6 +256,18 @@ ENTRY_TIMING_IMMEDIATE = "immediate"
 PAPER_GATEWAY_PORT = 4002
 
 ORDER_REF_PREFIX = "crucible-trader"
+#: Every protective stop's `orderRef` starts with this. It is NOT
+#: ``ORDER_REF_PREFIX + "|"``, so the session orders' readers (adoption here,
+#: the intent reconciliation) never take a stop for a session order.
+STOP_REF_PREFIX = "crucible-trader-stop"
+
+#: How far below the reference price the standing stop sits: v1's bracket STP
+#: (`catastrophic_gap_stop_pct` 0.15 + `bracket_backstop_extra_pct` 0.05).
+DEFAULT_STOP_DISTANCE_PCT = 0.20
+STOP_DISTANCE_VAR = "CRUCIBLE_TRADER_STOP_DISTANCE_PCT"
+
+#: The account-summary tag the SIZING reads. Read only here, never by the ledger.
+NAV_TAG = "NetLiquidation"
 _REF_SEP = "|"
 _STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -241,6 +323,14 @@ class OrderRefError(RoutingRefusedError):
 
 class StagingRoutingRefusedError(RoutingRefusedError):
     """The routing switch is present in staging. Staging never routes."""
+
+
+class NavUnavailableError(RoutingRefusedError):
+    """The broker's NetLiquidation could not be read. A live session never sizes blind."""
+
+
+class ProtectiveStopError(RoutingRefusedError):
+    """A held name could not be given its protective stop. Page; the name is unprotected."""
 
 
 class UnknownOrderStateError(RoutingRefusedError):
@@ -302,6 +392,21 @@ def _positive_float(source: Mapping[str, str], var: str) -> float:
     return value
 
 
+def _gap_stop_pct(source: Mapping[str, str]) -> float | None:
+    raw = (source.get(GAP_STOP_VAR) or "").strip()
+    if not raw:
+        return DEFAULT_GAP_STOP_PCT
+    if raw == "off":
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RouterSettingsError(f"{GAP_STOP_VAR}={raw!r} is not a number or 'off'") from exc
+    if not (math.isfinite(value) and 0.0 < value < 1.0):
+        raise RouterSettingsError(f"{GAP_STOP_VAR}={raw!r} must be a fraction in (0, 1)")
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class RouterConfig:
     """Whether orders are routed, and to what. Disabled unless explicitly enabled."""
@@ -311,8 +416,11 @@ class RouterConfig:
     address: GatewayAddress | None = None
     max_order_notional_usd: float | None = None
     max_session_notional_usd: float | None = None
+    stop_distance_pct: float = DEFAULT_STOP_DISTANCE_PCT
     #: The intraday triggers, or None to send every order at the session start.
     entry_timing: EntryTimingParams | None = EntryTimingParams()
+    #: The opening batch's gap-stop threshold (`crucible_trader.gap_stop`), or None.
+    gap_stop_pct: float | None = DEFAULT_GAP_STOP_PCT
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -324,6 +432,10 @@ class RouterConfig:
             value = getattr(self, name)
             if value is None or not (math.isfinite(value) and value > 0):
                 raise RouterSettingsError(f"routing is enabled with {name}={value!r}")
+        if not (math.isfinite(self.stop_distance_pct) and 0 < self.stop_distance_pct < 1):
+            raise RouterSettingsError(
+                f"stop_distance_pct={self.stop_distance_pct!r} must be a fraction in (0, 1)"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> RouterConfig:
@@ -355,8 +467,56 @@ class RouterConfig:
             address=GatewayAddress.from_env(dict(source)),
             max_order_notional_usd=_positive_float(source, MAX_ORDER_NOTIONAL_VAR),
             max_session_notional_usd=_positive_float(source, MAX_SESSION_NOTIONAL_VAR),
+            stop_distance_pct=(
+                _positive_float(source, STOP_DISTANCE_VAR)
+                if (source.get(STOP_DISTANCE_VAR) or "").strip()
+                else DEFAULT_STOP_DISTANCE_PCT
+            ),
             entry_timing=None if timing == ENTRY_TIMING_IMMEDIATE else EntryTimingParams(),
+            gap_stop_pct=_gap_stop_pct(source),
         )
+
+
+def read_net_liquidation(client: Any, account: str) -> float:  # pyright: ignore[reportExplicitAny]  # an ib_async IB
+    """The account's ``NetLiquidation`` in USD, for SIZING the session's book.
+
+    Exactly one finite, positive USD row for ``account``, or
+    :class:`NavUnavailableError`: a NAV that cannot be read is not the
+    declared notional, and a live session refuses rather than size on a guess.
+    """
+    rows = [
+        item
+        for item in client.accountSummary()
+        if item.account == account and item.tag == NAV_TAG and item.currency == "USD"
+    ]
+    if len(rows) != 1:
+        raise NavUnavailableError(
+            f"expected exactly one USD {NAV_TAG} row for {account}, found {len(rows)}; the "
+            "session is not sized on the declared notional in its place"
+        )
+    try:
+        value = float(rows[0].value)
+    except (TypeError, ValueError) as exc:
+        raise NavUnavailableError(f"{NAV_TAG} {rows[0].value!r} is not a number") from exc
+    if not (math.isfinite(value) and value > 0):
+        raise NavUnavailableError(f"{NAV_TAG} {value!r} is not a positive, finite amount")
+    return value
+
+
+def stop_price_for(reference: float, distance: float) -> float:
+    """The stop price ``distance`` below ``reference``, floored to the cent."""
+    price = math.floor(reference * (1.0 - distance) * 100.0) / 100.0
+    if not price > 0:
+        raise PriceUnavailableError(
+            f"a stop {distance:.0%} below {reference!r} rounds to {price!r}; no stop is placed "
+            "at a price that is not positive"
+        )
+    return price
+
+
+def stop_ref(trading_day: str, symbol: str, quantity: int, stop_price: float) -> str:
+    """A protective stop's `orderRef`: the day it was asserted, its size and price."""
+    return _REF_SEP.join((STOP_REF_PREFIX, trading_day, symbol, str(quantity), f"{stop_price:.2f}"))
 
 
 def order_key(trading_day: str, symbol: str) -> str:
@@ -546,6 +706,75 @@ def plan_orders(
             f"${max_session_notional_usd:,.2f}"
         )
     return tuple(sells), tuple(buys)
+
+
+#: The entry-watch trigger a hard-risk forced exit is released under.
+HARD_RISK_EXIT_PREFIX = "hard_risk"
+
+
+def hard_risk_exits(
+    decision: HardRiskDecision,
+    sells: Sequence[PlannedOrder],
+    buys: Sequence[PlannedOrder],
+    *,
+    positions: Mapping[str, int],
+    quote: QuoteSource,
+    clock: Callable[[], dt.datetime],
+    skip: frozenset[str] = frozenset(),
+) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...], dict[str, str]]:
+    """The plan under the hard-risk layer: (sells, buys, {forced exit: its trigger}).
+
+    Precedence is hard risk > eligibility > optimizer > timing. Every held name
+    the layer forced out is sold WHOLE -- a planned partial sell (the per-order
+    cap's clip) is replaced, a name the plan left alone gains one -- and those
+    exits lead the sells, right after any gap exit (``skip``: a gapped name is
+    already sold whole). A BUY of a forced name RAISES
+    :class:`~crucible_trader.hard_risk.HardRiskPrecedenceError` here, at plan
+    time, so a timed session refuses before anything is watched or sent. At the
+    circuit breaker every BUY is dropped. Like a gap exit, a forced exit is
+    sized on the shares held when planned; :meth:`PaperOrderRouter.send` then
+    cancels the name's standing stops and clips it to what is still held.
+    """
+    offending = sorted(o.decision.symbol for o in buys if o.decision.symbol in decision.forced)
+    if offending:
+        raise HardRiskPrecedenceError(
+            f"the plan for {decision.trading_day} BUYs {offending}, which the hard-risk layer "
+            "forced out today; nothing is sent"
+        )
+    if decision.circuit_breaker and buys:
+        print(
+            f"order_router: hard-risk circuit breaker engaged on {decision.trading_day}; "
+            f"BUY order(s) dropped: {sorted(o.decision.symbol for o in buys)}",
+            file=sys.stderr,
+        )
+        buys = ()
+    names = sorted(t for t in decision.forced if positions.get(t, 0) > 0 and t not in skip)
+    if not names:
+        return tuple(sells), tuple(buys), {}
+    planned = {o.decision.symbol: o for o in sells}
+    exits: list[PlannedOrder] = []
+    for symbol in names:
+        held = positions[symbol]
+        prior = planned.get(symbol)
+        if prior is not None and int(prior.decision.quantity) == held:
+            exits.append(prior)
+            continue
+        price = float(prior.decision.decision_price) if prior is not None else quote(symbol)
+        if price is None or not (math.isfinite(price) and price > 0):
+            raise PriceUnavailableError(
+                f"no usable price for {symbol}, which the hard-risk layer forced out "
+                f"({decision.forced[symbol]}); the book is not traded without its exit"
+            )
+        exits.append(
+            PlannedOrder(
+                trading_day=decision.trading_day,
+                decision=decide(symbol, "sell", held, price=price, now=clock()),
+            )
+        )
+    first = [o for o in sells if o.decision.symbol in skip]
+    rest = [o for o in sells if o.decision.symbol not in skip and o.decision.symbol not in names]
+    reasons = {s: f"{HARD_RISK_EXIT_PREFIX}: {decision.forced[s]}" for s in names}
+    return (*first, *exits, *rest), tuple(buys), reasons
 
 
 def book_cash(book: TargetBook, positions: Mapping[str, int], *, quote: QuoteSource) -> float:
@@ -837,6 +1066,7 @@ class PaperOrderRouter:
         clock: Callable[[], dt.datetime] = utcnow,
         quote: QuoteSource | None = None,
         fill_timeout_s: float = FILL_TIMEOUT_S,
+        live_quote: QuoteSource | None = None,
     ) -> None:
         if not config.enabled:
             raise RoutingDisabledError(f"order routing is off ({ROUTING_VAR} unset)")
@@ -857,24 +1087,49 @@ class PaperOrderRouter:
         if quote is None:
             from crucible_trader.simulated_broker import PanelCloseSource  # imports this module
 
-            quote = CloseFallbackQuote(
-                IbQuoteSource(client, sdk), PanelCloseSource(store, trading_day)
-            )
+            primary = IbQuoteSource(client, sdk)
+            live_quote = live_quote or primary
+            quote = CloseFallbackQuote(primary, PanelCloseSource(store, trading_day))
         self._quote = quote
+        # The gap stop's price: IB only, never the close fallback, whose price
+        # IS the reference and would read every unpriced name as a 0% drop.
+        self._live_quote = live_quote or quote
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
         self._records: list[ExecutionRecord] = []
+        self._nav: float | None = None
+        #: The names this session may protect: the book's, inherited and owned.
+        self._managed: frozenset[str] = frozenset()
         self._watch: EntryWatch | None = None
         self._intraday: IbIntradayQuotes | None = None
+        self._stop_events: list[dict[str, object]] = []
 
     @property
     def records(self) -> tuple[ExecutionRecord, ...]:
         return tuple(self._records)
 
+    def _net_liquidation(self) -> float:
+        """The account's NAV, read once per session (`read_net_liquidation`)."""
+        if self._nav is None:
+            self._nav = read_net_liquidation(self._client, self._config.account)  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
+        return self._nav
+
+    def session_sizing(self, ceiling_usd: float) -> SessionSizing:
+        """The live sizing: ``min(ceiling_usd, NetLiquidation)``. Raises when unreadable."""
+        return SessionSizing(ceiling_usd=ceiling_usd, nav_usd=self._net_liquidation())
+
     def batches(self, book: TargetBook) -> Iterable[Sequence[Any]]:
         if book.trading_day != self._day:
             raise RoutingRefusedError(
                 f"the book is for {book.trading_day}; this router was opened for {self._day}"
+            )
+        # The chokepoint for live sizing: whatever built the book, it is never
+        # sized past the money the account holds (parity audit row 5).
+        nav = self._net_liquidation()
+        if book.portfolio_notional_usd > nav * (1 + _GROSS_TOLERANCE):
+            raise RiskCapExceededError(
+                f"the book is sized on ${book.portfolio_notional_usd:,.2f}, over the account's "
+                f"{NAV_TAG} ${nav:,.2f}: a live book is sized on min(declared notional, NAV)"
             )
         statement = IbPaperStatementSource(self._client).read_statement(self._day)
         inherited = inherited_for(self._day)
@@ -899,7 +1154,23 @@ class PaperOrderRouter:
             inherited=inherited,
             owned=owned,
         )
+        gapped: frozenset[str] = frozenset()
+        if self._config.gap_stop_pct is not None:
+            sells, buys, gapped = self._gap_stop(statement.positions, sells, buys)
+        urgent = dict.fromkeys(sorted(gapped), GAP_STOP_EXIT)
+        if book.hard_risk is not None:
+            sells, buys, forced = hard_risk_exits(
+                book.hard_risk,
+                sells,
+                buys,
+                positions=statement.positions,
+                quote=quote,
+                clock=self._clock,
+                skip=gapped,
+            )
+            urgent.update(forced)
         self._planned = sells + buys
+        self._managed = frozenset(_tradable(book)) | inherited | owned
         if self._config.entry_timing is None or not self._planned:
             # Sells first, so their proceeds are cash before the buys go out.
             return [batch for batch in (sells, buys) if batch]
@@ -908,7 +1179,65 @@ class PaperOrderRouter:
             sells,
             buys,
             book_cash=book_cash(book, statement.positions, quote=quote),
+            urgent=urgent,
         )
+
+    def _gap_stop(
+        self,
+        positions: Mapping[str, int],
+        sells: tuple[PlannedOrder, ...],
+        buys: tuple[PlannedOrder, ...],
+    ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...], frozenset[str]]:
+        """The plan with every gapped held name sold whole (`gap_stop`), and those names.
+
+        The record is written before the orders exist, so an exit that reaches
+        the broker is never off the record.
+        """
+        from crucible_trader.simulated_broker import PanelCloseSource  # imports this module
+
+        threshold = self._config.gap_stop_pct
+        assert threshold is not None  # the caller checked
+        reference = PanelCloseSource(self._store, self._day)
+
+        def safe_reference(symbol: str) -> float | None:
+            try:
+                return reference(symbol)
+            except PriceUnavailableError:
+                return None
+
+        checks = check_gaps(
+            positions, reference=safe_reference, live_price=self._live_quote, threshold=threshold
+        )
+        now = self._clock()
+        write_gap_stop_document(
+            self._store,
+            self._day,
+            gap_stop_document(
+                self._day,
+                checks,
+                threshold=threshold,
+                reference_source=reference.source_key,
+                now=now,
+            ),
+        )
+        for check in checks:
+            if check.fired:
+                print(
+                    f"order_router: GAP STOP {check.symbol} at {check.price} is "
+                    f"{check.drop:.1%} below the {self._day} close {check.reference_close}; "
+                    f"selling all {check.shares} shares",
+                    file=sys.stderr,
+                )
+        sells, buys = apply_gap_exits(
+            sells,
+            buys,
+            checks,
+            symbol_of=lambda o: o.decision.symbol,
+            full_exit=lambda c: PlannedOrder(
+                trading_day=self._day, decision=exit_decision(c, now=now)
+            ),
+        )
+        return sells, buys, frozenset(c.symbol for c in checks if c.fired)
 
     def _timed_orders(
         self,
@@ -917,11 +1246,19 @@ class PaperOrderRouter:
         buys: Sequence[PlannedOrder],
         *,
         book_cash: float,
+        urgent: Mapping[str, str] | None = None,
     ) -> Iterator[tuple[PlannedOrder, ...]]:
         """Every order, released as its own batch when its trigger fires.
 
         In each poll the sells are judged and sent first, so the cash their fills
         free is on the ledger before any buy of the same poll is sized against it.
+        A generator, so each step below runs only after the batch before it was
+        SENT (and its fill wait ended). The sells of the ``urgent`` names (the gap
+        stop's exits and the hard-risk layer's forced exits, each with the reason
+        it is released under) are hard risk and wait for no trigger: they are the
+        first batch, sent at once, before any stop is placed. Then the names held are
+        protected, and every timed batch's names again right after it returns, not
+        at the session's end.
         """
         now = self._clock()
         schedule = params.schedule(now.astimezone(NYSE_ZONE).date())
@@ -975,11 +1312,24 @@ class PaperOrderRouter:
                     unknown.append(
                         OrderIntentConflictError(order_intent_key(self._day, entry.symbol), intent)
                     )
+            # Hard risk outranks timing: a gap exit or a hard-risk forced exit
+            # never waits for an exit trigger.
+            urgent = urgent or {}
+            gap_exits = [e for e in watch.waiting() if e.side == "sell" and e.symbol in urgent]
+            if gap_exits:
+                for entry in gap_exits:
+                    ledger.release_sell(entry, urgent[entry.symbol], now)
+                watch.write(now)
+                yield tuple(by_key[e.order_key] for e in gap_exits)
+                for entry in gap_exits:
+                    entry.status = "sent"
+            self._protect_in_session("at the session start")
             if adopted:
                 watch.write(now)
                 yield tuple(by_key[e.order_key] for e in adopted)
                 for entry in adopted:
                     entry.status = "sent"
+                self._protect_in_session("after the adopted orders")
             quotes.subscribe(e.symbol for e in watch.waiting())
             watch.write(self._clock())
             while watch.waiting():
@@ -1016,6 +1366,8 @@ class PaperOrderRouter:
                     yield tuple(by_key[e.order_key] for e in exits)
                     for entry in exits:
                         entry.status = "sent"
+                    names = ", ".join(entry.symbol for entry in exits)
+                    self._protect_in_session(f"after the timed sell of {names}")
                 # The sells sent above have had their fill wait in `send`.
                 cash = ledger.cash(
                     (
@@ -1059,6 +1411,8 @@ class PaperOrderRouter:
                     yield tuple(order for _, order in entries)
                     for entry, _ in entries:
                         entry.status = "sent"
+                    names = ", ".join(entry.symbol for entry, _ in entries)
+                    self._protect_in_session(f"after the timed buy of {names}")
                 if watch.waiting():
                     self._client.sleep(params.poll_interval_s)
             watch.state = "complete"
@@ -1145,6 +1499,42 @@ class PaperOrderRouter:
             decision=decide(d.symbol, d.side, quantity, price=d.decision_price, now=d.decided_at),
         )
 
+    def _protect_in_session(self, moment: str) -> None:
+        """:meth:`protect_holdings` mid-session; a stop it cannot place never stops the day.
+
+        A name left unprotected here is logged and re-attempted by the session's
+        final :meth:`protect_holdings`, which fails the run if it still cannot;
+        stopping the waiting buys would not protect it. The kill switch and a
+        broken connection still raise, as on every poll.
+        """
+        try:
+            results = self.protect_holdings()
+        except ProtectiveStopError as exc:
+            self._stop_events.append({"moment": moment, "error": str(exc)})
+            print(
+                f"order_router: {moment}: {exc}; re-attempted at the session's end",
+                file=sys.stderr,
+            )
+            return
+        self._stop_events.extend(
+            {"moment": moment, **result} for result in results if result["disposition"] != "kept"
+        )
+
+    @property
+    def protective_stop_events(self) -> tuple[dict[str, object], ...]:
+        """Every stop placed or cancelled, and every failure, during the all-day session."""
+        return tuple(self._stop_events)
+
+    def _stop_reference(self, symbol: str) -> float | None:
+        """The price a stop is set below: the live stream's last for a watched name, else a quote.
+
+        A name the entry watch streams is never re-quoted: a snapshot request
+        and its cancel on the same contract would end the watch's subscription.
+        """
+        if self._intraday is not None and symbol in self._intraday:
+            return self._intraday(symbol).last
+        return self._quote(symbol)
+
     def entry_watch_payload(self, now: dt.datetime) -> tuple[str, bytes] | None:
         """The day's final entry-watch document, or None when no buy was held."""
         if self._watch is None:
@@ -1186,6 +1576,13 @@ class PaperOrderRouter:
                     prior = parse_order_ref(known[order.key])
                     self._records.append(self._record(prior, "adopted", "Adopted", None))
                     continue
+                if order.action == "SELL":
+                    # A sell and a standing stop must never both fill.
+                    self._cancel_stops(order.decision.symbol, self._open_stops())
+                    clipped = self._clip_to_held(order)
+                    if clipped is None:
+                        continue
+                    order = clipped
                 try:
                     trade = self._place(order)
                 except OrderIntentConflictError as conflict:
@@ -1206,6 +1603,36 @@ class PaperOrderRouter:
         self._record_placed(placed)
         if unknown:
             raise UnknownOrderStateError(unknown)
+
+    def _clip_to_held(self, order: PlannedOrder) -> PlannedOrder | None:
+        """A sell clipped to the shares held once its name's stops are cancelled.
+
+        A timed sell waits all day while its name's protective stop stands. If the
+        stop fired in the meantime, the planned quantity is more than is held and
+        sending it would leave the book short, so it is cut to what is held -- and
+        not sent at all when nothing is.
+        """
+        d = order.decision
+        statement = IbPaperStatementSource(self._client).read_statement(self._day)
+        held = max(0, statement.positions.get(d.symbol, 0))
+        if held >= d.quantity:
+            return order
+        if held == 0:
+            print(
+                f"order_router: {d.symbol}: no share is held once its stops are cancelled "
+                f"(a protective stop filled); the sell of {int(d.quantity)} is not sent",
+                file=sys.stderr,
+            )
+            return None
+        print(
+            f"order_router: {d.symbol}: {held} share(s) held once its stops are cancelled; "
+            f"the sell of {int(d.quantity)} is clipped to {held}",
+            file=sys.stderr,
+        )
+        return PlannedOrder(
+            trading_day=order.trading_day,
+            decision=decide(d.symbol, d.side, held, price=d.decision_price, now=d.decided_at),
+        )
 
     def _claim_intent(self, order: PlannedOrder) -> None:
         """The durable intent, written before the submit. Raises; never sends past it."""
@@ -1238,6 +1665,134 @@ class PaperOrderRouter:
         ib_order.outsideRth = False
         ib_order.transmit = True
         return self._client.placeOrder(contract, ib_order)
+
+    def _open_stops(self) -> dict[str, list[Any]]:  # pyright: ignore[reportExplicitAny]  # ib_async Trades
+        """This router's working protective stops, by symbol."""
+        stops: dict[str, list[Any]] = {}  # pyright: ignore[reportExplicitAny]  # ib_async Trades
+        for trade in self._client.reqAllOpenOrders():
+            ref = trade.order.orderRef or ""
+            if ref.startswith(STOP_REF_PREFIX + _REF_SEP) and (
+                trade.orderStatus.status not in TERMINAL_STATUSES
+            ):
+                stops.setdefault(trade.contract.symbol, []).append(trade)
+        return stops
+
+    def _cancel_stops(self, symbol: str, stops: Mapping[str, list[Any]]) -> list[str]:  # pyright: ignore[reportExplicitAny]
+        """Cancel ``symbol``'s stops and wait until the broker confirms it. Raises if not."""
+        trades = stops.get(symbol, [])
+        for trade in trades:
+            self._client.cancelOrder(trade.order)
+        waited = 0.0
+        while any(t.orderStatus.status not in TERMINAL_STATUSES for t in trades):
+            if waited >= self._fill_timeout_s:
+                raise ProtectiveStopError(
+                    f"{symbol}: a stale protective stop was not confirmed cancelled within "
+                    f"{self._fill_timeout_s:g}s; no further order on it is sent, so the stops "
+                    "can never exceed the shares held"
+                )
+            self._client.sleep(POLL_INTERVAL_S)
+            waited += POLL_INTERVAL_S
+        return [t.order.orderRef for t in trades]
+
+    def protect_holdings(self) -> tuple[dict[str, object], ...]:
+        """Re-assert one GTC STP SELL per held name, after the session's orders.
+
+        Sized to the shares held less every other working sell on the name, at
+        :attr:`RouterConfig.stop_distance_pct` below the session's reference
+        price (:attr:`_quote`). A stop already standing for today at that size
+        is kept; any other stop of this router's on the name is cancelled --
+        confirmed -- first. A stop on a name no longer held is cancelled. The
+        kill switch is re-read before every stop. Every name is attempted; any
+        that could not be protected raise :class:`ProtectiveStopError` at the end.
+        """
+        assert_trading_permitted(self._store, self._day)
+        positions = IbPaperStatementSource(self._client).read_statement(self._day).positions
+        stops = self._open_stops()
+        other_sells: dict[str, float] = {}
+        for trade in self._client.reqAllOpenOrders():
+            ref = trade.order.orderRef or ""
+            if (
+                trade.order.action == "SELL"
+                and not ref.startswith(STOP_REF_PREFIX + _REF_SEP)
+                and trade.orderStatus.status not in TERMINAL_STATUSES
+            ):
+                remaining = float(trade.order.totalQuantity) - float(trade.orderStatus.filled)
+                symbol = trade.contract.symbol
+                other_sells[symbol] = other_sells.get(symbol, 0.0) + max(0.0, remaining)
+        held_names = {s for s, q in positions.items() if q > 0 and s in self._managed}
+        results: list[dict[str, object]] = []
+        failures: list[str] = []
+        for symbol in sorted(held_names | set(stops)):
+            quantity = 0
+            if symbol in held_names:
+                quantity = max(0, math.floor(positions[symbol] - other_sells.get(symbol, 0.0)))
+            existing = stops.get(symbol, [])
+            keep_prefix = _REF_SEP.join((STOP_REF_PREFIX, self._day, symbol, str(quantity))) + (
+                _REF_SEP
+            )
+            if (
+                quantity > 0
+                and len(existing) == 1
+                and existing[0].order.orderRef.startswith(keep_prefix)
+            ):
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "disposition": "kept",
+                        "order_ref": existing[0].order.orderRef,
+                    }
+                )
+                continue
+            try:
+                results.append(self._reassert_stop(symbol, quantity, stops))
+            except RoutingRefusedError as exc:
+                failures.append(f"{symbol}: {exc}")
+        if failures:
+            raise ProtectiveStopError(
+                f"{len(failures)} held name(s) are without a protective stop: "
+                + "; ".join(failures)
+            )
+        return tuple(results)
+
+    def _reassert_stop(
+        self,
+        symbol: str,
+        quantity: int,
+        stops: Mapping[str, list[Any]],  # pyright: ignore[reportExplicitAny]
+    ) -> dict[str, object]:
+        """Cancel ``symbol``'s stale stops, then place one for ``quantity`` (none at 0)."""
+        cancelled = self._cancel_stops(symbol, stops)
+        if quantity == 0:
+            return {"symbol": symbol, "disposition": "cancelled", "cancelled": cancelled}
+        reference = self._stop_reference(symbol)
+        if reference is None or not (math.isfinite(reference) and reference > 0):
+            raise PriceUnavailableError(f"no reference price for {symbol} ({reference!r})")
+        price = stop_price_for(reference, self._config.stop_distance_pct)
+        ref = stop_ref(self._day, symbol, quantity, price)
+        # The kill switch, re-read before every stop as before every order.
+        assert_trading_permitted(self._store, self._day)
+        self._place_stop(symbol, quantity, price, ref)
+        return {
+            "symbol": symbol,
+            "disposition": "placed",
+            "order_ref": ref,
+            "quantity": quantity,
+            "stop_price": price,
+            "reference_price": reference,
+            "cancelled": cancelled,
+        }
+
+    def _place_stop(self, symbol: str, quantity: int, stop_price: float, ref: str) -> None:
+        contract = self._sdk.Stock(symbol, "SMART", "USD")
+        if not _qualified(self._client, contract):
+            raise RoutingRefusedError(f"IB could not qualify {symbol}")
+        ib_order = self._sdk.StopOrder("SELL", quantity, stop_price)
+        ib_order.orderRef = ref
+        ib_order.account = self._config.account
+        ib_order.tif = "GTC"
+        ib_order.outsideRth = False
+        ib_order.transmit = True
+        self._client.placeOrder(contract, ib_order)
 
     def _record_placed(self, placed: list[tuple[PlannedOrder, Any, dt.datetime]]) -> None:
         for order, trade, submitted_at in placed:

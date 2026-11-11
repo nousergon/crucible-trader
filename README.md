@@ -150,6 +150,15 @@ every waiting order and what released each one.
 `CRUCIBLE_TRADER_ENTRY_TIMING=immediate` sends every order at the start
 instead, sells first.
 
+**A held name that gaps down is sold whole first** (`crucible_trader.gap_stop`,
+the v1 executor's catastrophic gap stop). At the session start every held name
+is priced live against the book day's close; one 15% or more below it is sold in
+full at once, as the session's first batch, whatever the book wants, and is not
+bought that day. It never waits for the sell-timing trigger the other sells wait
+for: hard risk outranks timing. Every check, fired or not, is recorded at
+`trader/gap_stop/{day}.json`. `CRUCIBLE_TRADER_GAP_STOP_PCT` overrides the
+threshold; `off` disables it.
+
 ## Where the rest lives
 
 | You need | Go to |

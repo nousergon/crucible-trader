@@ -49,6 +49,7 @@ from crucible.slots.strategy import construct_book
 
 import crucible_trader.construction as construction
 from crucible_trader.construction import (
+    SessionSizing,
     _previous_weights,
     construct_target_book,
     held_tickers,
@@ -109,6 +110,16 @@ class TestTheTraderAndTheGradeConstructOneBook:
         for field in ("engine", "cost_model", "params_digest", "arm_id", "sessions"):
             assert traded.evidence[field] == graded.evidence[field], field
 
+    def test_the_turnover_drivers_are_the_engines_own_diagnostics(self, world) -> None:
+        # v1 parity row 16: the churn alarm attributes from these, so they are
+        # copied from the construction, never recomputed or zero-filled.
+        world.record_session(world.arm_id)
+        traded = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+
+        assert traded.turnover_drivers is not None
+        assert set(traded.turnover_drivers) <= set(construction.TURNOVER_DRIVER_KEYS)
+        assert "turnover_mandatory_floor" in traded.turnover_drivers
+
     def test_same_book_from_a_held_position(self, world) -> None:
         world.record_session(world.arm_id)
         first = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
@@ -145,6 +156,51 @@ class TestTheTraderAndTheGradeConstructOneBook:
         world.write_adv()
         book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
         assert book.evidence["cost_model"]["name"] == "sqrt_impact_v1"
+
+
+class TestALiveSessionIsSizedOnItsNav:
+    """2026-11-09 parity audit row 5: min(declared notional, broker NAV)."""
+
+    def test_a_nav_below_the_ceiling_sizes_the_book_on_the_nav(self, world) -> None:
+        world.record_session(world.arm_id)
+        sizing = SessionSizing(ceiling_usd=1_000_000.0, nav_usd=850_000.0)
+        book = construct_target_book(
+            world.store, trading_day=DAY, previous_weights=None, now=NOW, sizing=sizing
+        )
+        assert book.portfolio_notional_usd == 850_000.0
+        assert book.sizing == sizing
+        assert sizing.record() == {
+            "basis": "broker_net_liquidation",
+            "nav_usd": 850_000.0,
+            "ceiling_usd": 1_000_000.0,
+            "notional_usd": 850_000.0,
+        }
+
+    def test_a_nav_above_the_ceiling_is_capped_at_the_declared_notional(self, world) -> None:
+        world.record_session(world.arm_id)
+        sizing = SessionSizing(ceiling_usd=1_000_000.0, nav_usd=1_200_000.0)
+        book = construct_target_book(
+            world.store, trading_day=DAY, previous_weights=None, now=NOW, sizing=sizing
+        )
+        assert book.portfolio_notional_usd == 1_000_000.0
+
+    def test_no_sizing_keeps_the_declared_notional(self, world) -> None:
+        world.record_session(world.arm_id)
+        book = construct_target_book(world.store, trading_day=DAY, previous_weights=None, now=NOW)
+        assert book.portfolio_notional_usd == 1_000_000.0 and book.sizing is None
+
+    def test_a_sizing_under_another_ceiling_is_refused(self, world) -> None:
+        world.record_session(world.arm_id)
+        sizing = SessionSizing(ceiling_usd=2_000_000.0, nav_usd=1_500_000.0)
+        with pytest.raises(ContractRefusal, match="ceiling"):
+            construct_target_book(
+                world.store, trading_day=DAY, previous_weights=None, now=NOW, sizing=sizing
+            )
+
+    @pytest.mark.parametrize("nav", [0.0, -1.0, float("nan"), float("inf")])
+    def test_a_nav_that_is_not_a_positive_amount_is_refused(self, nav) -> None:
+        with pytest.raises(ContractRefusal, match="nav_usd"):
+            SessionSizing(ceiling_usd=1_000_000.0, nav_usd=nav)
 
 
 class TestNoAttestedChampionNoBook:
