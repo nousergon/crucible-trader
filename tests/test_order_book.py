@@ -387,3 +387,76 @@ def test_a_feature_artifact_without_a_sector_column_labels_nothing(tmp_path) -> 
         features_key(DEFAULT_FEATURE_VERSION, "2026-11-05"), frame.to_parquet(index=False)
     )
     assert sector_labels(store, "2026-11-05", ["AAA"]) == ({}, None)
+
+
+# --- the optimizer block (Brian 2026-11-12: the dashboard's optimizer charts) ---------
+
+
+def test_the_book_carries_what_the_optimizer_solved_and_its_settings() -> None:
+    import dataclasses
+
+    import numpy as np
+
+    from crucible_trader.construction import optimizer_record
+
+    class _Params:
+        risk_aversion = 4.0
+        vol_target_annual = None
+        covariance_shrinkage = "ledoit_wolf"
+        min_hold_days = 5
+
+    diagnostics = {
+        "status": "optimal",
+        "portfolio_vol_ann": np.float64(0.21),
+        "active_share_vs_benchmark": 0.83,
+        "n_active_positions": np.int64(5),
+        "churn_controls": {"min_hold_days": 5, "floored": ["SNDK"]},
+        "aim_weights": np.ones(3),  # one per name: not a fact about the day
+        "not_a_display_key": 1,
+    }
+    record = optimizer_record(diagnostics, _Params())
+    assert record["solved"] == {
+        "status": "optimal",
+        "portfolio_vol_ann": 0.21,
+        "active_share_vs_benchmark": 0.83,
+        "n_active_positions": 5,
+        "churn_controls": {"min_hold_days": 5, "floored": ["SNDK"]},
+    }
+    assert record["settings"] == {
+        "risk_aversion": 4.0,
+        "vol_target_annual": None,
+        "covariance_shrinkage": "ledoit_wolf",
+        "min_hold_days": 5,
+    }
+    book = dataclasses.replace(_book(), optimizer=record)
+    doc = order_book_document(book, previous_weights=None, written_at_utc="t")
+    assert json.loads(json.dumps(doc))["optimizer"] == record
+
+
+def test_a_value_that_will_not_serialise_is_dropped_not_fatal() -> None:
+    import numpy as np
+
+    from crucible_trader.construction import optimizer_record
+
+    class _Params:
+        risk_aversion = object()
+        min_hold_days = 5
+
+    record = optimizer_record(
+        {
+            "portfolio_vol_ann": float("nan"),
+            "status": object(),
+            "expected_alpha": 0.01,
+            "cost_model": {"breaks": np.array([1.0, 2.0])},
+        },
+        _Params(),
+    )
+    assert record == {
+        "solved": {"expected_alpha": 0.01, "cost_model": {"breaks": [1.0, 2.0]}},
+        "settings": {"min_hold_days": 5},
+    }
+
+
+def test_a_book_without_an_optimizer_block_writes_null() -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
+    assert doc["optimizer"] is None

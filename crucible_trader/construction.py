@@ -82,6 +82,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import inspect
+import json
 import math
 from collections.abc import Callable, Mapping
 from typing import Any, cast
@@ -118,6 +119,8 @@ from crucible_trader.hard_risk import HardRiskDecision, HardRiskInputs, decide
 __all__ = [
     "STRATEGY_SLOT",
     "SessionSizing",
+    "OPTIMIZER_DIAGNOSTIC_KEYS",
+    "OPTIMIZER_PARAM_KEYS",
     "TURNOVER_DRIVER_KEYS",
     "TargetBook",
     "construct_target_book",
@@ -217,6 +220,10 @@ class TargetBook:
     #: forced out and locked out, and the drawdown rung. ``None`` when the
     #: session had no broker to evaluate it on.
     hard_risk: HardRiskDecision | None = None
+    #: What the optimizer solved and under which settings, for the order book
+    #: and the console's optimizer page (:func:`optimizer_record`). ``None``
+    #: from a test double.
+    optimizer: dict[str, object] | None = None
 
 
 #: The diagnostics a session's turnover is attributed from. Copied verbatim;
@@ -232,6 +239,83 @@ TURNOVER_DRIVER_KEYS: tuple[str, ...] = (
     "conviction_gate_applied",
     "conviction_gate_reason",
 )
+
+
+#: The engine diagnostics the order book carries for a reader, one day at a
+#: time (Brian 2026-11-12: the old dashboard's optimizer charts). Copied when
+#: present and JSON-safe; an absent key stays absent, never zero. The aim
+#: weights are left out: one number per name in the universe, not a fact
+#: about the day.
+OPTIMIZER_DIAGNOSTIC_KEYS: tuple[str, ...] = (
+    "status",
+    "portfolio_vol_ann",
+    "active_share_vs_benchmark",
+    "n_active_positions",
+    "expected_alpha",
+    "turnover_one_way",
+    "alpha_uncertainty_penalty_used",
+    "mean_alpha_std_active",
+    "alpha_uncertainty_penalty_contribution",
+    "rebalance_band",
+    "churn_controls",
+    "aim_adjustment",
+    "cost_model",
+)
+#: The settings the solve ran under, from the published parameter set.
+OPTIMIZER_PARAM_KEYS: tuple[str, ...] = (
+    "risk_aversion",
+    "vol_target_annual",
+    "covariance_shrinkage",
+    "sigma_horizon_days",
+    "ewma_lambda_decay",
+    "alpha_uncertainty_penalty",
+    "cash_sleeve_pct",
+    "max_position_pct",
+    "max_pct_adv",
+    "max_daily_turnover",
+    "rebalance_band_pct",
+    "min_hold_days",
+    "exit_rank_buffer",
+    "aim_adjustment_rate",
+)
+
+
+def _json_safe(value: object) -> object:
+    """``value`` as plain JSON, numpy scalars and arrays included; raises when it cannot be."""
+    return json.loads(json.dumps(value, default=_json_default, allow_nan=False))
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, np.generic):
+        return cast(object, value.item())
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"{type(value).__name__} is not JSON")
+
+
+def optimizer_record(diagnostics: Mapping[str, object], params: object) -> dict[str, object]:
+    """The day's ``optimizer`` block: what the solve recorded, and its settings.
+
+    The keys are :data:`OPTIMIZER_DIAGNOSTIC_KEYS` and :data:`OPTIMIZER_PARAM_KEYS`.
+
+    Display only: nothing reads it back to trade. A value that will not
+    serialise is dropped with its key rather than failing the session.
+    """
+    solved: dict[str, object] = {}
+    for key in OPTIMIZER_DIAGNOSTIC_KEYS:
+        if key in diagnostics:
+            try:
+                solved[key] = _json_safe(diagnostics[key])
+            except (TypeError, ValueError):
+                continue
+    settings: dict[str, object] = {}
+    for key in OPTIMIZER_PARAM_KEYS:
+        if hasattr(params, key):
+            try:
+                settings[key] = _json_safe(getattr(params, key))
+            except (TypeError, ValueError):
+                continue
+    return {"solved": solved, "settings": settings}
 
 
 def initial_weights(universe: BookUniverse) -> np.ndarray:
@@ -626,4 +710,5 @@ def construct_target_book(
         },
         sizing=sizing,
         hard_risk=decision,
+        optimizer=optimizer_record(diagnostics, params),
     )
