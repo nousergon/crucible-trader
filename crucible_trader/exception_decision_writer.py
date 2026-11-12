@@ -87,6 +87,7 @@ from crucible_trader.exception_decision import (
     DecisionError,
     decide,
     load_decisions,
+    load_exception_records,
     load_proposals,
     record_decision,
 )
@@ -411,6 +412,9 @@ def _form(event: Mapping[str, object], *, approver: Approver, store: Store) -> d
     reader = read_only(store, reason="the decision form only reads proposals and decisions")
     try:
         items = queue_items(load_proposals(reader), load_decisions(reader), tenants=tenants)
+        exceptions = load_exception_records(
+            reader, (str(item.proposal.get("trading_day")) for item in items)
+        )
     except (DecisionError, ValueError) as exc:
         return _refuse(503, f"cannot read the queue: {exc}", **who)
     nonce = secrets.token_urlsafe(18)
@@ -424,7 +428,13 @@ def _form(event: Mapping[str, object], *, approver: Approver, store: Store) -> d
             "referrer-policy": "no-referrer",
             "x-content-type-options": "nosniff",
         },
-        "body": render_queue_page(items, reviewer=approver.reviewer, tenants=tenants, nonce=nonce),
+        "body": render_queue_page(
+            items,
+            reviewer=approver.reviewer,
+            tenants=tenants,
+            nonce=nonce,
+            exceptions=exceptions,
+        ),
     }
 
 
