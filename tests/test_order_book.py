@@ -434,12 +434,27 @@ def test_the_book_carries_what_the_optimizer_solved_and_its_settings() -> None:
 
 
 def test_a_value_that_will_not_serialise_is_dropped_not_fatal() -> None:
+    import numpy as np
+
     from crucible_trader.construction import optimizer_record
 
+    class _Params:
+        risk_aversion = object()
+        min_hold_days = 5
+
     record = optimizer_record(
-        {"portfolio_vol_ann": float("nan"), "status": object(), "expected_alpha": 0.01}, object()
+        {
+            "portfolio_vol_ann": float("nan"),
+            "status": object(),
+            "expected_alpha": 0.01,
+            "cost_model": {"breaks": np.array([1.0, 2.0])},
+        },
+        _Params(),
     )
-    assert record == {"solved": {"expected_alpha": 0.01}, "settings": {}}
+    assert record == {
+        "solved": {"expected_alpha": 0.01, "cost_model": {"breaks": [1.0, 2.0]}},
+        "settings": {"min_hold_days": 5},
+    }
 
 
 def test_a_book_without_an_optimizer_block_writes_null() -> None:
