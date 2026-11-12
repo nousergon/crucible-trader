@@ -703,6 +703,26 @@ def _book_interest(
             statement_day=opened_with.trading_day,
             basis="accrued before the book opened: opening equity, not income",
         )
+    # The previous statement's accrual, when the receivable never reached it:
+    # days the ledger posted before it booked interest (`alpha-engine-config-I13234`).
+    # Interest IB accrued by then is that period's income. Skipping it nets it
+    # into today's change, which on a posting day understates the posting by
+    # exactly that growth (2026-11-04: $6.77 of an $8.62 page-tier cash gap).
+    anchor = inputs.anchor
+    if anchor is not None and anchor.accrued_cash_usd is not None and anchor.trading_day < day:
+        behind = to_cents(anchor.accrued_cash_usd) - ledger.cents(
+            tenant, account, INTEREST_RECEIVABLE
+        )
+        if behind > 0:
+            book(
+                "interest_accrual",
+                f"accrual/{anchor.trading_day}",
+                [Posting(INTEREST_RECEIVABLE, behind), Posting(INTEREST_INCOME, -behind)],
+                source="ib_statement",
+                statement_day=anchor.trading_day,
+                accrued_cents=to_cents(anchor.accrued_cash_usd),
+                booked_late="the previous statement's accrual, not booked on its own day",
+            )
     held = ledger.cents(tenant, account, INTEREST_RECEIVABLE)
     # A move TOWARD zero is a posting to cash; a move away from zero accrues.
     # IB's AccruedCash is negative for debit interest, so a falling negative

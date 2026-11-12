@@ -253,14 +253,35 @@ class TestPostDailyLedgerReadsTheOpeningStatement:
     def test_a_book_opened_earlier_books_its_opening_accrual_late(self, store):
         opened_without_interest(store, stmt(D0, 1_000.0, 2.00))
         posting = post(store, stmt(D2, 1_000.0, 2.30), stmt(D1, 1_000.0, 2.10))
+        # D1 posted before interest was booked: its growth is caught up first
+        # (alpha-engine-config-I13234), then D2's own.
         assert kinds(posting) == [
             ("interest_accrual", f"accrual/opening/{D0}"),
+            ("interest_accrual", f"accrual/{D1}"),
             ("interest_accrual", f"accrual/{D2}"),
         ]
+        assert [legs(e)[INTEREST_INCOME] for e in posting.entries[1:]] == [-10, -20]
         # Once booked, the opening statement is not read again.
         assert kinds(post(store, stmt(D3, 1_000.0, 2.40), stmt(D2, 1_000.0, 2.30))) == [
             ("interest_accrual", f"accrual/{D3}")
         ]
+
+    def test_a_late_booked_posting_day_settles_from_the_previous_statement(self, store):
+        """2026-11-04 (alpha-engine-config-I13234): opened from 10-30 at a $102.51
+        accrual, 11-03 posted before interest was booked (accrual $109.28), and
+        11-04 IB posted the interest (accrual $3.43). The settlement is the fall
+        from $109.28, not from $102.51; the $6.77 between was income, and booking
+        it removes that much of the day's cash gap."""
+        opened_without_interest(store, stmt(D0, 1_000.0, 102.51))
+        posting = post(store, stmt(D2, 1_105.85, 3.43), stmt(D1, 1_000.0, 109.28))
+        assert kinds(posting) == [
+            ("interest_accrual", f"accrual/opening/{D0}"),
+            ("interest_accrual", f"accrual/{D1}"),
+            ("interest_settlement", f"accrual/{D2}"),
+        ]
+        assert legs(posting.entries[1]) == {INTEREST_RECEIVABLE: 677, INTEREST_INCOME: -677}
+        assert legs(posting.entries[2]) == {CASH: 10585, INTEREST_RECEIVABLE: -10585}
+        assert posting.document["clean"] is True
 
     def test_an_unreadable_or_foreign_opening_statement_is_an_unrecorded_opening(self, store):
         opened_without_interest(store, stmt(D0, 1_000.0, 2.00))
