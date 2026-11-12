@@ -736,11 +736,18 @@ class SizingRouter(HoldingRouter):
         self.nav = nav
         self.protect_fail = protect_fail
         self.protected = 0
+        self.events: list[str] = []
 
     def session_sizing(self, ceiling: float) -> SessionSizing:
         return SessionSizing(ceiling_usd=ceiling, nav_usd=self.nav)
 
+    def settle(self) -> int:
+        # Order matters: the stops are sized after the working orders settle.
+        self.events.append("settle")
+        return 0
+
     def protect_holdings(self):
+        self.events.append("protect")
         self.protected += 1
         if self.protect_fail is not None:
             raise self.protect_fail
@@ -777,6 +784,7 @@ class TestALiveSessionSizesOnNavAndProtectsItsHoldings:
             "notional_usd": 850_000.0,
         }
         assert router.protected == 1
+        assert router.events == ["settle", "protect"]
         assert result["protective_stops"] == [{"symbol": "PLTR", "disposition": "placed"}]
 
     def test_a_router_without_nav_or_stops_keeps_the_declared_notional(self, store) -> None:

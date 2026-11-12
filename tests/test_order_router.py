@@ -451,6 +451,43 @@ def test_an_order_still_working_at_the_fill_bound_is_recorded_unfilled(store) ->
     assert document["outcome"] == "computed" and document["summary"]["n_filled"] == 0
 
 
+def test_settle_rerecords_an_order_that_filled_after_the_fill_bound(store) -> None:
+    # 2026-11-12: a paper market buy was still working at the 30 s bound and
+    # filled minutes later; the session filed it unfilled.
+    ib = RoutingIB(stall=True)
+    router = _router(store, ib, fill_timeout_s=2.0)
+    _route(router, _book({"AAA": 0.1}))
+    assert router.records[0].filled_quantity == 0.0
+    ib.stall = False
+    assert router.settle(timeout_s=5.0) == 0
+    (record,) = router.records
+    assert record.broker_status == "Filled" and record.filled_quantity > 0
+    assert record.fill_price is not None
+    document = router.shortfall_document(champion="m:arm:abc", trading_day=DAY, now=T0)
+    assert document["summary"]["n_filled"] == 1
+    # Settled: a second call waits on nothing.
+    before = ib.clock()
+    assert router.settle(timeout_s=5.0) == 0 and ib.clock() == before
+
+
+def test_settle_gives_up_at_its_bound_and_records_what_stands(store) -> None:
+    ib = RoutingIB(stall=True)
+    router = _router(store, ib, fill_timeout_s=1.0)
+    _route(router, _book({"AAA": 0.1}))
+    assert router.settle(timeout_s=2.0) == 1
+    (record,) = router.records
+    assert record.broker_status == "Submitted" and record.filled_quantity == 0.0
+    assert len(ib.order_calls) == 1 and ib.cancel_calls == 0
+
+
+def test_settle_with_every_order_filled_waits_on_nothing(store) -> None:
+    ib = RoutingIB()
+    router = _router(store, ib)
+    _route(router, _book({"AAA": 0.1}))
+    before = ib.clock()
+    assert router.settle() == 0 and ib.clock() == before
+
+
 def test_a_contract_ib_cannot_qualify_is_refused_at_send(store) -> None:
     ib = RoutingIB()
     router = _router(store, ib, quote=lambda symbol: 100.0)
