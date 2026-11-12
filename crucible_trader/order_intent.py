@@ -36,7 +36,6 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from crucible.execution import execution_shortfall_key, validate_execution_shortfall
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
 __all__ = [
@@ -179,6 +178,16 @@ def _filled_by_order(store: Store, day: str) -> dict[str, float]:
     Empty when the session filed no record of fills: none written, ``no_orders``,
     or ``not_computed``. A record that cannot be read raises.
     """
+    # Imported here, not at module top: crucible.execution pulls pydantic,
+    # jsonschema, numpy and yaml, and this module sits in the back-office
+    # decision writer Lambda's import closure (via exception_record), which is
+    # packaged --no-deps with stdlib + crucible.store only. Only the trader's
+    # session path reaches this function.
+    from crucible.execution import (  # noqa: PLC0415
+        execution_shortfall_key,
+        validate_execution_shortfall,
+    )
+
     key = execution_shortfall_key(day)
     if not store.exists(key):
         return {}
