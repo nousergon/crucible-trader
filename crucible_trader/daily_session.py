@@ -398,6 +398,13 @@ def daily_session_cycle(
             else functools.partial(constructor, sizing=sizing),
             hard_risk_facts=_hard_risk_facts(router),
         )
+        # Orders still working past the per-batch fill bound are waited on
+        # (bounded) so the stops below and the shortfall filed after size from
+        # what filled (`PaperOrderRouter.settle`). A router without it (shadow,
+        # simulated) has nothing working.
+        settle: Callable[[], int] | None = getattr(router, "settle", None)
+        if settle is not None:
+            settle()
         # After the session's orders: one standing GTC stop per held long
         # (`PaperOrderRouter.protect_holdings`). A router without stops (shadow,
         # simulated) has nothing to protect.

@@ -274,6 +274,13 @@ _STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 #: v1's fill wait and poll (`IBKRClient.place_market_order`).
 FILL_TIMEOUT_S = 30.0
+#: How long the session waits, once its last order is out, for orders still
+#: working past :data:`FILL_TIMEOUT_S` before it files the day's fills and
+#: sizes the protective stops. 2026-11-12: a market buy of 84 ANF (paper) was
+#: still working 30 s after it was sent, the session filed it as unfilled and
+#: ended, and the reconcile then found it filled -- the day's shortfall, the
+#: close summary and the stop size all read a fill that had happened.
+SETTLE_TIMEOUT_S = 300.0
 POLL_INTERVAL_S = 0.5
 #: v1's quote wait (`IBKRClient.get_current_price`).
 QUOTE_MAX_WAIT_S = 6.0
@@ -1103,6 +1110,9 @@ class PaperOrderRouter:
         self._planned: tuple[PlannedOrder, ...] = ()
         self._share_basis: ShareBasis | None = None
         self._records: list[ExecutionRecord] = []
+        #: Placed orders not yet terminal when recorded: ``(record index, order,
+        #: trade, submitted_at)``, re-read by :meth:`settle`.
+        self._working: list[tuple[int, PlannedOrder, Any, dt.datetime]] = []  # pyright: ignore[reportExplicitAny]  # ib_async Trade
         self._nav: float | None = None
         #: The names this session may protect: the book's, inherited and owned.
         self._managed: frozenset[str] = frozenset()
@@ -1809,9 +1819,35 @@ class PaperOrderRouter:
 
     def _record_placed(self, placed: list[tuple[PlannedOrder, Any, dt.datetime]]) -> None:
         for order, trade, submitted_at in placed:
+            if trade.orderStatus.status not in TERMINAL_STATUSES:
+                self._working.append((len(self._records), order, trade, submitted_at))
             self._records.append(
                 self._record(order, "placed", trade.orderStatus.status, submitted_at)
             )
+
+    def settle(self, timeout_s: float = SETTLE_TIMEOUT_S) -> int:
+        """Wait up to ``timeout_s`` for orders still working, then re-record them.
+
+        Called once the session's last order is out and before its fills are
+        filed and its stops sized, so both read what the broker did rather
+        than a 30-second snapshot. Sends, modifies and cancels nothing; an
+        order still working at the bound is recorded as it stands, which is
+        what reconciliation then settles. Returns how many are still working.
+        """
+        waited = 0.0
+        while self._working and waited < timeout_s:
+            if all(t.orderStatus.status in TERMINAL_STATUSES for _, _, t, _ in self._working):
+                break
+            self._client.sleep(POLL_INTERVAL_S)
+            waited += POLL_INTERVAL_S
+        still: list[tuple[int, PlannedOrder, Any, dt.datetime]] = []  # pyright: ignore[reportExplicitAny]  # ib_async Trade
+        for index, order, trade, submitted_at in self._working:
+            status = trade.orderStatus.status
+            self._records[index] = self._record(order, "placed", status, submitted_at)
+            if status not in TERMINAL_STATUSES:
+                still.append((index, order, trade, submitted_at))
+        self._working = still
+        return len(still)
 
     def _record(
         self,
