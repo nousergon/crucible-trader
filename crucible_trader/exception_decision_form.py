@@ -29,10 +29,18 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from crucible_trader.exception_decision import VERDICTS, effective_decisions
+from crucible_trader.exception_decision import effective_decisions
 from crucible_trader.exception_proposal import ACTIONS, NATURES
 
-__all__ = ["QueueItem", "content_security_policy", "queue_items", "render_queue_page"]
+__all__ = [
+    "ACTION_TEXT",
+    "NATURE_TEXT",
+    "QueueItem",
+    "content_security_policy",
+    "headline",
+    "queue_items",
+    "render_queue_page",
+]
 
 
 @dataclass(frozen=True)
@@ -99,21 +107,148 @@ def _options(values: Iterable[str], *, blank: str | None = None) -> str:
     return head + "".join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values)
 
 
-_FIELDS = (
-    ("trading_day", "Day"),
-    ("tenant", "Tenant"),
-    ("class", "Class"),
-    ("nature", "Proposed nature"),
-    ("action", "Proposed action"),
-    ("rationale", "Why"),
-)
+#: The proposed fix in plain words (Brian 2026-11-12: "I need to be able to
+#: understand what we are doing here. From the UX alone."). One sentence per
+#: action in :data:`~crucible_trader.exception_proposal.ACTIONS`; a test holds
+#: the two sets equal so a new action cannot reach the page as a bare code.
+ACTION_TEXT: dict[str, str] = {
+    "await_broker_corporate_action": "Wait for IB to book it. Nothing changes in our books yet.",
+    "book_corporate_action_manually": (
+        "Book the corporate action in our books by hand, from IB's notice."
+    ),
+    "accept_partial_fill": "Accept the partial fill as final.",
+    "investigate_cash": "Find the missing or wrong cash entry before anything is booked.",
+    "investigate_shares": "Find the missing or wrong share entry before anything is booked.",
+    "investigate_position_count": "Find which holding is missing on one side.",
+    "investigate_order": "Check the order with IB before anything is booked.",
+    "rerun_after_feed": "Run the check again once the late data has arrived.",
+    "refresh_anchor": "Restart the daily comparison from today's IB statement.",
+    "investigate_detector": (
+        "Check our own checker: the difference looks like a fault in detection."
+    ),
+}
+
+#: What kind of difference the machine thinks this is, in plain words.
+NATURE_TEXT: dict[str, str] = {
+    "event": "a real event at the broker",
+    "defect": "a mistake on our side",
+    "detector": "our checker misfired or lacked data",
+}
 
 
-def _row(item: QueueItem) -> str:
+def _money(value: float) -> str:
+    return f"${abs(value):,.2f}"
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _sub(record: Mapping[str, object], name: str) -> Mapping[str, object]:
+    """A nested object of the record, or an empty one."""
+    found = record.get(name)
+    return cast("Mapping[str, object]", found) if isinstance(found, Mapping) else {}
+
+
+def _side_value(record: Mapping[str, object], side: str) -> float | None:
+    return _number(_sub(record, side).get("value"))
+
+
+def _signed_money(value: float) -> str:
+    return _money(value) if value >= 0 else "-" + _money(value)
+
+
+def _plain(value: float) -> str:
+    return f"{value:,g}"
+
+
+def headline(proposal: Mapping[str, object], record: Mapping[str, object] | None) -> str:
+    """One plain sentence saying what is different, from the exception record
+    when there is one. Unescaped: the caller escapes."""
+    rec = record or {}
+    kind = proposal.get("class")
+    amount = _number(rec.get("amount"))
+    instrument = rec.get("instrument")
+    if kind == "cash_delta" and amount is not None:
+        more = amount > 0
+        return f"IB shows {_money(amount)} {'more' if more else 'less'} cash than our books expect"
+    if kind == "stale_anchor":
+        return (
+            "The daily check skipped a day, so this day's comparison started from an old statement"
+        )
+    if kind == "corporate_action" and instrument:
+        return f"A corporate action on {instrument} is not yet booked at IB"
+    detail = rec.get("detail") or proposal.get("rationale") or kind
+    return str(detail)
+
+
+def _sides(record: Mapping[str, object] | None) -> str:
+    if not record:
+        return ""
+    expected, actual = _side_value(record, "expected"), _side_value(record, "actual")
+    amount = _number(record.get("amount"))
+    usd = record.get("unit") == "usd"
+    fmt = _signed_money if usd else _plain
+    cells: list[tuple[str, str]] = []
+    if expected is not None:
+        cells.append(("Our books", fmt(expected)))
+    if actual is not None:
+        cells.append(("IB says", fmt(actual)))
+    if amount is not None:
+        sign = "+" if amount > 0 else "-" if amount < 0 else ""
+        cells.append(("Difference", sign + (_money(amount) if usd else f"{abs(amount):,g}")))
+    if not cells:
+        return ""
+    body = "".join(f'<div class="cell"><span>{_e(k)}</span><b>{_e(v)}</b></div>' for k, v in cells)
+    return f'<div class="sides">{body}</div>'
+
+
+def _evidence(record: Mapping[str, object] | None) -> str:
+    if not record:
+        return ""
+    rows: list[tuple[str, object]] = []
+    for side, label in (
+        ("expected", "Our figure comes from"),
+        ("actual", "IB's figure comes from"),
+    ):
+        key = _sub(record, side).get("record")
+        if key:
+            rows.append((label, key))
+    manifest = _sub(record, "detected_by").get("manifest_key")
+    if manifest:
+        rows.append(("The check's run record", manifest))
+    if not rows:
+        return ""
+    items = "".join(f"<li>{_e(label)}: <code>{_e(key)}</code></li>" for label, key in rows)
+    return f"<details><summary>Evidence</summary><ul>{items}</ul></details>"
+
+
+def _row(item: QueueItem, record: Mapping[str, object] | None = None) -> str:
     p = item.proposal
-    facts = "".join(f"<dt>{_e(label)}</dt><dd>{_e(p.get(field))}</dd>" for field, label in _FIELDS)
-    title = f"{_e(p.get('class'))} on {_e(p.get('trading_day'))}"
-    head = f"<h2>{title} <small>{_e(item.status)}</small></h2>"
+    action = cast("str", p.get("action") or "")
+    nature = cast("str", p.get("nature") or "")
+    status = {"undecided": "", "deferred": " · you chose Not now earlier", "conflicted": ""}.get(
+        item.status, f" · {item.status}"
+    )
+    head = (
+        f"<h2>{_e(headline(p, record))}</h2>"
+        f'<p class="meta">Found on {_e(p.get("trading_day"))}{_e(status)}</p>'
+    )
+    what = (record or {}).get("detail")
+    what_html = f"<p><b>What the check saw:</b> {_e(what)}</p>" if what else ""
+    likely = NATURE_TEXT.get(nature)
+    likely_html = f"<p><b>Most likely:</b> {_e(likely)}.</p>" if likely else ""
+    fix = ACTION_TEXT.get(action, action)
+    fix_html = (
+        f'<p class="fix"><b>Proposed fix:</b> {_e(fix)}'
+        f'<br><span class="why">Why: {_e(p.get("rationale"))}</span></p>'
+    )
+    technical = "".join(
+        f"<dt>{_e(label)}</dt><dd>{_e(p.get(field))}</dd>" for field, label in _FIELDS
+    )
+    tech_html = f"<details><summary>Technical details</summary><dl>{technical}</dl></details>"
     if item.status == "conflicted":
         body = (
             "<p>Two decisions stand side by side for this proposal. Record the next one with "
@@ -126,29 +261,56 @@ def _row(item: QueueItem) -> str:
                 ("proposal_id", p.get("proposal_id")),
                 ("tenant", p.get("tenant")),
                 ("supersedes", item.supersedes or ""),
+                ("verdict", ""),
             )
         )
         body = (
             f'<form class="decide">{hidden}'
-            f'<label>Verdict <select name="verdict" required>{_options(VERDICTS)}</select></label> '
-            '<label>Nature (on correct) <select name="nature">'
+            '<label class="note">Note (optional; required for Change) '
+            '<input name="note" maxlength="2000"></label>'
+            '<div class="buttons">'
+            '<button type="submit" class="approve" data-verdict="agree">Approve the fix</button>'
+            '<button type="submit" data-verdict="defer">Not now</button></div>'
+            "<details><summary>Change the fix</summary>"
+            '<label>It is <select name="nature">'
             f"{_options(NATURES, blank='-')}</select></label> "
-            '<label>Action (on correct) <select name="action">'
+            '<label>Do instead <select name="action">'
             f"{_options(ACTIONS, blank='-')}</select></label> "
-            '<label>Note <input name="note" maxlength="2000"></label> '
-            '<button type="submit">Record</button> <output></output></form>'
+            '<button type="submit" data-verdict="correct">Save my change</button></details>'
+            "<output></output></form>"
         )
-    return f'<section id="p-{_e(p.get("proposal_id"))}">{head}<dl>{facts}</dl>{body}</section>'
+    sides = _sides(record)
+    return (
+        f'<section class="card" id="p-{_e(p.get("proposal_id"))}">{head}{sides}{what_html}'
+        f"{likely_html}{fix_html}{_evidence(record)}{body}{tech_html}</section>"
+    )
+
+
+_FIELDS = (
+    ("trading_day", "Day"),
+    ("tenant", "Tenant"),
+    ("class", "Class"),
+    ("nature", "Proposed nature"),
+    ("action", "Proposed action"),
+    ("rationale", "Why"),
+    ("proposal_id", "Proposal id"),
+    ("exception_id", "Exception id"),
+)
 
 
 _SCRIPT = """
 for (const form of document.querySelectorAll("form.decide")) {
+  for (const button of form.querySelectorAll("button[data-verdict]")) {
+    button.addEventListener("click", () => {
+      form.querySelector("input[name=verdict]").value = button.dataset.verdict;
+    });
+  }
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const out = form.querySelector("output");
     const body = {};
     for (const [name, value] of new FormData(form)) { if (value !== "") body[name] = value; }
-    form.querySelector("button").disabled = true;
+    for (const b of form.querySelectorAll("button")) b.disabled = true;
     out.textContent = "Recording...";
     try {
       const response = await fetch(window.location.pathname, {
@@ -156,16 +318,18 @@ for (const form of document.querySelectorAll("form.decide")) {
         headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
       const reply = await response.json();
       if (response.status === 201) {
-        out.textContent = "Recorded: " + reply.verdict + " by " + reply.decided_by
-          + " (" + reply.decision_id + ")";
+        const said = {agree: "Approved", defer: "Set aside for now", correct: "Changed"};
+        out.textContent = (said[reply.verdict] || reply.verdict) + " by " + reply.decided_by
+          + ". Saved permanently.";
+        form.closest("section").classList.add("done");
         for (const field of form.elements) field.disabled = true;
       } else {
-        out.textContent = "Refused (" + response.status + "): " + reply.error;
-        form.querySelector("button").disabled = false;
+        out.textContent = "Not saved: " + reply.error;
+        for (const b of form.querySelectorAll("button")) b.disabled = false;
       }
     } catch (error) {
       out.textContent = "Not sent: " + error;
-      form.querySelector("button").disabled = false;
+      for (const b of form.querySelectorAll("button")) b.disabled = false;
     }
   });
 }
@@ -173,24 +337,65 @@ for (const form of document.querySelectorAll("form.decide")) {
 
 
 def render_queue_page(
-    items: Iterable[QueueItem], *, reviewer: str, tenants: Iterable[str], nonce: str
+    items: Iterable[QueueItem],
+    *,
+    reviewer: str,
+    tenants: Iterable[str],
+    nonce: str,
+    exceptions: Mapping[str, Mapping[str, object]] | None = None,
 ) -> str:
-    """The whole HTML page for ``reviewer``; ``nonce`` must match the CSP header."""
-    rows = "".join(_row(item) for item in items) or "<p>Nothing waits for a decision.</p>"
+    """The whole HTML page for ``reviewer``; ``nonce`` must match the CSP header.
+
+    ``exceptions`` (exception id -> ``exception.v1`` record,
+    :func:`~crucible_trader.exception_decision.load_exception_records`) supplies
+    each card's two sides, amount, what the check saw and the evidence; without
+    it a card shows the proposal alone."""
+    found = exceptions or {}
+    listed = list(items)
+    rows = (
+        "".join(
+            _row(item, found.get(cast("str", item.proposal.get("exception_id") or "")))
+            for item in listed
+        )
+        or "<p>Nothing waits for a decision. The books agree with IB.</p>"
+    )
+    waiting = len(listed)
+    summary = (
+        f'<p class="summary"><b>{waiting} difference{"s" if waiting != 1 else ""} '
+        "between our books "
+        "and IB wait for you.</b> For each one, read what is different and the proposed fix, then "
+        "approve it, change it, or set it aside. Nothing is booked until you decide.</p>"
+        if waiting
+        else ""
+    )
     scope = ", ".join(sorted(tenants)) or "none"
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         "<title>Back office decisions</title>"
-        "<style>body{font:15px/1.45 system-ui,sans-serif;max-width:60rem;"
-        "margin:1rem auto;padding:0 1rem}section{border-top:1px solid #8884;padding:.5rem 0}"
-        "dl{display:grid;grid-template-columns:9rem 1fr;margin:.25rem 0}dt{opacity:.7}"
-        "dd{margin:0}label{display:inline-block;margin:.25rem .5rem .25rem 0}"
-        "small{font-weight:normal;opacity:.7}</style></head><body>"
-        "<h1>Back office: decide the queue</h1>"
-        f"<p>Signed in as <strong>{_e(reviewer)}</strong>, deciding for: {_e(scope)}. "
-        "Each call is written once and never edited; a later call supersedes it "
-        "and both stay on record. "
-        "<em>Correct</em> needs a nature, an action and a note.</p>"
+        "<style>:root{color-scheme:light dark}body{font:16px/1.5 system-ui,sans-serif;"
+        "max-width:44rem;margin:1rem auto;padding:0 1rem}"
+        ".card{border:1px solid #8886;border-radius:12px;padding:1rem;margin:1rem 0}"
+        ".card.done{opacity:.55}.card h2{font-size:1.15rem;margin:0 0 .25rem}"
+        ".meta{margin:0 0 .75rem;opacity:.7;font-size:.9rem}"
+        ".sides{display:flex;gap:.5rem;flex-wrap:wrap;margin:.5rem 0}"
+        ".cell{flex:1 1 8rem;border:1px solid #8884;border-radius:8px;padding:.5rem}"
+        ".cell span{display:block;font-size:.8rem;opacity:.7}.cell b{font-size:1.1rem}"
+        ".fix{background:#8881;border-radius:8px;padding:.5rem .75rem}"
+        ".why{opacity:.75;font-size:.9rem}"
+        ".buttons{display:flex;gap:.5rem;flex-wrap:wrap;margin:.5rem 0}"
+        "button{font:inherit;padding:.5rem 1rem;border-radius:8px;"
+        "border:1px solid #8888;cursor:pointer}"
+        "button.approve{background:#1f7a3a;color:#fff;border-color:#1f7a3a}"
+        "label{display:inline-block;margin:.25rem .5rem .25rem 0}"
+        ".note input{width:100%;max-width:30rem}"
+        "details{margin:.5rem 0}summary{cursor:pointer;opacity:.8}"
+        "dl{display:grid;grid-template-columns:9rem 1fr;margin:.25rem 0;font-size:.85rem}"
+        "dt{opacity:.7}dd{margin:0;overflow-wrap:anywhere}output{display:block;font-weight:600}"
+        "</style></head><body>"
+        "<h1>Back office: differences to decide</h1>"
+        f"{summary}"
+        f'<p class="meta">Signed in as <strong>{_e(reviewer)}</strong>, deciding for: {_e(scope)}. '
+        "Each decision is saved permanently; a later one replaces it and both stay on record.</p>"
         f'{rows}<script nonce="{_e(nonce)}">{_SCRIPT}</script></body></html>'
     )

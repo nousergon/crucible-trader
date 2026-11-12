@@ -9,10 +9,13 @@ a form field; and nothing from a record reaches the page unescaped.
 from __future__ import annotations
 
 from crucible_trader.exception_decision_form import (
+    ACTION_TEXT,
+    NATURE_TEXT,
     content_security_policy,
     queue_items,
     render_queue_page,
 )
+from crucible_trader.exception_proposal import ACTIONS, NATURES
 
 TENANT = "nous-ergon-paper"
 
@@ -81,12 +84,13 @@ class TestPage:
         )
         page = render_queue_page(items, reviewer="brian", tenants=[TENANT], nonce="n0nce")
         assert page.count('<form class="decide">') == 2
+        assert page.count('data-verdict="agree"') == 2 and page.count('data-verdict="defer"') == 2
         assert '<input type="hidden" name="supersedes" value="d1">' in page
         assert "Two decisions stand side by side" in page
         assert '<script nonce="n0nce">' in page and "Signed in as <strong>brian</strong>" in page
         assert 'name="decided_by"' not in page and 'name="reviewer"' not in page
         for verdict in ("agree", "correct", "defer"):
-            assert f'<option value="{verdict}">' in page
+            assert f'data-verdict="{verdict}"' in page
 
     def test_record_values_are_escaped(self) -> None:
         hostile = proposal(1, rationale='<script>alert("x")</script>', **{"class": "a&b"})
@@ -103,6 +107,7 @@ class TestPage:
     def test_an_empty_queue_and_no_tenants_say_so(self) -> None:
         page = render_queue_page([], reviewer="brian", tenants=[], nonce="n")
         assert "Nothing waits for a decision." in page and "deciding for: none" in page
+        assert "wait for you" not in page
 
     def test_a_missing_field_renders_blank(self) -> None:
         bare = {"proposal_id": "p9", "tenant": TENANT}
@@ -116,3 +121,58 @@ def test_the_policy_admits_only_the_nonced_script_and_requests_to_itself() -> No
     policy = content_security_policy("abc")
     assert "script-src 'nonce-abc'" in policy and "connect-src 'self'" in policy
     assert "default-src 'none'" in policy and "frame-ancestors 'none'" in policy
+
+
+class TestDecidableFromTheScreen:
+    """Brian 2026-11-12: "I need to be able to understand what we are doing here.
+    From the UX alone." Each card leads with plain words, both sides and the
+    proposed fix; codes and ids sit behind "Technical details"."""
+
+    CASH = {
+        "exception_id": "e1",
+        "class": "cash_delta",
+        "amount": 107.69,
+        "unit": "usd",
+        "detail": "broker cash differs from anchor + fills + declared flows + dividends",
+        "expected": {"record": "trader/reconciliation/2026-11-04.json", "value": 496715.37},
+        "actual": {"record": "trader/broker_statements/2026-11-04.json", "value": 496823.06},
+        "detected_by": {"manifest_key": "runs/trader.reconcile/2026-11-04/run.json"},
+    }
+
+    def page(self, record: dict[str, object] | None, **extra: object) -> str:
+        p = proposal(1, exception_id="e1", **extra)
+        items = queue_items([p], [], tenants=[TENANT])
+        exceptions = {"e1": record} if record else None
+        return render_queue_page(
+            items, reviewer="brian", tenants=[TENANT], nonce="n", exceptions=exceptions
+        )
+
+    def test_a_cash_break_shows_both_sides_the_difference_and_the_fix_in_words(self) -> None:
+        page = self.page(
+            self.CASH, **{"class": "cash_delta", "nature": "defect", "action": "investigate_cash"}
+        )
+        assert "IB shows $107.69 more cash than our books expect" in page
+        assert "$496,715.37" in page and "$496,823.06" in page and "+$107.69" in page
+        assert "Find the missing or wrong cash entry before anything is booked." in page
+        assert "a mistake on our side" in page
+        assert "trader/broker_statements/2026-11-04.json" in page
+        assert "1 difference between our books and IB wait" in page
+        assert page.index("Technical details") > page.index("Proposed fix")
+
+    def test_less_cash_reads_less(self) -> None:
+        record = dict(self.CASH, amount=-3.5)
+        assert "IB shows $3.50 less cash" in self.page(record, **{"class": "cash_delta"})
+
+    def test_without_the_exception_record_the_card_still_renders(self) -> None:
+        page = self.page(None)
+        assert "The daily check skipped a day" in page
+        assert "Restart the daily comparison from today" in page
+
+    def test_every_action_and_nature_has_plain_words(self) -> None:
+        assert set(ACTION_TEXT) == set(ACTIONS)
+        assert set(NATURE_TEXT) == set(NATURES)
+
+    def test_record_text_on_a_card_is_escaped(self) -> None:
+        record = dict(self.CASH, detail="<img src=x onerror=1>", instrument="<b>")
+        page = self.page(record, **{"class": "cash_delta"})
+        assert "<img src=x" not in page and "&lt;img src=x" in page

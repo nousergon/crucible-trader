@@ -550,7 +550,7 @@ class TestServesTheForm:
         }
         assert call(event(defer, jwt=token(key)), config=config, store=store, key=key)[0] == 201
         page = w.handle(get(jwt=token(key)), config=config, keys=keys, store=store, now=NOW)["body"]
-        assert f"{1:032x}" in page and "deferred" in page
+        assert f"{1:032x}" in page and "you chose Not now earlier" in page
 
     def test_narrowed_to_one_held_tenant(self, config, store, key):
         response = w.handle(
