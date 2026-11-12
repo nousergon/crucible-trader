@@ -176,3 +176,22 @@ class TestDecidableFromTheScreen:
         record = dict(self.CASH, detail="<img src=x onerror=1>", instrument="<b>")
         page = self.page(record, **{"class": "cash_delta"})
         assert "<img src=x" not in page and "&lt;img src=x" in page
+
+    def test_a_share_count_corporate_action_reads_plainly(self) -> None:
+        record = {
+            "exception_id": "e1",
+            "class": "corporate_action",
+            "instrument": "MU",
+            "amount": -40,
+            "unit": "shares",
+            "expected": {"value": 120},
+            "actual": {"value": 80},
+        }
+        page = self.page(record, **{"class": "corporate_action"})
+        assert "A corporate action on MU is not yet booked at IB" in page
+        assert "<b>120</b>" in page and "<b>80</b>" in page and "<b>-40</b>" in page
+
+    def test_a_record_with_no_figures_or_sources_shows_neither_box(self) -> None:
+        page = self.page({"exception_id": "e1", "detail": "something odd"})
+        assert 'class="sides"' not in page and "<summary>Evidence</summary>" not in page
+        assert "something odd" in page
