@@ -289,6 +289,9 @@ def order_book_document(
         "session_inputs_key": book.session_inputs_key,
         "previous_book": "given" if previous_weights is not None else "all_cash",
         "written_at_utc": written_at_utc,
+        # What the optimizer solved and under which settings
+        # (`construction.optimizer_record`); None from a book that has none.
+        "optimizer": getattr(book, "optimizer", None),
         # Where each row's `sector_label` came from (a feature artifact key), and
         # whether its share columns are the session's own plan.
         "sector_label_source": sectors_source,
