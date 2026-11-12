@@ -29,6 +29,8 @@ from crucible_trader.statement_backfill import (
     backfill_day,
     main,
     parse_activity_statement,
+    parse_flex_statement,
+    parse_statement,
 )
 
 ANCHOR, DAY = "2026-09-08", "2026-09-09"
@@ -72,6 +74,73 @@ def csv_text(
         lines.append(f'Open Positions,Data,Lot,Stocks,{currency},{symbol},"{qty}",1,1,1,1')
     lines.append("Open Positions,Total,,Stocks,USD,,,,,,10")
     return "\n".join(lines) + "\n" + extra
+
+
+def flex_xml(
+    *,
+    day: str = "20260909",
+    to_day: str | None = None,
+    account: str = "DU1234567",
+    info_account: str | None = None,
+    base: str = "USD",
+    positions: tuple[tuple[str, str, str], ...] = (("AAA", "USD", "10"),),
+    cash: tuple[tuple[str, str], ...] = (("BASE_SUMMARY", "1000"),),
+    cash_account: str | None = None,
+    cash_day: str | None = None,
+    asset: str = "STK",
+    position_account: str | None = None,
+    position_day: str | None = None,
+    statements: int = 1,
+    prolog: str = "",
+    root: str = "FlexQueryResponse",
+) -> str:
+    """The shape of a Flex Web Service Activity statement (query type AF), cut to the
+    sections and attributes the parser reads plus the ones it must ignore. Every
+    identifier is synthetic: this repository is public, and a real statement's
+    account, name, address and balances never belong in a fixture."""
+    lines = []
+    for _ in range(statements):
+        lines.append(
+            f'<FlexStatement accountId="{account}" fromDate="{day}" toDate="{to_day or day}" '
+            'period="" whenGenerated="20260910;010203">'
+        )
+        lines.append(
+            f'<AccountInformation accountId="{info_account or account}" currency="{base}" '
+            'accountType="Individual" name="" street="" dateOfBirth="" />'
+        )
+        lines.append("<EquitySummaryInBase>")
+        lines.append(f'<EquitySummaryByReportDateInBase reportDate="{day}" total="1" cash="1" />')
+        lines.append("</EquitySummaryInBase><CashReport>")
+        for currency, ending in cash:
+            lines.append(
+                f'<CashReportCurrency accountId="{cash_account or account}" currency="{currency}" '
+                f'levelOfDetail="BaseCurrency" startingCash="1" endingCash="{ending}" '
+                f'endingSettledCash="1" fromDate="{cash_day or day}" toDate="{cash_day or day}" />'
+            )
+        lines.append("</CashReport><OpenPositions>")
+        for symbol, currency, qty in positions:
+            for level in ("SUMMARY", "LOT"):
+                lines.append(
+                    f'<OpenPosition accountId="{position_account or account}" '
+                    f'assetCategory="{asset}" symbol="{symbol}" currency="{currency}" '
+                    f'position="{qty}" side="Long" levelOfDetail="{level}" '
+                    f'reportDate="{position_day or day}" subCategory="COMMON" fxRateToBase="1" />'
+                )
+        lines.append("</OpenPositions><Trades>")
+        lines.append(
+            f'<Trade accountId="{account}" symbol="AAA" buySell="BUY" quantity="3" '
+            f'tradeDate="{day}" levelOfDetail="EXECUTION" />'
+        )
+        lines.append("</Trades><CorporateActions /><CashTransactions /><InterestAccruals>")
+        lines.append(
+            f'<InterestAccrualsCurrency accountId="{account}" currency="BASE_SUMMARY" '
+            f'fromDate="{day}" toDate="{day}" endingAccrualBalance="2.5" />'
+        )
+        lines.append("</InterestAccruals></FlexStatement>")
+    return (
+        f'{prolog}<{root} queryName="daily-activity" type="AF">'
+        f'<FlexStatements count="{statements}">' + "".join(lines) + f"</FlexStatements></{root}>"
+    )
 
 
 # -- 1. the statement ---------------------------------------------------------------
@@ -129,6 +198,87 @@ class TestParse:
         assert src.read_statement(DAY).trading_day == DAY
         with pytest.raises(BrokerStatementError, match="holds 2026-09-09 only"):
             src.read_statement(ANCHOR)
+
+
+class TestParseFlex:
+    def test_positions_and_ending_cash_become_a_v2_paper_statement(self):
+        st = parse_flex_statement(
+            flex_xml(
+                positions=(("AAA", "USD", "1200"), ("BBB", "USD", "-5")),
+                cash=(("BASE_SUMMARY", "-1234.56"),),
+            ),
+            trading_day=DAY,
+        )
+        assert st == BrokerStatement("DU1234567", DAY, {"AAA": 1200, "BBB": -5}, -1234.56)
+        doc = st.to_document()
+        assert doc["schema_version"] == "broker_statement.v2" and doc["source"] == "ib_paper"
+        assert doc["accrued_cash_usd"] is None  # not recorded, never guessed
+
+    def test_it_is_the_same_statement_the_csv_path_files(self):
+        csv = parse_activity_statement(csv_text(account="DU1234567"), trading_day=DAY)
+        assert parse_flex_statement(flex_xml(), trading_day=DAY) == csv
+
+    def test_lot_rows_trades_and_accruals_do_not_leak_into_the_statement(self):
+        st = parse_flex_statement(flex_xml(positions=(("AAA", "USD", "10"),)), trading_day=DAY)
+        assert st.positions == {"AAA": 10}  # the LOT row restates it; the trade is not a position
+
+    def test_a_per_currency_usd_row_is_preferred_and_a_bom_is_read(self):
+        text = flex_xml(cash=(("USD", "7"), ("BASE_SUMMARY", "999")))
+        st = parse_flex_statement("\ufeff\n" + text, trading_day=DAY)
+        assert st.cash_usd == 7.0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"account": "U1234567"}, "not an IB paper account"),
+            ({"info_account": "DU7654321"}, "exactly one AccountInformation"),
+            ({"base": "EUR"}, "base currency"),
+            ({"positions": (("AAA", "CAD", "10"),)}, "not USD"),
+            ({"asset": "OPT"}, "only STK"),
+            ({"positions": (("AAA", "USD", "10.5"),)}, "not whole shares"),
+            ({"positions": (("AAA", "USD", "ten"),)}, "not a number"),
+            ({"positions": (("AAA", "USD", "10"), ("AAA", "USD", "2"))}, "appears twice"),
+            ({"positions": (("AAA", "USD", "0"),)}, "is zero"),
+            ({"position_account": "DU7654321"}, "different account"),
+            ({"position_day": "20260908"}, "not as of 2026-09-09"),
+            ({"position_day": "soon"}, "not a YYYYMMDD date"),
+            ({"cash": (("BASE_SUMMARY", "1"), ("EUR", "2"))}, "not USD"),
+            ({"cash": ()}, "exactly one USD endingCash row"),
+            ({"cash": (("USD", "1"), ("USD", "2"))}, "exactly one USD endingCash row"),
+            ({"cash": (("BASE_SUMMARY", "n/a"),)}, "not a number"),
+            ({"cash_account": "DU7654321"}, "different account"),
+            ({"cash_day": "20260908"}, "cash report fromDate is not"),
+            ({"day": "20260910"}, "not 2026-09-09"),
+            ({"day": "20260908", "to_day": "20260909"}, "not one day"),
+            ({"statements": 2}, "exactly one FlexStatement"),
+            ({"statements": 0}, "exactly one FlexStatement"),
+            ({"root": "FlexStatementResponse"}, "not 'FlexQueryResponse'"),
+            (
+                {"prolog": '<!DOCTYPE x [<!ENTITY a "b">]>'},
+                "DTD or entity",
+            ),
+        ],
+    )
+    def test_refuses_anything_that_is_not_one_paper_usd_day(self, kwargs, message):
+        with pytest.raises(BrokerStatementError, match=message):
+            parse_flex_statement(flex_xml(**kwargs), trading_day=DAY)
+
+    def test_a_truncated_document_is_refused(self):
+        with pytest.raises(BrokerStatementError, match="not well-formed"):
+            parse_flex_statement(flex_xml()[:-30], trading_day=DAY)
+
+    def test_parse_statement_reads_either_form_by_content(self):
+        assert parse_statement(flex_xml(), trading_day=DAY).positions == {"AAA": 10}
+        assert parse_statement(csv_text(), trading_day=DAY).positions == {"AAA": 10}
+        assert parse_statement("\ufeff  " + flex_xml(), trading_day=DAY).cash_usd == 1000.0
+
+    def test_the_fixture_carries_no_personal_attribute_values(self):
+        """A guard on the fixture itself: public repo, so the identifying attributes IB
+        emits stay empty here."""
+        text = flex_xml()
+        for attr in ("name", "street", "dateOfBirth"):
+            assert f'{attr}=""' in text
+        assert "DU1234567" in text and not re.search(r"\bDU(?!1234567)\d+", text)
 
 
 # -- 2 and 3. the captured cycle and the apply ------------------------------------------
@@ -279,6 +429,19 @@ class TestCli:
         assert main(self._args(root, tmp_path, "--apply"), clock=lambda: OUTSIDE) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["written"] and LocalStore(root).exists(trader_reconciliation_key(DAY))
+
+    def test_a_flex_xml_statement_is_backfilled_through_the_cli(
+        self, root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        path = tmp_path / "stmt.xml"
+        path.write_text(flex_xml(account="DU1"), encoding="utf-8")
+        args = ["--store", str(root), "--day", DAY, "--statement", str(path)]
+        before = snapshot(root)
+        assert main(args) == 0
+        assert snapshot(root) == before
+        out = json.loads(capsys.readouterr().out)
+        assert out["account"] == "DU1" and out["has_reconciliation"] and out["cash_usd"] == 1000.0
 
     def test_a_bad_statement_is_a_no_go(self, root, tmp_path, capsys):
         assert main(self._args(root, tmp_path, text=csv_text(account="U9"))) == 1

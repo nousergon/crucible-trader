@@ -40,6 +40,13 @@ the latest live run, and a backfill of an earlier day must not move it.
 
     python -m crucible_trader.statement_backfill --store URI --day 2026-10-14 \\
         --statement DU_20261014.csv [--fills PATH] [--apply]
+
+``--statement`` takes either form IB issues the same day in: the Client Portal
+Daily Activity Statement CSV (:func:`parse_activity_statement`) or a Flex Web
+Service Activity XML (:func:`parse_flex_statement`, `alpha-engine-config-I13196`).
+:func:`parse_statement` picks by content; both yield the same
+``broker_statement.v2`` and hold the same refusals, so the reconcile and the
+apply cannot tell them apart.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ import io
 import json
 import pathlib
 import sys
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -85,6 +93,8 @@ __all__ = [
     "backfill_day",
     "main",
     "parse_activity_statement",
+    "parse_flex_statement",
+    "parse_statement",
     "rehearse_close",
 ]
 
@@ -100,6 +110,7 @@ _WINDOW = (dt.time(9, 0), dt.time(16, 30))
 
 _USD = "USD"
 _BASE_SUMMARY = "Base Currency Summary"
+_FLEX_BASE_SUMMARY = "BASE_SUMMARY"
 
 
 class BackfillRefused(RuntimeError):
@@ -218,6 +229,150 @@ def parse_activity_statement(text: str, *, trading_day: str) -> BrokerStatement:
         source="ib_paper",
         accrued_cash_usd=None,
     )
+
+
+# -- 1b. the Flex Web Service statement -----------------------------------------------
+
+_FLEX_DAY = "%Y%m%d"
+
+
+def _flex_day(raw: str | None, what: str) -> str:
+    try:
+        return dt.datetime.strptime(raw or "", _FLEX_DAY).date().isoformat()
+    except ValueError:
+        raise BrokerStatementError(f"{what}: {raw!r} is not a YYYYMMDD date") from None
+
+
+def _flex_root(text: str) -> ET.Element:
+    body = text.lstrip("\ufeff \t\r\n")
+    # IB's documents declare no DTD. A document that carries one is not one, and
+    # entity expansion is the one thing a stdlib parse of foreign XML can be made
+    # to do; refuse before parsing rather than trust the parser to.
+    if "<!DOCTYPE" in body.upper() or "<!ENTITY" in body.upper():
+        raise BrokerStatementError("Flex XML carries a DTD or entity declaration; refused")
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise BrokerStatementError(f"Flex XML is not well-formed: {exc}") from None
+    if root.tag != "FlexQueryResponse":
+        raise BrokerStatementError(
+            f"Flex XML root is {root.tag!r}, not 'FlexQueryResponse' "
+            "(a Flex Web Service error reply is not a statement)"
+        )
+    return root
+
+
+def _flex_cash(statement: ET.Element, *, account: str, trading_day: str) -> float:
+    """The day's USD ``endingCash`` from the Cash Report. Account Information
+    has already fixed the base currency at USD, so IB's ``BASE_SUMMARY`` row
+    (all that a base-currency-level query emits) is USD cash; a per-currency
+    ``USD`` row, when present, is preferred and the two never both count."""
+    usd: list[float] = []
+    base: list[float] = []
+    for row in statement.findall("CashReport/CashReportCurrency"):
+        currency = row.get("currency", "")
+        if currency not in (_USD, _FLEX_BASE_SUMMARY):
+            raise BrokerStatementError(f"cash report row in {currency!r}, not {_USD}")
+        if row.get("accountId") != account:
+            raise BrokerStatementError("cash report row is for a different account")
+        for edge in ("fromDate", "toDate"):
+            if _flex_day(row.get(edge), f"cash report {edge}") != trading_day:
+                raise BrokerStatementError(f"cash report {edge} is not {trading_day}")
+        (usd if currency == _USD else base).append(
+            _number(row.get("endingCash", ""), f"endingCash ({currency})")
+        )
+    rows = usd or base
+    if len(rows) != 1:
+        raise BrokerStatementError(
+            f"cash report must carry exactly one USD endingCash row (found {len(rows)})"
+        )
+    return rows[0]
+
+
+def parse_flex_statement(text: str, *, trading_day: str) -> BrokerStatement:
+    """IB's Flex Web Service Activity XML for ``trading_day`` as a broker statement.
+
+    The same contract as :func:`parse_activity_statement`, read from the
+    document IB issues through the Flex Web Service (`alpha-engine-config-I13196`):
+    ``OpenPositions`` summary rows (stocks, whole shares, USD) and the Cash
+    Report's ``endingCash``. Raises :class:`BrokerStatementError` on a non-``DU``
+    account, a non-USD base or row, a statement that is not exactly the one day,
+    a different account on any row, and anything it cannot read as one position
+    per symbol. The accrual is recorded as ``None``, as the CSV path does: the
+    Flex document does carry IB's interest accrual, but recording it is a
+    decision for the ledger's interest posting, not for a parser.
+    """
+    root = _flex_root(text)
+    statements = root.findall("FlexStatements/FlexStatement")
+    if len(statements) != 1:
+        raise BrokerStatementError(
+            f"Flex XML must carry exactly one FlexStatement (found {len(statements)})"
+        )
+    statement = statements[0]
+    start = _flex_day(statement.get("fromDate"), "statement fromDate")
+    end = _flex_day(statement.get("toDate"), "statement toDate")
+    if start != end:
+        raise BrokerStatementError(
+            f"statement period is {start} to {end}, not one day; a backfill reads a DAILY statement"
+        )
+    if end != trading_day:
+        raise BrokerStatementError(f"statement period is {end}, not {trading_day}")
+
+    account = statement.get("accountId", "")
+    if not account.startswith(PAPER_ACCOUNT_PREFIX):
+        raise BrokerStatementError(
+            f"account {account!r} is not an IB paper account ({PAPER_ACCOUNT_PREFIX}...); "
+            "the paper -> live crossing is a reserved action"
+        )
+    info = statement.findall("AccountInformation")
+    if len(info) != 1 or info[0].get("accountId") != account:
+        raise BrokerStatementError(
+            "Flex XML must carry exactly one AccountInformation, for the statement's account"
+        )
+    base = info[0].get("currency", "")
+    if base != _USD:
+        raise BrokerStatementError(f"base currency is {base!r}, not {_USD}")
+
+    positions: dict[str, int] = {}
+    for row in statement.findall("OpenPositions/OpenPosition"):
+        if row.get("levelOfDetail", "SUMMARY") != "SUMMARY":
+            continue  # lot rows restate the summary row
+        symbol, currency = row.get("symbol", ""), row.get("currency", "")
+        if row.get("accountId") != account:
+            raise BrokerStatementError(f"position {symbol!r} is for a different account")
+        if currency != _USD:
+            raise BrokerStatementError(f"position {symbol!r} is in {currency!r}, not {_USD}")
+        if row.get("assetCategory") != "STK":
+            raise BrokerStatementError(
+                f"position {symbol!r} is {row.get('assetCategory')!r}; only STK reconciles"
+            )
+        if _flex_day(row.get("reportDate"), f"position {symbol!r} reportDate") != trading_day:
+            raise BrokerStatementError(f"position {symbol!r} is not as of {trading_day}")
+        quantity = _number(row.get("position", ""), f"position {symbol!r} quantity")
+        if not quantity.is_integer():
+            raise BrokerStatementError(
+                f"position {symbol!r} quantity {quantity} is not whole shares"
+            )
+        if symbol in positions:
+            raise BrokerStatementError(f"position {symbol!r} appears twice")
+        positions[symbol] = int(quantity)
+
+    return BrokerStatement(
+        account=account,
+        trading_day=trading_day,
+        positions=positions,
+        cash_usd=_flex_cash(statement, account=account, trading_day=trading_day),
+        source="ib_paper",
+        accrued_cash_usd=None,
+    )
+
+
+def parse_statement(text: str, *, trading_day: str) -> BrokerStatement:
+    """Read ``text`` as the IB document it is: Flex XML when it opens with a
+    tag, the Daily Activity Statement CSV otherwise."""
+    if text.lstrip("\ufeff \t\r\n").startswith("<"):
+        return parse_flex_statement(text, trading_day=trading_day)
+    return parse_activity_statement(text, trading_day=trading_day)
 
 
 class FiledStatementSource:
@@ -495,7 +650,7 @@ def main(
         required=True,
         action="append",
         type=pathlib.Path,
-        help="IB activity statement CSV, in --day order",
+        help="IB activity statement (Daily Activity CSV or Flex Activity XML), in --day order",
     )
     parser.add_argument("--fills", default=None, type=pathlib.Path, help="fills as JSON lines")
     parser.add_argument(
@@ -520,7 +675,7 @@ def main(
         parser.error("more than one --day needs --close")
     day = days[0]
     try:
-        statement = parse_activity_statement(paths[0].read_text(encoding="utf-8"), trading_day=day)
+        statement = parse_statement(paths[0].read_text(encoding="utf-8"), trading_day=day)
         fills = load_fills(cast("pathlib.Path | None", args.fills)).get(day, [])
         backend = opener(cast("str | None", args.store))
         view, summary = backfill_day(backend, statement, fills=fills)
@@ -563,7 +718,7 @@ def _rehearse(
     now = cast("str | None", args.now) or dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         statements = [
-            parse_activity_statement(p.read_text(encoding="utf-8"), trading_day=d)
+            parse_statement(p.read_text(encoding="utf-8"), trading_day=d)
             for d, p in zip(days, paths, strict=True)
         ]
         fills = load_fills(cast("pathlib.Path | None", args.fills))
