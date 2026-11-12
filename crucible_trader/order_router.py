@@ -131,6 +131,12 @@ sell becomes a full exit and any buy of it is dropped. Hard risk outranks timing
 with timed orders the gap exits are the session's first batch, sent at once and
 never held for an exit trigger; immediately, they lead the opening sells.
 
+**A name the hard-risk layer forced out is sold the same way**
+(`crucible_trader.hard_risk`, :func:`hard_risk_exits`): whole, right after any gap
+exit, at once and ahead of every timed order. Like every sell, :meth:`PaperOrderRouter.send`
+cancels its standing stop first and clips it to the shares still held. A BUY of a
+forced name is refused at plan time; at the circuit breaker every BUY is dropped.
+
 **Declared scope:** an order still working when the fill wait ends is left
 working (a DAY order), and its record carries the broker status and what filled
 so far. An adopted order's `submitted_at` is its decision instant, because the
@@ -178,6 +184,12 @@ from crucible_trader.gap_stop import (
     exit_decision,
     gap_stop_document,
     write_gap_stop_document,
+)
+from crucible_trader.hard_risk import (
+    BrokerFacts,
+    HardRiskDecision,
+    HardRiskPrecedenceError,
+    read_broker_facts,
 )
 from crucible_trader.inherited_positions import inherited_for
 from crucible_trader.kill_switch import assert_trading_permitted, utcnow
@@ -697,6 +709,75 @@ def plan_orders(
     return tuple(sells), tuple(buys)
 
 
+#: The entry-watch trigger a hard-risk forced exit is released under.
+HARD_RISK_EXIT_PREFIX = "hard_risk"
+
+
+def hard_risk_exits(
+    decision: HardRiskDecision,
+    sells: Sequence[PlannedOrder],
+    buys: Sequence[PlannedOrder],
+    *,
+    positions: Mapping[str, int],
+    quote: QuoteSource,
+    clock: Callable[[], dt.datetime],
+    skip: frozenset[str] = frozenset(),
+) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...], dict[str, str]]:
+    """The plan under the hard-risk layer: (sells, buys, {forced exit: its trigger}).
+
+    Precedence is hard risk > eligibility > optimizer > timing. Every held name
+    the layer forced out is sold WHOLE -- a planned partial sell (the per-order
+    cap's clip) is replaced, a name the plan left alone gains one -- and those
+    exits lead the sells, right after any gap exit (``skip``: a gapped name is
+    already sold whole). A BUY of a forced name RAISES
+    :class:`~crucible_trader.hard_risk.HardRiskPrecedenceError` here, at plan
+    time, so a timed session refuses before anything is watched or sent. At the
+    circuit breaker every BUY is dropped. Like a gap exit, a forced exit is
+    sized on the shares held when planned; :meth:`PaperOrderRouter.send` then
+    cancels the name's standing stops and clips it to what is still held.
+    """
+    offending = sorted(o.decision.symbol for o in buys if o.decision.symbol in decision.forced)
+    if offending:
+        raise HardRiskPrecedenceError(
+            f"the plan for {decision.trading_day} BUYs {offending}, which the hard-risk layer "
+            "forced out today; nothing is sent"
+        )
+    if decision.circuit_breaker and buys:
+        print(
+            f"order_router: hard-risk circuit breaker engaged on {decision.trading_day}; "
+            f"BUY order(s) dropped: {sorted(o.decision.symbol for o in buys)}",
+            file=sys.stderr,
+        )
+        buys = ()
+    names = sorted(t for t in decision.forced if positions.get(t, 0) > 0 and t not in skip)
+    if not names:
+        return tuple(sells), tuple(buys), {}
+    planned = {o.decision.symbol: o for o in sells}
+    exits: list[PlannedOrder] = []
+    for symbol in names:
+        held = positions[symbol]
+        prior = planned.get(symbol)
+        if prior is not None and int(prior.decision.quantity) == held:
+            exits.append(prior)
+            continue
+        price = float(prior.decision.decision_price) if prior is not None else quote(symbol)
+        if price is None or not (math.isfinite(price) and price > 0):
+            raise PriceUnavailableError(
+                f"no usable price for {symbol}, which the hard-risk layer forced out "
+                f"({decision.forced[symbol]}); the book is not traded without its exit"
+            )
+        exits.append(
+            PlannedOrder(
+                trading_day=decision.trading_day,
+                decision=decide(symbol, "sell", held, price=price, now=clock()),
+            )
+        )
+    first = [o for o in sells if o.decision.symbol in skip]
+    rest = [o for o in sells if o.decision.symbol not in skip and o.decision.symbol not in names]
+    reasons = {s: f"{HARD_RISK_EXIT_PREFIX}: {decision.forced[s]}" for s in names}
+    return (*first, *exits, *rest), tuple(buys), reasons
+
+
 def book_cash(book: TargetBook, positions: Mapping[str, int], *, quote: QuoteSource) -> float:
     """The book's cash at the session start: its notional less the held book's value.
 
@@ -1085,6 +1166,18 @@ class PaperOrderRouter:
         gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:
             sells, buys, gapped = self._gap_stop(statement.positions, sells, buys)
+        urgent = dict.fromkeys(sorted(gapped), GAP_STOP_EXIT)
+        if book.hard_risk is not None:
+            sells, buys, forced = hard_risk_exits(
+                book.hard_risk,
+                sells,
+                buys,
+                positions=statement.positions,
+                quote=quote,
+                clock=self._clock,
+                skip=gapped,
+            )
+            urgent.update(forced)
         self._planned = sells + buys
         self._managed = frozenset(_tradable(book)) | inherited | owned
         if self._config.entry_timing is None or not self._planned:
@@ -1095,7 +1188,7 @@ class PaperOrderRouter:
             sells,
             buys,
             book_cash=book_cash(book, statement.positions, quote=quote),
-            urgent=gapped,
+            urgent=urgent,
         )
 
     def _gap_stop(
@@ -1162,7 +1255,7 @@ class PaperOrderRouter:
         buys: Sequence[PlannedOrder],
         *,
         book_cash: float,
-        urgent: frozenset[str] = frozenset(),
+        urgent: Mapping[str, str] | None = None,
     ) -> Iterator[tuple[PlannedOrder, ...]]:
         """Every order, released as its own batch when its trigger fires.
 
@@ -1170,8 +1263,9 @@ class PaperOrderRouter:
         free is on the ledger before any buy of the same poll is sized against it.
         A generator, so each step below runs only after the batch before it was
         SENT (and its fill wait ended). The sells of the ``urgent`` names (the gap
-        stop's exits) are hard risk and wait for no trigger: they are the first
-        batch, sent at once, before any stop is placed. Then the names held are
+        stop's exits and the hard-risk layer's forced exits, each with the reason
+        it is released under) are hard risk and wait for no trigger: they are the
+        first batch, sent at once, before any stop is placed. Then the names held are
         protected, and every timed batch's names again right after it returns, not
         at the session's end.
         """
@@ -1227,11 +1321,13 @@ class PaperOrderRouter:
                     unknown.append(
                         OrderIntentConflictError(order_intent_key(self._day, entry.symbol), intent)
                     )
-            # Hard risk outranks timing: a gap exit never waits for an exit trigger.
+            # Hard risk outranks timing: a gap exit or a hard-risk forced exit
+            # never waits for an exit trigger.
+            urgent = urgent or {}
             gap_exits = [e for e in watch.waiting() if e.side == "sell" and e.symbol in urgent]
             if gap_exits:
                 for entry in gap_exits:
-                    ledger.release_sell(entry, GAP_STOP_EXIT, now)
+                    ledger.release_sell(entry, urgent[entry.symbol], now)
                 watch.write(now)
                 yield tuple(by_key[e.order_key] for e in gap_exits)
                 for entry in gap_exits:
@@ -1764,6 +1860,10 @@ class PaperOrderRouter:
         if self._intraday is not None:
             self._intraday.close()
         self._client.disconnect()
+
+    def hard_risk_facts(self) -> BrokerFacts:
+        """Average cost, mark and NAV for the hard-risk layer (`hard_risk.read_broker_facts`)."""
+        return read_broker_facts(self._client, trading_day=self._day, quote=self._quote)
 
 
 def open_paper_router(

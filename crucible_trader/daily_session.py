@@ -149,6 +149,7 @@ from crucible_trader.contract import (
     resolve,
 )
 from crucible_trader.entry_timing import ENTRY_WATCH_SCHEMA_VERSION
+from crucible_trader.hard_risk import BrokerFacts
 from crucible_trader.kill_switch import (
     BrokerControl,
     IbBrokerControl,
@@ -338,6 +339,17 @@ def _held_into_session(
     return (None if held is None else held(notional)), sizing
 
 
+def _hard_risk_facts(router: object) -> BrokerFacts | None:
+    """The broker's facts for the hard-risk layer, or None for a router with no broker.
+
+    A live router reads average cost, marks and NAV from the account
+    (`order_router.PaperOrderRouter.hard_risk_facts`); a shadow or staging
+    simulated router has no account, so the layer stays off for that session.
+    """
+    read: Callable[[], BrokerFacts] | None = getattr(router, "hard_risk_facts", None)
+    return None if read is None else read()
+
+
 def daily_session_cycle(
     ctx: RunContext,
     *,
@@ -384,6 +396,7 @@ def daily_session_cycle(
             construct=constructor
             if sizing is None
             else functools.partial(constructor, sizing=sizing),
+            hard_risk_facts=_hard_risk_facts(router),
         )
         # After the session's orders: one standing GTC stop per held long
         # (`PaperOrderRouter.protect_holdings`). A router without stops (shadow,

@@ -129,8 +129,10 @@ def test_a_clear_session_constructs_and_sends_every_batch(store) -> None:
         "alpha_bench": None,
         "turnover_one_way": None,
         "turnover_budget": None,
+        "hard_risk": None,
         "turnover_drivers": None,
     }
+    assert "hard_risk" not in constructed[0]  # no broker facts: construct is called as before
     assert constructed[0]["trading_day"] == "2026-09-08" and constructed[0]["now"] == ib.clock()
     assert [m["name"] for m in ctx.metrics] == [
         # `alpha-engine-config-I12024`: the v1-rules guard reports first. No
