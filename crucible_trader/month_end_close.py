@@ -89,6 +89,7 @@ from crucible_trader.ledger import (
     INTEREST_RECEIVABLE,
     LEDGER_JOURNAL_PREFIX,
     OPENING,
+    REALIZED_GAINS,
     RECEIVABLE,
     RECONCILIATION_ADJUSTMENTS,
     SECURITIES,
@@ -345,6 +346,11 @@ def close_month(inputs: CloseInputs) -> dict[str, object]:
                     adjustments -= p.amount_cents
                 elif p.account == CASH_ROUNDING:
                     rounding -= p.amount_cents
+                elif p.account.startswith(REALIZED_GAINS):
+                    # IB's realized figure, booked beside a holding relieved at
+                    # IB's cost: with the securities leg below it sums to the
+                    # proceeds, so the close's average-cost realised is unchanged.
+                    realised -= p.amount_cents
                 elif p.account.startswith(SECURITIES):
                     realised += _move(lots, p.account[len(SECURITIES) :], p, entry.kind)
     # A position that went to zero realises whatever cost it still carries.

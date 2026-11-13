@@ -353,11 +353,24 @@ def test_each_held_row_carries_the_shares_the_session_sized(tmp_path) -> None:
         assert rows[sentinel]["target_shares"] is None
         assert rows[sentinel]["previous_shares"] is None
     assert doc["share_basis"] == "router_plan"
+    # The trade, signed: + buys, - sells; no notional where there is no price.
+    trades = {t: (r["trade_shares"], r["trade_notional_usd"]) for t, r in rows.items()}
+    assert trades == {
+        "AAA": (45, 4950.0),
+        "BBB": (-100, -5000.0),
+        "CCC": (909, 29997.0),
+        "DDD": (0, None),
+        "SPY": (None, None),
+        "$CASH": (None, None),
+    }
+    assert rows["AAA"]["weight_change_pct"] == 5.0
+    assert rows["BBB"]["weight_change_pct"] == -5.0
 
 
 def test_without_a_share_basis_the_share_columns_are_null() -> None:
     doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
     assert {(r["previous_shares"], r["target_shares"]) for r in doc["rows"]} == {(None, None)}
+    assert {(r["trade_shares"], r["trade_notional_usd"]) for r in doc["rows"]} == {(None, None)}
     assert doc["share_basis"] is None
 
 
@@ -477,3 +490,16 @@ def test_a_resize_the_plan_left_inside_the_band_reads_as_the_shares_held() -> No
         )
         == 5
     )
+
+
+def test_the_book_carries_reader_facing_percentages_and_an_exchange_clock_build_time() -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc="2026-11-13T14:32:14Z")
+    assert doc["built_at_et"] == "2026-11-13 09:32 ET"
+    assert doc["summary"]["cash_weight_pct"] == round(doc["summary"]["cash_weight"] * 100, 3)
+    assert doc["turnover_one_way_pct"] == round(doc["turnover_one_way_ratio"] * 100, 3)
+
+
+@pytest.mark.parametrize("stamp", ["t", "2026-11-13T14:32:14"])
+def test_an_unreadable_or_zoneless_build_time_reads_null(stamp) -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc=stamp)
+    assert doc["built_at_et"] is None
