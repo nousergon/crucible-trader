@@ -644,7 +644,7 @@ class TestRehearseClose:
     @pytest.mark.parametrize(
         ("extra", "message"),
         [
-            (("--close", "2026-09", "--apply"), "dry run"),
+            (("--close", "2026-09", "--apply"), "give --book"),
             (("--close", "2026-09"), "needs --out"),
             (("--day", "2026-09-10"), "one --statement per --day"),
         ],
@@ -892,3 +892,128 @@ class TestPriorPeriodBook:
 
 
 NOW_STAMP = "2026-11-03T05:30:00Z"
+
+
+# -- codex review of crucible-trader#160 ---------------------------------------------
+
+
+class TestBookEnd:
+    """A prior-period book holds nothing past its declared final month."""
+
+    def test_a_backfill_past_the_books_end_is_refused(self, root, monkeypatch):
+        from crucible_trader import ledger
+
+        monkeypatch.setattr(ledger, "PRIOR_PERIOD_BOOKS", {BOOK: "2026-08"})
+        with pytest.raises(BackfillRefused, match="after 2026-08, the last month"):
+            backfill_day(LocalStore(root), _statement(), corporate_actions=CA, book=BOOK)
+
+
+SEP11 = "2026-09-11"
+
+
+class TestWholeBookApply:
+    """A month with a stored reconciliation (LATER) between missing days (DAY,
+    09-11) is applied into the book from its rehearsal, create-only and in
+    date order: the stored day cannot be backfilled (it is not missing) and a
+    missing day alone ahead of it is refused."""
+
+    def _args(self, gap_root, tmp_path, *extra):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        args = ["--store", str(gap_root), "--book", BOOK]
+        for day, period in ((DAY, "September 9, 2026"), (SEP11, "September 11, 2026")):
+            path = tmp_path / f"{day}.csv"
+            path.write_text(csv_text(account="DU1", period=period), encoding="utf-8")
+            args += ["--day", day, "--statement", str(path)]
+        out = tmp_path / "out"
+        return [*args, "--close", "2026-09", "--out", str(out), "--now", NOW_STAMP, *extra], out
+
+    def _rehearse(self, gap_root):
+        return statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [_statement(), BrokerStatement("DU1", SEP11, {"AAA": 10}, 1_000.0)],
+            month="2026-09",
+            now=NOW_STAMP,
+            corporate_actions=CA,
+            book=BOOK,
+        )
+
+    def test_stored_and_missing_days_book_in_date_order(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        from crucible_trader.exception_proposal import exception_proposals_key
+
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        args, out = self._args(gap_root, tmp_path, "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 0, capsys.readouterr().err
+        assert "applied" in capsys.readouterr().err
+        backend = LocalStore(gap_root)
+        journals = [journal_key("nous-ergon-paper", d, BOOK) for d in (DAY, LATER, SEP11)]
+        for key in journals:
+            assert backend.exists(key), key
+        for day in (DAY, LATER, SEP11):
+            assert not backend.exists(journal_key("nous-ergon-paper", day))
+        assert backend.exists(trader_reconciliation_key(DAY))
+        assert backend.exists(trader_reconciliation_key(SEP11))
+        applied = json.loads((out / "summary.json").read_text())["applied"]
+        at = [applied.index(k) for k in journals]
+        assert at == sorted(at)
+        assert applied.index(trader_reconciliation_key(DAY)) < at[1]
+        # the dry run's own review-queue rehearsal is not applied
+        assert exception_proposals_key(LATER) not in applied
+        assert not backend.exists(exception_proposals_key(LATER))
+        # the applied days are no longer missing: a re-run is refused, nothing written
+        before = snapshot(gap_root)
+        args, _ = self._args(gap_root, tmp_path / "again", "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 1
+        assert "not a missing day" in capsys.readouterr().err
+        assert snapshot(gap_root) == before
+
+    def test_create_only_refuses_before_the_first_write(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        taken = (
+            f"trader/ledger/books/{BOOK}/close/nous-ergon-paper/2026-09/attempts/2026-10-01.json"
+        )
+        LocalStore(gap_root).put_bytes(taken, b"{}")
+        before = snapshot(gap_root)
+        args, out = self._args(gap_root, tmp_path, "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 1
+        assert "create-only" in capsys.readouterr().err
+        assert snapshot(gap_root) == before
+        assert (out / "summary.json").exists()  # the rehearsal is kept
+
+    def test_a_refused_lock_exits_2(self, gap_root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        monkeypatch.setattr(
+            statement_backfill, "lock_books_records", lambda *_a, **_k: ([], {"k": "denied"})
+        )
+        args, _ = self._args(gap_root, tmp_path, "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 2
+        assert "NOT under WORM retention" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("spoil", "message"),
+        [
+            (lambda s: s["backfill"][0].update(has_ledger=False), "no reconciliation, journal"),
+            (lambda s: s["backfill"][0].update(locked_writes=["x"]), "Object Lock"),
+            (lambda s: s["days_with_reconciliation"].append("2026-09-30"), "no pre-v2 journal"),
+        ],
+    )
+    def test_refusals_write_nothing(self, gap_root, spoil, message):
+        view, summary = self._rehearse(gap_root)
+        spoil(summary)
+        before = snapshot(gap_root)
+        with pytest.raises(BackfillRefused, match=message):
+            statement_backfill.apply_book(
+                LocalStore(gap_root), view, summary, book=BOOK, now=OUTSIDE
+            )
+        assert snapshot(gap_root) == before
+
+    @pytest.mark.parametrize(
+        ("book", "now", "message"), [(None, OUTSIDE, "give --book"), (BOOK, INSIDE, "09:00-16:30")]
+    )
+    def test_no_book_or_inside_the_window_is_refused(self, gap_root, book, now, message):
+        view, summary = self._rehearse(gap_root)
+        with pytest.raises(BackfillRefused, match=message):
+            statement_backfill.apply_book(LocalStore(gap_root), view, summary, book=book, now=now)

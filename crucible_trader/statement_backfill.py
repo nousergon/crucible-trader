@@ -49,7 +49,13 @@ keys no live reader lists. Without ``--book``, a day dated before a live
 journal is refused up front, naming the book to use. ``--close`` with
 ``--book`` rehearses the book's close, and for the book's last month the bridge
 into the live book's opening balance (`crucible_trader.month_end_close`): the
-rehearsal says whether it ties, line by line.
+rehearsal says whether it ties, line by line. Adding ``--apply`` then applies
+that rehearsal (:func:`apply_book`): every day's book journal and view, the
+stored days' and the backfilled days' alike, and each backfilled day's cycle,
+create-only and in date order, then the book's close records. A month holding
+both stored reconciliations and missing days has no other way into the book:
+a stored day is not a missing day, so it cannot be backfilled on its own, and
+one missing day applied alone ahead of it is refused.
 
     python -m crucible_trader.statement_backfill --book pre-v2 \\
         --day 2026-10-14 --statement <14.csv> --day 2026-10-15 --statement <15.csv> \\
@@ -97,7 +103,9 @@ from crucible_trader.broker_statement import (
 from crucible_trader.exception_record import PAPER_FUND_TENANT
 from crucible_trader.ledger import (
     PRIOR_PERIOD_BOOK,
+    LedgerError,
     book_root,
+    check_book_day,
     journal_key,
     journal_prefix,
     ledger_reconciliation_key,
@@ -440,7 +448,10 @@ def backfill_day(
         raise BackfillRefused(
             f"{trader_reconciliation_key(day)} already exists: {day} is not a missing day"
         )
-    book_root(book)  # an undeclared book is refused before anything runs
+    try:  # an undeclared book, or a day past the book's end, is refused before anything runs
+        check_book_day(book, day)
+    except LedgerError as exc:
+        raise BackfillRefused(str(exc)) from None
     prefix = journal_prefix(PAPER_FUND_TENANT)
     if book is None and (
         later := sorted(
@@ -643,11 +654,39 @@ def apply_writes(
     existing = [k for k in keys if k not in same and backend.exists(k)]
     if existing:
         raise BackfillRefused(f"create-only: {len(existing)} key(s) already exist: {existing}")
-    sentinel = trader_reconciliation_key(str(summary["trading_day"]))
-    order = sorted(
-        (k for k in keys if k not in same),
-        key=lambda k: 0 if k.startswith(_REPLAYABLE) else 1 if k == sentinel else 2,
+    order = _tiered([k for k in keys if k not in same], str(summary["trading_day"]))
+    _create_only(
+        backend,
+        view,
+        order,
+        same,
+        summary,
+        trading_day=str(summary["trading_day"]),
+        now=now,
     )
+    return keys
+
+
+def _tiered(keys: Sequence[str], day: str) -> list[str]:
+    """``keys`` of one day in apply order: what a re-run replays byte for byte
+    first, then the day's reconciliation (what makes it "not missing"), then
+    everything stamped with its run's time."""
+    sentinel = trader_reconciliation_key(day)
+    return sorted(keys, key=lambda k: 0 if k.startswith(_REPLAYABLE) else 1 if k == sentinel else 2)
+
+
+def _create_only(
+    backend: Store,
+    view: Store,
+    order: Sequence[str],
+    same: Sequence[str],
+    summary: dict[str, Any],  # pyright: ignore[reportExplicitAny]
+    *,
+    trading_day: str,
+    now: dt.datetime,
+) -> None:
+    """Write ``order`` create-only, then lock every books record written (and
+    ``same``, already holding the captured bytes) in a ``finally``."""
     written: list[str] = list(same)
     try:
         for key in order:
@@ -667,12 +706,91 @@ def apply_writes(
         locked, refused = lock_books_records(
             backend,
             written,
-            trading_day=dt.date.fromisoformat(str(summary["trading_day"])),
+            trading_day=dt.date.fromisoformat(trading_day),
             written_on=now.astimezone(dt.UTC).date(),
         )
         summary["written"] = written
         summary["locked"], summary["lock_refused"] = locked, refused
-    return keys
+
+
+def apply_book(
+    backend: Store,
+    view: Store,
+    summary: dict[str, Any],  # pyright: ignore[reportExplicitAny]
+    *,
+    book: str | None,
+    now: dt.datetime,
+) -> list[str]:
+    """Apply a prior-period book's close rehearsal (:func:`rehearse_close`
+    with ``book``) to ``backend``: the supported way to book a month that
+    holds stored reconciliations AND missing days (codex review of
+    crucible-trader#160). Returns the keys in the order applied.
+
+    What is applied: every journal and view the rehearsal posted into the book,
+    each backfilled day's own cycle (``keys_to_write``, as :func:`apply_writes`
+    applies one day), and the book's close records (an attempt, or the close,
+    its period lock and statement). What is NOT: the review-queue files the
+    dry run's own export, proposal and score steps rehearse -- the live job
+    files those -- and the live pointers.
+
+    Date ordered: day by day, each day's books before its reconciliation and
+    its run-stamped records (:func:`_tiered`), and the close records last. So
+    an apply stopped part-way leaves a book with no gap behind its newest
+    journal, and a re-run (dropping the backfilled days it already applied,
+    which are no longer missing) skips what holds the same bytes. Create-only,
+    window-guarded and all-or-nothing up front, as :func:`apply_writes`: every
+    refusal below is checked before the first write."""
+    if book is None:
+        raise BackfillRefused("a whole-month apply posts into a prior-period book: give --book")
+    if _in_window(now):
+        raise BackfillRefused(
+            f"it is {now.astimezone(_ET):%H:%M} ET on a weekday, inside 09:00-16:30 ET; "
+            "re-run --apply outside market hours"
+        )
+    days = cast("list[dict[str, Any]]", summary["backfill"])  # pyright: ignore[reportExplicitAny]
+    for day in days:
+        if not day["has_reconciliation"] or not day.get("has_ledger"):
+            raise BackfillRefused(
+                f"{day['trading_day']}: the cycle wrote no reconciliation, journal and view "
+                f"({day['error']}); nothing applied"
+            )
+        if day["locked_writes"]:
+            raise BackfillRefused(f"Object Lock writes cannot be replayed: {day['locked_writes']}")
+    booked = cast("list[str]", summary["days_with_reconciliation"])
+    unposted = [d for d in booked if not view.exists(journal_key(PAPER_FUND_TENANT, d, book))]
+    if unposted:
+        raise BackfillRefused(
+            f"the rehearsal posted no {book} journal for {unposted}; applying the days after "
+            "them would leave them unbookable -- nothing applied"
+        )
+    root = book_root(book)
+    by_day: dict[str, list[str]] = {}
+    for day in days:
+        by_day.setdefault(str(day["trading_day"]), []).extend(day["keys_to_write"])
+    closing: list[str] = []
+    for key in cast("list[str]", summary["keys_written"]):
+        if key.startswith((f"{root}journal/", f"{root}reconciliation/")):
+            by_day.setdefault(key.rsplit("/", 1)[-1].removesuffix(".json"), []).append(key)
+        elif key.startswith(root):
+            closing.append(key)
+    order: list[str] = []
+    for day in sorted(by_day):
+        order.extend(_tiered(list(dict.fromkeys(by_day[day])), day))
+    order.extend(k for k in sorted(closing) if k not in order)
+    same = [k for k in order if backend.exists(k) and _same(backend, view, k)]
+    existing = [k for k in order if k not in same and backend.exists(k)]
+    if existing:
+        raise BackfillRefused(f"create-only: {len(existing)} key(s) already exist: {existing}")
+    _create_only(
+        backend,
+        view,
+        [k for k in order if k not in same],
+        same,
+        summary,
+        trading_day=max(booked),
+        now=now,
+    )
+    return order
 
 
 #: The books a re-run of the same statement reproduces byte for byte.
@@ -738,7 +856,7 @@ def main(
     if len(days) != len(paths):
         parser.error("give one --statement per --day")
     if args.close is not None:
-        return _rehearse(parser, args, days, paths, opener)
+        return _rehearse(parser, args, days, paths, opener, clock)
     if len(days) != 1:
         parser.error("more than one --day needs --close")
     day = days[0]
@@ -754,7 +872,8 @@ def main(
             if args.book is not None and (behind := unbooked_earlier_days(backend, day, args.book)):
                 raise BackfillRefused(
                     f"the {args.book} book has no journal yet for {behind}; {day} applied ahead "
-                    "of them would leave them unbookable -- apply the book whole, in date order"
+                    "of them would leave them unbookable -- apply the book whole, in date order: "
+                    f"--close {day[:7]} --book {args.book} --apply"
                 )
             summary["written"] = apply_writes(backend, view, summary, now=clock())
     except (BackfillRefused, BrokerStatementError, OSError, ValueError) as exc:
@@ -781,9 +900,10 @@ def _rehearse(
     days: Sequence[str],
     paths: Sequence[pathlib.Path],
     opener: Callable[[str | None], Store],
+    clock: Callable[[], dt.datetime],
 ) -> int:
-    if args.apply:
-        parser.error("--close is a dry run; --apply one --day at a time")
+    if args.apply and args.book is None:
+        parser.error("--close --apply applies a prior-period book; give --book")
     out = cast("pathlib.Path | None", args.out)
     if out is None:
         parser.error("--close needs --out")
@@ -797,8 +917,9 @@ def _rehearse(
             for d, p in zip(days, paths, strict=True)
         ]
         fills = load_fills(cast("pathlib.Path | None", args.fills))
+        backend = opener(cast("str | None", args.store))
         view, summary = rehearse_close(
-            opener(cast("str | None", args.store)),
+            backend,
             statements,
             month=month,
             now=now,
@@ -810,15 +931,34 @@ def _rehearse(
         return 1
     out.mkdir(parents=True, exist_ok=True)
     write_out(view, summary, out)
+    if args.apply:
+        try:
+            summary["applied"] = apply_book(
+                backend, view, summary, book=cast("str", args.book), now=clock()
+            )
+        except BackfillRefused as exc:
+            sys.stderr.write(f"NO-GO: {exc} (the rehearsal is in {out})\n")
+            return 1
+        finally:
+            (out / "summary.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        if summary.get("lock_refused"):
+            sys.stderr.write(
+                f"{month}: applied, but {len(summary['lock_refused'])} books record(s) are NOT "
+                "under WORM retention (see lock_refused)\n"
+            )
+            return 2
     close = cast("Mapping[str, Any] | None", summary["close"])  # pyright: ignore[reportExplicitAny]
     missing = [
         e for e in (close or {}).get("exceptions", []) if e["class"] == "close_input_missing"
     ]
     bridge = cast("Mapping[str, Any] | None", (close or {}).get("bridge"))  # pyright: ignore[reportExplicitAny]
     sys.stderr.write(
-        f"{month}: backfilled {', '.join(sorted(days))} (dry run); "
-        f"close {close['status'] if close else 'not attempted'}, "
-        f"{len(missing)} close_input_missing line(s)"
+        f"{month}: backfilled {', '.join(sorted(days))} "
+        + (f"(applied {len(summary['written'])} key(s)); " if args.apply else "(dry run); ")
+        + f"close {close['status'] if close else 'not attempted'}, "
+        + f"{len(missing)} close_input_missing line(s)"
         + (
             ""
             if bridge is None

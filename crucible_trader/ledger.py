@@ -1010,6 +1010,19 @@ def book_final_month(book: str | None) -> str | None:
     return None if book is None else PRIOR_PERIOD_BOOKS[book]
 
 
+def check_book_day(book: str | None, trading_day: str) -> None:
+    """Refuse ``trading_day`` for a prior-period book it lies past the end of.
+    A book holds nothing after its declared final month: a later day posted
+    into it would let a close after that month finish with no bridge into the
+    live book (codex review of crucible-trader#160). The live book has no end."""
+    final = book_final_month(book)
+    if final is not None and trading_day[:7] > final:
+        raise LedgerError(
+            f"{trading_day} is after {final}, the last month of the {book} book; a book "
+            "holds nothing past its declared end"
+        )
+
+
 def journal_prefix(tenant: str, book: str | None = None) -> str:
     return f"{book_root(book)}journal/{tenant}/"
 
@@ -1134,6 +1147,7 @@ def post_daily_ledger(
     key = None
     try:
         key = journal_key(tenant, day, book)
+        check_book_day(book, day)
         locks = read_period_locks(ctx.store, tenant, book=book)
         if day[:7] in locks:
             raise LedgerError(

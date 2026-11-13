@@ -256,6 +256,25 @@ class TestBookPosting:
         # the live book is not closed by the prior-period book's lock
         assert post(store, stmt("2026-11-04", {"AAA": 10, "BBB": 5}, 899.0), OCT_END) is not None
 
+    def test_a_day_past_the_books_end_is_refused(self, store):
+        # codex review of crucible-trader#160: a November day in the October
+        # book would let a close past the book's end finish with no bridge.
+        ctx = ctx_for(store, "2026-11-04")
+        posting = post_daily_ledger(
+            ctx,
+            broker=stmt("2026-11-04", {"AAA": 10}, 1_000.0),
+            anchor=None,
+            fills=(),
+            cash_flows=(),
+            corporate_actions=NONE,
+            reconciliation={},
+            now=NOW,
+            book=BOOK,
+        )
+        assert posting is None
+        assert "after 2026-10, the last month" in str(ctx.metrics[0]["status_reason"])
+        assert not store.exists(journal_key(T, "2026-11-04", BOOK))
+
     def test_opening_balances_reads_what_the_live_book_opened_with(self, store):
         assert opening_balances(store, T, "DU1") is None
         live_opening(store)
