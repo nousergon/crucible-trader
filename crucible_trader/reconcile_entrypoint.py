@@ -154,19 +154,21 @@ def _commission(report: _CommissionReport | None, exec_id: str) -> float | None:
     return value
 
 
-def _realized(report: _CommissionReport | None, exec_id: str) -> float | None:
-    """IB's realized P&L (net of commission) on execution ``exec_id``, from the
-    report attached to it, or None when IB states none: an opening trade carries
-    the unset sentinel, and a report for another execution says nothing."""
-    if report is None or getattr(report, "execId", None) != exec_id:
+def _reported(report: _CommissionReport | None, exec_id: str) -> tuple[float, float | None] | None:
+    """The commission and IB's realized P&L (net of that commission) that
+    ``report`` attaches to execution ``exec_id``, or None when it attaches no
+    commission (:func:`_commission`). The realized figure is None when IB
+    states none: an opening trade carries the unset sentinel."""
+    commission = _commission(report, exec_id)
+    if commission is None:
         return None
     value = getattr(report, "realizedPNL", None)
     if value is None:
-        return None
+        return commission, None
     value = float(value)
     if not math.isfinite(value) or abs(value) >= _UNSET_DOUBLE:
-        return None
-    return value
+        return commission, None
+    return commission, value
 
 
 def _store_commissions(
@@ -176,9 +178,9 @@ def _store_commissions(
     for record in client.fills():
         exec_id = record.execution.execId
         if exec_id in exec_ids:
-            value = _commission(record.commissionReport, exec_id)
-            if value is not None:
-                found[exec_id] = (value, _realized(record.commissionReport, exec_id))
+            reported = _reported(record.commissionReport, exec_id)
+            if reported is not None:
+                found[exec_id] = reported
     return found
 
 
@@ -220,9 +222,9 @@ def fills_from_ib(
         executions.setdefault(execution.execId, record)
 
     commissions = {
-        exec_id: (value, _realized(record.commissionReport, exec_id))
+        exec_id: reported
         for exec_id, record in executions.items()
-        if (value := _commission(record.commissionReport, exec_id)) is not None
+        if (reported := _reported(record.commissionReport, exec_id)) is not None
     }
     waited = 0.0
     while True:
