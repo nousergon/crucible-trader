@@ -114,6 +114,23 @@ line in the close, never folded into the month's interest income. A recorded
 zero is a baseline like any other (a zero entry). A statement that records no
 accrual books nothing; the receivable stands.
 
+**Books** (`alpha-engine-config-I13232`, owner decision 2026-11-12). The LIVE
+book is the one the trader posts every evening; its keys are the ones above and
+``book=None`` everywhere means it. A **prior-period book** is a separate, earlier
+accounting period booked after the fact: October 2026 belongs to the v1 era, and
+the live book opened on 2026-11-03 from IB's 10-30 statement, so October is
+posted as its own book (:data:`PRIOR_PERIOD_BOOK`), never inserted behind the
+live book's journals and never as a correction in November (Rule 6: corrections
+are for errors, not for missing history). Every key of a prior-period book sits
+under ``trader/ledger/books/<book>/`` (:func:`book_root`), a prefix no live
+reader lists, so the two books never see each other's journals, views, period
+locks or closes; the books retention prefix ``trader/ledger/`` covers both. The
+guards hold WITHIN each book exactly as in the live one (append-only, never
+inserted behind a later journal of the same book, a closed month refuses). A
+prior-period book is DECLARED (:data:`PRIOR_PERIOD_BOOKS`, with the last month
+it holds), and its last month's close must bridge into the live book's opening
+balance (:func:`opening_balances`, `crucible_trader.month_end_close`).
+
 **Failure isolation.** :func:`post_daily_ledger` NEVER raises: the trader's
 reconcile job decides and pages exactly as before; this step rides beside it
 and reports through one MetricRecord (``FAIL`` when it could not post).
@@ -163,6 +180,16 @@ TENANT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 #: reconciliation view is a derived document and may be rewritten by a re-run.
 LEDGER_JOURNAL_PREFIX = "trader/ledger/journal/"
 LEDGER_RECONCILIATION_PREFIX = "trader/ledger/reconciliation/"
+#: The live book's root; a prior-period book's is under :data:`LEDGER_BOOKS_PREFIX`.
+LEDGER_ROOT = "trader/ledger/"
+LEDGER_BOOKS_PREFIX = "trader/ledger/books/"
+#: The v1-era book (`alpha-engine-config-I13232`): October 2026, before the
+#: live book opened on 2026-11-03 from IB's 2026-10-30 statement.
+PRIOR_PERIOD_BOOK = "pre-v2"
+#: Every prior-period book -> the LAST month it holds. That month's close must
+#: bridge into the live book's opening balance. A book is added here by PR,
+#: never named ad hoc: an undeclared book name is refused by :func:`book_root`.
+PRIOR_PERIOD_BOOKS: Mapping[str, str] = {PRIOR_PERIOD_BOOK: "2026-10"}
 
 CASH = "assets:cash:USD"
 COMMISSIONS = "expenses:commissions"
@@ -963,14 +990,38 @@ def _cited(entry: Entry) -> list[str]:
 # --------------------------------------------------------------------------- I/O
 
 
-def journal_key(tenant: str, trading_day: str) -> str:
-    _require(tenant, trading_day)
-    return f"{LEDGER_JOURNAL_PREFIX}{tenant}/{trading_day}.json"
+def book_root(book: str | None) -> str:
+    """Where ``book``'s records live: :data:`LEDGER_ROOT` for the live book
+    (``None``), ``trader/ledger/books/<book>/`` for a declared prior-period
+    book. Raises :class:`LedgerError` for a book that is not declared."""
+    if book is None:
+        return LEDGER_ROOT
+    if book not in PRIOR_PERIOD_BOOKS:
+        raise LedgerError(
+            f"book {book!r} is not a declared prior-period book ({sorted(PRIOR_PERIOD_BOOKS)})"
+        )
+    return f"{LEDGER_BOOKS_PREFIX}{book}/"
 
 
-def ledger_reconciliation_key(tenant: str, trading_day: str) -> str:
+def book_final_month(book: str | None) -> str | None:
+    """The last month a prior-period book holds (whose close bridges into the
+    live book), or ``None`` for the live book."""
+    book_root(book)
+    return None if book is None else PRIOR_PERIOD_BOOKS[book]
+
+
+def journal_prefix(tenant: str, book: str | None = None) -> str:
+    return f"{book_root(book)}journal/{tenant}/"
+
+
+def journal_key(tenant: str, trading_day: str, book: str | None = None) -> str:
     _require(tenant, trading_day)
-    return f"{LEDGER_RECONCILIATION_PREFIX}{tenant}/{trading_day}.json"
+    return f"{journal_prefix(tenant, book)}{trading_day}.json"
+
+
+def ledger_reconciliation_key(tenant: str, trading_day: str, book: str | None = None) -> str:
+    _require(tenant, trading_day)
+    return f"{book_root(book)}reconciliation/{tenant}/{trading_day}.json"
 
 
 def _require(tenant: str, trading_day: str) -> None:
@@ -989,9 +1040,11 @@ def journal_document(tenant: str, trading_day: str, entries: Sequence[Entry]) ->
     return json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
 
 
-def load_journals(store: Store, tenant: str, *, before: str) -> dict[str, tuple[Entry, ...]]:
-    """Every stored journal of ``tenant`` dated before ``before``, by day."""
-    prefix = f"{LEDGER_JOURNAL_PREFIX}{tenant}/"
+def load_journals(
+    store: Store, tenant: str, *, before: str, book: str | None = None
+) -> dict[str, tuple[Entry, ...]]:
+    """Every stored journal of ``tenant`` in ``book`` dated before ``before``, by day."""
+    prefix = journal_prefix(tenant, book)
     days = sorted(
         k[len(prefix) : -len(".json")]
         for k in store.list_keys(prefix)
@@ -999,16 +1052,16 @@ def load_journals(store: Store, tenant: str, *, before: str) -> dict[str, tuple[
     )
     journals: dict[str, tuple[Entry, ...]] = {}
     for day in days:
-        document = json.loads(store.get_bytes(journal_key(tenant, day)).decode("utf-8"))
+        document = json.loads(store.get_bytes(journal_key(tenant, day, book)).decode("utf-8"))
         if document.get("schema_version") != LEDGER_SCHEMA_VERSION:
             raise LedgerError(f"journal {day} is {document.get('schema_version')!r}")
         journals[day] = tuple(entry_from_document(raw) for raw in document["entries"])
     return journals
 
 
-def _later_journal_days(store: Store, tenant: str, day: str) -> list[str]:
-    """Stored journal days of ``tenant`` dated after ``day``, ascending."""
-    prefix = f"{LEDGER_JOURNAL_PREFIX}{tenant}/"
+def _later_journal_days(store: Store, tenant: str, day: str, book: str | None) -> list[str]:
+    """Stored journal days of ``tenant`` in ``book`` dated after ``day``, ascending."""
+    prefix = journal_prefix(tenant, book)
     return sorted(
         d
         for k in store.list_keys(prefix)
@@ -1025,9 +1078,35 @@ def ledger_from(journals: Mapping[str, Sequence[Entry]]) -> Ledger:
     return ledger
 
 
-def load_ledger(store: Store, tenant: str, *, before: str) -> Ledger:
-    """Replay every stored journal of ``tenant`` dated before ``before``."""
-    return ledger_from(load_journals(store, tenant, before=before))
+def load_ledger(store: Store, tenant: str, *, before: str, book: str | None = None) -> Ledger:
+    """Replay every stored journal of ``tenant`` in ``book`` dated before ``before``."""
+    return ledger_from(load_journals(store, tenant, before=before, book=book))
+
+
+def opening_balances(
+    store: Store, tenant: str, account: str, *, book: str | None = None
+) -> tuple[Ledger, list[tuple[str, Entry]]] | None:
+    """What ``book`` OPENED with for ``tenant``/``account``: every entry that
+    posts to :data:`OPENING` (the ``opening_balance`` entry, and the opening
+    statement's accrued interest booked as its own entry), replayed into a
+    ledger of its own, with ``(journal day, entry)`` for each. ``None`` when
+    the book holds no ``opening_balance`` for the account.
+
+    This is the far side of the bridge across a cutover: a prior-period book's
+    closing balances must equal it (`alpha-engine-config-I13232`)."""
+    journals = load_journals(store, tenant, before="9999-12-31", book=book)
+    opening = Ledger()
+    cited: list[tuple[str, Entry]] = []
+    for day in sorted(journals):
+        for entry in journals[day]:
+            if entry.tenant != tenant or entry.account != account:
+                continue
+            if any(p.account == OPENING for p in entry.postings):
+                opening.append(entry)
+                cited.append((day, entry))
+    if not any(e.kind == "opening_balance" for _, e in cited):
+        return None
+    return opening, cited
 
 
 def post_daily_ledger(
@@ -1042,24 +1121,29 @@ def post_daily_ledger(
     now: str,
     tenant: str = PAPER_FUND_TENANT,
     closes: SettledCloses | None = None,
+    book: str | None = None,
 ) -> DayPosting | None:
     """Step 5d of `trader.reconcile`: book the day, reconcile the LEDGER to the
     broker, write the journal (create-only) and the reconciliation view, and
     record one MetricRecord. NEVER raises; returns ``None`` on failure.
 
-    ``closes`` defaults to the stored price panels (``close_raw``)."""
+    ``closes`` defaults to the stored price panels (``close_raw``). ``book``
+    names a declared prior-period book (``None``: the live book); every read
+    and write, and every guard, is then that book's alone."""
     day = broker.trading_day
     key = None
     try:
-        key = journal_key(tenant, day)
-        locks = read_period_locks(ctx.store, tenant)
+        key = journal_key(tenant, day, book)
+        locks = read_period_locks(ctx.store, tenant, book=book)
         if day[:7] in locks:
             raise LedgerError(
                 f"{day[:7]} is closed; a late fix is a prior-period adjustment dated in the "
                 "open month"
             )
-        journals = load_journals(ctx.store, tenant, before=day)
-        if not ctx.store.exists(key) and (later := _later_journal_days(ctx.store, tenant, day)):
+        journals = load_journals(ctx.store, tenant, before=day, book=book)
+        if not ctx.store.exists(key) and (
+            later := _later_journal_days(ctx.store, tenant, day, book)
+        ):
             raise LedgerError(
                 f"journals after {day} already exist ({later[0]}); a day is never inserted "
                 "behind a later journal -- post a correction instead"
@@ -1092,6 +1176,7 @@ def post_daily_ledger(
             locks=locks,
             view=posting.document,
             closes=closes if closes is not None else _panel_closes(ctx.store),
+            book=book,
         )
         posting.document["checks"] = checks
         payload = journal_document(tenant, day, posting.entries)
@@ -1103,7 +1188,7 @@ def post_daily_ledger(
                     f"the {day} journal is already written with different entries; a journal "
                     "is never rewritten -- post a correction instead"
                 ) from None
-        view_key = ledger_reconciliation_key(tenant, day)
+        view_key = ledger_reconciliation_key(tenant, day, book)
         ctx.record_output(
             view_key,
             json.dumps(posting.document, indent=2, sort_keys=True).encode("utf-8"),
@@ -1259,9 +1344,9 @@ LEDGER_PERIODS_PREFIX = "trader/ledger/periods/"
 PERIOD_LOCK_SCHEMA_VERSION = "ledger_period_lock.v1"
 
 
-def period_lock_key(tenant: str, month: str) -> str:
+def period_lock_key(tenant: str, month: str, book: str | None = None) -> str:
     _require(tenant, f"{month}-01")
-    return f"{LEDGER_PERIODS_PREFIX}{tenant}/{month}.json"
+    return f"{book_root(book)}periods/{tenant}/{month}.json"
 
 
 def journal_digest(tenant: str, day: str, entries: Sequence[Entry]) -> str:
@@ -1283,9 +1368,11 @@ def period_lock_document(
     }
 
 
-def read_period_locks(store: Store, tenant: str) -> dict[str, dict[str, str]]:
-    """Every locked month of ``tenant`` -> its journal digests."""
-    prefix = f"{LEDGER_PERIODS_PREFIX}{tenant}/"
+def read_period_locks(
+    store: Store, tenant: str, *, book: str | None = None
+) -> dict[str, dict[str, str]]:
+    """Every locked month of ``tenant`` in ``book`` -> its journal digests."""
+    prefix = f"{book_root(book)}periods/{tenant}/"
     locks: dict[str, dict[str, str]] = {}
     for key in sorted(store.list_keys(prefix)):
         document = json.loads(store.get_bytes(key).decode("utf-8"))
@@ -1351,8 +1438,11 @@ def run_checks(
     locks: Mapping[str, Mapping[str, str]],
     view: Mapping[str, object],
     closes: SettledCloses | None = None,
+    book: str | None = None,
 ) -> dict[str, object]:
-    """The 1h checks for ``day`` (whose entries are already in ``journals``).
+    """The 1h checks for ``day`` (whose entries are already in ``journals``),
+    against ``book``'s published views (the broker's statements and the
+    reconciliations are one per day, shared by every book).
 
     ``closes`` (``(trading_day, tickers) -> {ticker: close}``) adds the daily
     settled-close completeness check; ``None`` skips it."""
@@ -1386,7 +1476,7 @@ def run_checks(
         if prev is not None and d <= prev:
             held_after[d] = sorted(replay.positions(tenant, account))
         if month_start <= d < day:
-            key = ledger_reconciliation_key(tenant, d)
+            key = ledger_reconciliation_key(tenant, d, book)
             if not store.exists(key):
                 continue  # a missing view is counted by completeness below
             stored = json.loads(store.get_bytes(key).decode("utf-8"))
@@ -1432,7 +1522,7 @@ def run_checks(
             name
             for name, present in (
                 ("journal", d in journals),
-                ("view", d == day or store.exists(ledger_reconciliation_key(tenant, d))),
+                ("view", d == day or store.exists(ledger_reconciliation_key(tenant, d, book))),
                 ("ib_statement", store.exists(trader_broker_statement_key(d))),
                 ("reconciliation", d == day or store.exists(trader_reconciliation_key(d))),
             )

@@ -41,6 +41,20 @@ the latest live run, and a backfill of an earlier day must not move it.
     python -m crucible_trader.statement_backfill --store URI --day 2026-10-14 \\
         --statement DU_20261014.csv [--fills PATH] [--apply]
 
+**Prior-period book** (owner decision 2026-11-12 on `alpha-engine-config-I13232`).
+A day before the live book opened (2026-11-03) is never inserted behind it:
+``--book pre-v2`` posts the day, its view and its month's close into that
+declared prior-period book (`crucible_trader.ledger.PRIOR_PERIOD_BOOKS`), whose
+keys no live reader lists. Without ``--book``, a day dated before a live
+journal is refused up front, naming the book to use. ``--close`` with
+``--book`` rehearses the book's close, and for the book's last month the bridge
+into the live book's opening balance (`crucible_trader.month_end_close`): the
+rehearsal says whether it ties, line by line.
+
+    python -m crucible_trader.statement_backfill --book pre-v2 \\
+        --day 2026-10-14 --statement <14.csv> --day 2026-10-15 --statement <15.csv> \\
+        --fills 2026-10-v1-fills.jsonl --close 2026-10 --out DIR --now 2026-11-02T14:00:00Z
+
 ``--statement`` takes either form IB issues the same day in: the Client Portal
 Daily Activity Statement CSV (:func:`parse_activity_statement`) or a Flex Web
 Service Activity XML (:func:`parse_flex_statement`, `alpha-engine-config-I13196`).
@@ -81,10 +95,16 @@ from crucible_trader.broker_statement import (
     BrokerStatementError,
 )
 from crucible_trader.exception_record import PAPER_FUND_TENANT
-from crucible_trader.ledger import journal_key, ledger_reconciliation_key
+from crucible_trader.ledger import (
+    PRIOR_PERIOD_BOOK,
+    book_root,
+    journal_key,
+    journal_prefix,
+    ledger_reconciliation_key,
+)
 from crucible_trader.reconcile_entrypoint import live_corporate_action_source
 from crucible_trader.reconciliation import Fill
-from crucible_trader.reconciliation_job import run_reconciliation
+from crucible_trader.reconciliation_job import RECONCILIATION_PREFIX, run_reconciliation
 
 __all__ = [
     "BackfillRefused",
@@ -400,6 +420,7 @@ def backfill_day(
     fills: Sequence[Fill] = (),
     corporate_actions: Any = None,  # pyright: ignore[reportExplicitAny]
     runner: Callable[..., Any] = run_reconciliation,  # pyright: ignore[reportExplicitAny]
+    book: str | None = None,
 ) -> tuple[Store, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
     """Run the real reconcile for ``statement``'s day against a capturing view
     of ``backend``. Returns that view (holding the captured objects) and the
@@ -409,11 +430,28 @@ def backfill_day(
     several days and then the month's close can run in ONE capture and see
     each other's writes (:func:`rehearse_close`). Wrapping it again would not:
     `crucible.store.capturing` starts a fresh overlay over the same backend,
-    so the inner capture's writes are invisible to the outer one."""
+    so the inner capture's writes are invisible to the outer one.
+
+    ``book`` posts the day into a declared prior-period book. Without it, a
+    day dated before a stored live journal is refused here: the live book is
+    never inserted behind (owner decision, `alpha-engine-config-I13232`)."""
     day = statement.trading_day
     if backend.exists(trader_reconciliation_key(day)):
         raise BackfillRefused(
             f"{trader_reconciliation_key(day)} already exists: {day} is not a missing day"
+        )
+    book_root(book)  # an undeclared book is refused before anything runs
+    prefix = journal_prefix(PAPER_FUND_TENANT)
+    if book is None and (
+        later := sorted(
+            d
+            for k in backend.list_keys(prefix)
+            if k.endswith(".json") and (d := k[len(prefix) : -len(".json")]) > day
+        )
+    ):
+        raise BackfillRefused(
+            f"the live book already holds {later[0]}; {day} is never inserted behind it -- "
+            f"backfill it into its prior-period book (--book {PRIOR_PERIOD_BOOK})"
         )
     shared = capture_ledger_of(backend)
     view = backend if shared is not None else capturing(backend)
@@ -430,6 +468,7 @@ def backfill_day(
             if corporate_actions is not None
             else live_corporate_action_source(),
             run_mode="replay",
+            **({} if book is None else {"ledger_book": book}),
         )
     except Exception as exc:  # noqa: BLE001 - a paging day is an outcome, not a crash
         outcome, error = "failed", f"{type(exc).__name__}: {exc}"
@@ -438,6 +477,7 @@ def backfill_day(
     keys = list(dict.fromkeys(w.key for w in writes))
     summary: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]
         "schema_version": SUMMARY_SCHEMA_VERSION,
+        "book": book,
         "trading_day": day,
         "account": statement.account,
         "positions": len(statement.positions),
@@ -455,10 +495,10 @@ def backfill_day(
         # the ledger verified it byte for byte before writing the view
         # (`ledger.post_daily_ledger`), so the view stands for both (codex 40108050).
         "has_ledger": (
-            journal_key(PAPER_FUND_TENANT, day) in keys
-            or view.exists(journal_key(PAPER_FUND_TENANT, day))
+            journal_key(PAPER_FUND_TENANT, day, book) in keys
+            or view.exists(journal_key(PAPER_FUND_TENANT, day, book))
         )
-        and ledger_reconciliation_key(PAPER_FUND_TENANT, day) in keys,
+        and ledger_reconciliation_key(PAPER_FUND_TENANT, day, book) in keys,
     }
     return view, summary
 
@@ -471,6 +511,7 @@ def rehearse_close(
     now: str,
     fills: Mapping[str, Sequence[Fill]] | None = None,
     corporate_actions: Any = None,  # pyright: ignore[reportExplicitAny]
+    book: str | None = None,
 ) -> tuple[Store, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
     """Backfill every statement's day and run the month's back-office dry run,
     all in one capture of ``backend``. This is the proof the close needs
@@ -481,7 +522,11 @@ def rehearse_close(
     Each day is backfilled in date order BETWEEN the stored days the dry run
     books, not all first: its reconcile posts the day's journal, and a stored
     earlier day with no journal yet would then be refused as inserted behind
-    it (codex d411bf68)."""
+    it (codex d411bf68).
+
+    ``book``: the declared prior-period book every day and the close post into;
+    the summary's ``close.bridge`` then itemises the bridge into the live
+    book's opening for the book's last month."""
     twice = sorted(
         {
             s.trading_day
@@ -506,6 +551,7 @@ def rehearse_close(
                     statement,
                     fills=by_day.get(statement.trading_day, ()),
                     corporate_actions=corporate_actions,
+                    book=book,
                 )[1]
             )
 
@@ -517,12 +563,29 @@ def rehearse_close(
         now=now,
         fills=by_day,
         backfill={s.trading_day: backfill(s) for s in statements},
+        book=book,
     )
     summary["backfill"] = days
     return view, summary
 
 
 # -- 3. the apply -----------------------------------------------------------------
+
+
+def unbooked_earlier_days(backend: Store, day: str, book: str) -> list[str]:
+    """Days of ``day``'s month before it that have a stored reconciliation and
+    no journal in ``book``. Applying ``day`` alone into the book ahead of them
+    would leave them unbookable forever: the book refuses a day inserted behind
+    a later journal. Such a book is applied whole, from the rehearsal
+    (``--close``), in date order."""
+    return sorted(
+        d
+        for k in backend.list_keys(RECONCILIATION_PREFIX)
+        if k.endswith(".json")
+        and (d := k.removeprefix(RECONCILIATION_PREFIX).removesuffix(".json"))[:7] == day[:7]
+        and d < day
+        and not backend.exists(journal_key(PAPER_FUND_TENANT, d, book))
+    )
 
 
 def _in_window(now: dt.datetime) -> bool:
@@ -664,6 +727,11 @@ def main(
     )
     parser.add_argument("--out", default=None, type=pathlib.Path, help="local directory")
     parser.add_argument("--now", default=None, help="stamp for every close record")
+    parser.add_argument(
+        "--book",
+        default=None,
+        help=f"a declared prior-period book to post into (e.g. {PRIOR_PERIOD_BOOK}; default: live)",
+    )
     args = parser.parse_args(argv)
     days = cast("list[str]", args.day)
     paths = cast("list[pathlib.Path]", args.statement)
@@ -678,9 +746,16 @@ def main(
         statement = parse_statement(paths[0].read_text(encoding="utf-8"), trading_day=day)
         fills = load_fills(cast("pathlib.Path | None", args.fills)).get(day, [])
         backend = opener(cast("str | None", args.store))
-        view, summary = backfill_day(backend, statement, fills=fills)
+        view, summary = backfill_day(
+            backend, statement, fills=fills, book=cast("str | None", args.book)
+        )
         summary["mode"] = "apply" if args.apply else "dry-run"
         if args.apply:
+            if args.book is not None and (behind := unbooked_earlier_days(backend, day, args.book)):
+                raise BackfillRefused(
+                    f"the {args.book} book has no journal yet for {behind}; {day} applied ahead "
+                    "of them would leave them unbookable -- apply the book whole, in date order"
+                )
             summary["written"] = apply_writes(backend, view, summary, now=clock())
     except (BackfillRefused, BrokerStatementError, OSError, ValueError) as exc:
         sys.stderr.write(f"NO-GO: {exc}\n")
@@ -723,7 +798,12 @@ def _rehearse(
         ]
         fills = load_fills(cast("pathlib.Path | None", args.fills))
         view, summary = rehearse_close(
-            opener(cast("str | None", args.store)), statements, month=month, now=now, fills=fills
+            opener(cast("str | None", args.store)),
+            statements,
+            month=month,
+            now=now,
+            fills=fills,
+            book=cast("str | None", args.book),
         )
     except (BackfillRefused, BrokerStatementError, OSError, ValueError) as exc:
         sys.stderr.write(f"NO-GO: {exc}\n")
@@ -734,10 +814,22 @@ def _rehearse(
     missing = [
         e for e in (close or {}).get("exceptions", []) if e["class"] == "close_input_missing"
     ]
+    bridge = cast("Mapping[str, Any] | None", (close or {}).get("bridge"))  # pyright: ignore[reportExplicitAny]
     sys.stderr.write(
         f"{month}: backfilled {', '.join(sorted(days))} (dry run); "
         f"close {close['status'] if close else 'not attempted'}, "
-        f"{len(missing)} close_input_missing line(s); wrote {out}\n"
+        f"{len(missing)} close_input_missing line(s)"
+        + (
+            ""
+            if bridge is None
+            else "; bridge to the live opening "
+            + (
+                "ties"
+                if bridge["ties"]
+                else f"does NOT tie ({len(bridge['differences'])} difference(s))"
+            )
+        )
+        + f"; wrote {out}\n"
     )
     return 0
 

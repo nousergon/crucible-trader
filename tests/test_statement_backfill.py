@@ -797,3 +797,98 @@ class TestRehearseInDateOrder:
                 now="2026-11-03T05:30:00Z",
                 corporate_actions=CA,
             )
+
+
+# -- the prior-period book (owner decision 2026-11-12 on aec#13232) ----------------
+
+BOOK = "pre-v2"
+
+
+class TestPriorPeriodBook:
+    """A day before the live book opened is posted into its declared
+    prior-period book, never behind the live book's journals."""
+
+    def test_a_day_behind_the_live_book_is_refused_naming_the_book(self, root):
+        LocalStore(root).put_bytes(journal_key("nous-ergon-paper", "2026-11-03"), b"{}")
+        with pytest.raises(BackfillRefused, match="--book pre-v2"):
+            backfill_day(LocalStore(root), _statement(), corporate_actions=CA)
+
+    def test_the_day_posts_into_the_book_and_applies_there(self, root):
+        backend = LocalStore(root)
+        backend.put_bytes(journal_key("nous-ergon-paper", "2026-11-03"), b"{}")
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA, book=BOOK)
+        assert summary["book"] == BOOK and summary["has_ledger"], summary
+        keys = summary["keys_to_write"]
+        assert journal_key("nous-ergon-paper", DAY, BOOK) in keys
+        assert f"trader/ledger/books/{BOOK}/reconciliation/nous-ergon-paper/{DAY}.json" in keys
+        assert not [k for k in keys if k.startswith("trader/ledger/journal/")]
+        apply_writes(backend, view, summary, now=OUTSIDE)
+        assert backend.exists(journal_key("nous-ergon-paper", DAY, BOOK))
+        assert not backend.exists(journal_key("nous-ergon-paper", DAY))
+        assert backend.get_bytes(journal_key("nous-ergon-paper", "2026-11-03")) == b"{}"
+
+    def test_the_rehearsal_books_and_closes_the_month_in_the_book(self, gap_root):
+        live = journal_key("nous-ergon-paper", "2026-11-03")
+        LocalStore(gap_root).put_bytes(live, b"{}")
+        before = snapshot(gap_root)
+        view, summary = statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [_statement()],
+            month="2026-09",
+            now="2026-11-03T05:30:00Z",
+            corporate_actions=CA,
+            book=BOOK,
+        )
+        assert snapshot(gap_root) == before
+        assert summary["book"] == BOOK and summary["backfill"][0]["has_ledger"]
+        written = summary["keys_written"]
+        assert {journal_key("nous-ergon-paper", d, BOOK) for d in (DAY, LATER)} <= set(written)
+        assert not [
+            k for k in written if k.startswith(("trader/ledger/journal/", "trader/ledger/close/"))
+        ]
+        assert any(k.startswith(f"trader/ledger/books/{BOOK}/close/") for k in written)
+        rows = {row["trading_day"]: row["status"] for row in summary["ledger"]}
+        assert rows[DAY] == "OK"  # LATER books too; it lacks only a settled close, as live
+        assert "already exist" not in str(summary["ledger"])
+        assert view.get_bytes(live) == b"{}"
+
+    def test_cli_rehearsal_reports_the_bridge_for_the_books_last_month(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        from crucible_trader import ledger
+
+        monkeypatch.setattr(ledger, "PRIOR_PERIOD_BOOKS", {BOOK: "2026-09"})
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        out = tmp_path / "out"
+        args = ["--store", str(gap_root), "--day", DAY, "--statement", str(stmt), "--book", BOOK]
+        assert main([*args, "--close", "2026-09", "--out", str(out), "--now", NOW_STAMP]) == 0
+        err = capsys.readouterr().err
+        assert "bridge to the live opening does NOT tie" in err
+        summary = json.loads((out / "summary.json").read_text())
+        assert summary["close"]["bridge"]["ties"] is False
+        assert "close_input_missing" in {e["class"] for e in summary["close"]["exceptions"]}
+
+    def test_a_single_day_apply_ahead_of_unbooked_days_is_refused(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        day = "2026-09-11"
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1", period="September 11, 2026"), encoding="utf-8")
+        args = ["--store", str(gap_root), "--day", day, "--statement", str(stmt), "--book", BOOK]
+        before = snapshot(gap_root)
+        assert main([*args, "--apply"], clock=lambda: OUTSIDE) == 1
+        assert f"no journal yet for ['{LATER}']" in capsys.readouterr().err
+        assert snapshot(gap_root) == before
+
+    def test_an_undeclared_book_is_a_no_go(self, root, tmp_path, capsys):
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        args = ["--store", str(root), "--day", DAY, "--statement", str(stmt), "--book", "x"]
+        assert main(args) == 1
+        assert "not a declared prior-period book" in capsys.readouterr().err
+
+
+NOW_STAMP = "2026-11-03T05:30:00Z"
