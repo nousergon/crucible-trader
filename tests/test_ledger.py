@@ -21,6 +21,7 @@ from crucible_trader.ledger import (
     CASH,
     CASH_ROUNDING,
     COMMISSIONS,
+    REALIZED_GAINS,
     RECONCILIATION_ADJUSTMENTS,
     SECURITIES,
     SHARE_ADJUSTMENTS,
@@ -100,6 +101,70 @@ def buy(ticker, shares, price, commission, exec_id):
     return Fill(
         ticker, shares, -shares * price - commission, commission_usd=commission, exec_id=exec_id
     )
+
+
+def sell(ticker, shares, price, commission, exec_id, realized_net=None):
+    """A sale of ``shares`` (positive count) as IB reports it: ``realized_net``
+    is the commission report's ``realizedPNL``, net of the commission."""
+    return Fill(
+        ticker,
+        -shares,
+        shares * price - commission,
+        commission_usd=commission,
+        exec_id=exec_id,
+        realized_pnl_usd=realized_net,
+    )
+
+
+class TestRealizedGainOnEachSale:
+    """Brian 2026-11-13: the realized gain or loss on every sale is tracked."""
+
+    def test_a_sale_relieves_ib_cost_and_books_the_gain_in_the_same_entry(self):
+        anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
+        # Sell 4 @ 25.00, commission 1.00; IB: cost 80.00, realizedPNL net 19.00.
+        broker = stmt(DAY, {"AAA": 6}, 1_099.00)
+        fill = sell("AAA", 4, 25.0, 1.0, "s1", realized_net=19.0)
+        ledger = Ledger()
+        posting = book_day(ledger, day_inputs(broker, anchor, (fill,)))
+        sale = posting.entries[1]
+        assert sale.kind == "fill"
+        assert sale.postings == (
+            Posting(CASH, 10_000),
+            Posting(SECURITIES + "AAA", -8_000, -4),
+            Posting(REALIZED_GAINS + "AAA", -2_000),
+        )
+        assert sale.evidence["realized_cents"] == 2_000
+        assert sale.evidence["ib_realized_pnl_net_cents"] == 1_900
+        assert [e.kind for e in posting.entries][2] == "commission"
+        assert ledger.trial_balance() == 0 and posting.document["clean"] is True
+        assert posting.document["realized_gains_today_cents"] == {"AAA": 2_000}
+        assert posting.document["realized_gains_cents"] == {"AAA": 2_000}
+
+    def test_a_loss_is_a_negative_figure(self):
+        anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
+        broker = stmt(DAY, {"AAA": 9}, 1_009.00)
+        fill = sell("AAA", 1, 10.0, 1.0, "s1", realized_net=-6.0)  # cost 15.00
+        posting = book_day(Ledger(), day_inputs(broker, anchor, (fill,)))
+        assert posting.entries[1].postings[1] == Posting(SECURITIES + "AAA", -1_500, -1)
+        assert posting.document["realized_gains_today_cents"] == {"AAA": -500}
+
+    def test_a_sale_ib_states_no_realized_figure_for_is_booked_at_proceeds_and_says_so(self):
+        anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
+        broker = stmt(DAY, {"AAA": 6}, 1_099.00)
+        posting = book_day(Ledger(), day_inputs(broker, anchor, (sell("AAA", 4, 25.0, 1.0, "s1"),)))
+        sale = posting.entries[1]
+        assert len(sale.postings) == 2
+        assert sale.evidence["realized"] == "not stated by IB for this sale"
+        assert posting.document["realized_gains_today_cents"] == {}
+
+    def test_a_buy_books_no_realized_figure(self):
+        anchor = stmt(PREV, {"AAA": 10}, 1_000.00)
+        broker = stmt(DAY, {"AAA": 12}, 799.0)
+        fill = Fill("AAA", 2, -201.0, commission_usd=1.0, exec_id="b1", realized_pnl_usd=0.0)
+        posting = book_day(Ledger(), day_inputs(broker, anchor, (fill,)))
+        assert (
+            len(posting.entries[1].postings) == 2 and "realized" not in posting.entries[1].evidence
+        )
 
 
 class TestBalancedByConstruction:
