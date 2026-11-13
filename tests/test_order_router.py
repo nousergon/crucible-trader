@@ -1232,3 +1232,12 @@ def test_no_usable_band_bands_nothing(band) -> None:
 
 def test_a_book_without_an_optimizer_record_bands_nothing() -> None:
     assert _orders(_plan(_book({"AAA": 0.299}), positions={"AAA": 300})) == {"AAA": ("sell", 1)}
+
+
+def test_the_share_basis_carries_the_broker_cost_the_session_read(store) -> None:
+    ib = RoutingIB(positions={"BBB": 500, "CCC": 100})
+    router = _router(store, ib)
+    router._avg_costs = {"BBB": 40.0}  # as `hard_risk_facts` leaves it  # noqa: SLF001
+    list(router.batches(_book()))
+    basis = router.share_basis()
+    assert basis is not None and basis.avg_costs == {"BBB": 40.0}

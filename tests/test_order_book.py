@@ -503,3 +503,20 @@ def test_a_resize_the_plan_left_inside_the_band_reads_as_the_shares_held() -> No
         )
         == 5
     )
+
+
+def test_a_held_row_carries_the_broker_average_cost() -> None:
+    basis = ShareBasis(
+        positions={"AAA": 500, "BBB": 100},
+        prices={"AAA": 110.0, "BBB": 50.0, "CCC": 33.0},
+        avg_costs={"AAA": 95.5, "BBB": 60.0, "CCC": 1.0},
+    )
+    doc = order_book_document(
+        _book(),
+        previous_weights={"AAA": 0.55, "BBB": 0.05},
+        written_at_utc="t",
+        shares=basis,
+    )
+    costs = {r["ticker"]: r["avg_cost_usd"] for r in doc["rows"]}
+    # CCC is not held, so it has no cost basis whatever the map says.
+    assert costs == {"AAA": 95.5, "BBB": 60.0, "CCC": None, "DDD": None, "SPY": None, "$CASH": None}

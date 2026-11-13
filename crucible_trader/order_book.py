@@ -41,6 +41,9 @@ and cash sentinels included and labelled, with:
   ``previous_shares``, and that times ``share_price_usd``. ``null`` wherever
   either side (or the price, for the notional) is ``null``.
   ``weight_change_pct`` is ``weight_change`` in percent.
+* ``avg_cost_usd`` -- the broker's average cost per share of the shares held
+  into the session (IB ``avgCost``), what a sale realizes against; ``null`` for
+  a name not held, on a session that read no broker, and on the sentinels.
 
 **Never raises into the session.** A book that cannot be written must not
 stop the day's orders -- a no-trade day is a worse outcome than a missing
@@ -57,7 +60,7 @@ import json
 import logging
 import math
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -132,6 +135,9 @@ class ShareBasis:
     #: The engine's no-trade band in dollars the plan applied
     #: (`order_router._rebalance_band_usd`); 0 when it applied none.
     band_usd: float = 0.0
+    #: The broker's average cost per share held into the session (IB
+    #: ``avgCost``, read for the hard-risk layer); empty when not read.
+    avg_costs: Mapping[str, float] = field(default_factory=lambda: dict[str, float]())
 
     def target_shares(self, symbol: str, weight: float, notional_usd: float) -> int | None:
         """``floor(weight * notional / price)``, as the plan sizes it; None unpriced.
@@ -269,6 +275,7 @@ def order_book_document(
             else basis.target_shares(ticker, target, book.portfolio_notional_usd)
         )
         price = None if basis is None else basis.prices.get(ticker)
+        avg_cost = None if basis is None or not held_shares else basis.avg_costs.get(ticker)
         trade_shares = (
             None if held_shares is None or book_shares is None else book_shares - held_shares
         )
@@ -312,6 +319,9 @@ def order_book_document(
                     if trade_shares is None or price is None
                     else round(trade_shares * price, 2)
                 ),
+                # The broker's average cost of the shares held into the session:
+                # what a sale today realizes its gain or loss against.
+                "avg_cost_usd": avg_cost,
             }
         )
     rows.sort(key=lambda r: (-r["target_weight"], r["alpha_rank"] or 10**9, r["ticker"]))

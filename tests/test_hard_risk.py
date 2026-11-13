@@ -330,6 +330,8 @@ def test_the_paper_router_reads_facts_through_its_own_quote(tmp_path) -> None:
     assert facts.nav_usd == pytest.approx(180.0)
     assert daily_session._hard_risk_facts(router) == facts  # noqa: SLF001
     assert daily_session._hard_risk_facts(object()) is None  # noqa: SLF001
+    # The costs it read are what the order book's cost column carries.
+    assert router._avg_costs == {"AAA": 10.0}  # noqa: SLF001
 
 
 # ── the session files the record and enforces precedence ────────────────
