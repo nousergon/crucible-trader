@@ -473,3 +473,16 @@ def test_a_value_that_will_not_serialise_is_dropped_not_fatal() -> None:
 def test_a_book_without_an_optimizer_block_writes_null() -> None:
     doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
     assert doc["optimizer"] is None
+
+
+def test_the_book_carries_reader_facing_percentages_and_an_exchange_clock_build_time() -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc="2026-11-13T14:32:14Z")
+    assert doc["built_at_et"] == "2026-11-13 09:32 ET"
+    assert doc["summary"]["cash_weight_pct"] == round(doc["summary"]["cash_weight"] * 100, 3)
+    assert doc["turnover_one_way_pct"] == round(doc["turnover_one_way_ratio"] * 100, 3)
+
+
+@pytest.mark.parametrize("stamp", ["t", "2026-11-13T14:32:14"])
+def test_an_unreadable_or_zoneless_build_time_reads_null(stamp) -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc=stamp)
+    assert doc["built_at_et"] is None

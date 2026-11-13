@@ -59,6 +59,7 @@ import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.features.compute import read_features
@@ -112,6 +113,9 @@ SECTOR_LABEL_COLUMN = "sector_raw"
 #: test), so a row's ``target_shares`` is the target the plan sized against.
 _SHARE_EPSILON = 1e-6
 
+#: The exchange's clock, for the reader-facing build time.
+_ET = ZoneInfo("America/New_York")
+
 
 @dataclass(frozen=True)
 class ShareBasis:
@@ -161,6 +165,17 @@ def sector_labels(
         if name in wanted and isinstance(label, str) and label.strip():
             labels[name] = label.strip()
     return labels, key
+
+
+def _as_et(stamp: str) -> str | None:
+    """``2026-11-13T14:32:14Z`` as ``2026-11-13 09:32 ET``; None when unparseable."""
+    try:
+        instant = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if instant.tzinfo is None:
+        return None
+    return instant.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET")
 
 
 def order_book_key(trading_day: str) -> str:
@@ -309,6 +324,9 @@ def order_book_document(
         "session_inputs_key": book.session_inputs_key,
         "previous_book": "given" if previous_weights is not None else "all_cash",
         "written_at_utc": written_at_utc,
+        # The same instant on the exchange's clock, for a reader (the console).
+        "built_at_et": _as_et(written_at_utc),
+        "turnover_one_way_pct": round(book.turnover_one_way_ratio * 100.0, 3),
         # What the optimizer solved and under which settings
         # (`construction.optimizer_record`); None from a book that has none.
         "optimizer": getattr(book, "optimizer", None),
@@ -322,6 +340,7 @@ def order_book_document(
                 1 for r in rows if r["target_weight"] > _ZERO and r["action"] != "cash"
             ),
             "cash_weight": float(book.weights.get(cash, 0.0)),
+            "cash_weight_pct": round(float(book.weights.get(cash, 0.0)) * 100.0, 3),
             "actions": dict(sorted(counts.items())),
         },
         "rows": rows,
