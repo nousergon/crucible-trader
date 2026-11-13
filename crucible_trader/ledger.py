@@ -186,6 +186,12 @@ INTEREST_FIRST_RECORDED = "income:interest_first_recorded"
 #: Where a decided share gap's suspense goes: the securities account already
 #: holds IB's count, so the offsetting shares leave suspense to here.
 SHARE_ADJUSTMENTS = "equity:share_adjustments:"
+#: A sale's realized gain (credit, so negative) or loss (debit, positive), per
+#: instrument, BEFORE commission (the commission is its own entry), at IB's own
+#: figure: the commission report's ``realizedPNL`` plus that commission. The
+#: securities account is relieved at the cost IB used, so proceeds less cost is
+#: exactly this posting (Brian 2026-11-13: track the gain or loss on each sale).
+REALIZED_GAINS = "income:realized_gains:"
 #: Where a cash difference inside the 5-cent band goes (Brian 2026-10-28: "round
 #: to the IB reporting"): a NAMED plug (policy Rule 2), its balance reported.
 CASH_ROUNDING = "income:cash_rounded_to_broker"
@@ -207,7 +213,14 @@ _FIXED_ACCOUNTS = frozenset(
 #: for review up to the second; a gap that pages above it.
 CASH_ROUNDING_BAND_CENTS = round(CASH_TOLERANCE_USD * 100)
 CASH_PAGE_THRESHOLD_CENTS = round(CASH_PAGE_THRESHOLD_USD * 100)
-_PER_INSTRUMENT = (SECURITIES, RECEIVABLE, DIVIDEND_INCOME, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
+_PER_INSTRUMENT = (
+    SECURITIES,
+    RECEIVABLE,
+    DIVIDEND_INCOME,
+    SUSPENSE_POSITION,
+    SHARE_ADJUSTMENTS,
+    REALIZED_GAINS,
+)
 #: Only these accounts hold shares.
 _QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
 
@@ -254,6 +267,15 @@ def to_cents(usd: float | Decimal | str) -> int:
     if not value.is_finite():
         raise LedgerError(f"amount {usd!r} is not finite")
     return int((value * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def _realized_cents(fill: Fill) -> int | None:
+    """A sale's realized gain (positive) or loss before commission, in cents,
+    from IB's net ``realizedPNL`` plus the commission it netted; None for a buy,
+    or when IB states no realized figure or no commission."""
+    if fill.shares >= 0 or fill.realized_pnl_usd is None or fill.commission_usd is None:
+        return None
+    return to_cents(Decimal(repr(fill.realized_pnl_usd)) + Decimal(repr(fill.commission_usd)))
 
 
 def _valid_account(name: str) -> bool:
@@ -532,15 +554,35 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
                 Decimal(repr(fill.cash_usd)) + Decimal(repr(fill.commission_usd))
             )
             separated = True
+        realized = _realized_cents(fill)
+        if realized is None:
+            postings = [
+                Posting(CASH, consideration),
+                Posting(SECURITIES + fill.ticker, -consideration, fill.shares),
+            ]
+            evidence: dict[str, object] = (
+                {"realized": "not stated by IB for this sale"} if fill.shares < 0 else {}
+            )
+        else:
+            # One entry per sale (Rule 4): cash at proceeds, the holding
+            # relieved at IB's cost, the difference to realized gains.
+            postings = [
+                Posting(CASH, consideration),
+                Posting(SECURITIES + fill.ticker, -(consideration - realized), fill.shares),
+                Posting(REALIZED_GAINS + fill.ticker, -realized),
+            ]
+            evidence = {
+                "realized_source": "ib_commission_report.realizedPNL + commission",
+                "realized_cents": realized,
+                "ib_realized_pnl_net_cents": to_cents(fill.realized_pnl_usd),  # pyright: ignore[reportArgumentType]
+            }
         book(
             "fill",
             ref,
-            [
-                Posting(CASH, consideration),
-                Posting(SECURITIES + fill.ticker, -consideration, fill.shares),
-            ],
+            postings,
             source="ib_execution",
             commission_separated=separated,
+            **evidence,
         )
         if fill.commission_usd is not None and (commission := to_cents(fill.commission_usd)):
             book(
@@ -648,6 +690,13 @@ def book_day(ledger: Ledger, inputs: DayInputs) -> DayPosting:
         "broker_accrued_interest_cents": (
             None if broker.accrued_cash_usd is None else to_cents(broker.accrued_cash_usd)
         ),
+        # Per instrument, a gain positive and a loss negative (the account
+        # holds the credit), before commission: today's sales and to date.
+        "realized_gains_today_cents": _realized_today(new),
+        "realized_gains_cents": {
+            name[len(REALIZED_GAINS) :]: -c
+            for name, c in sorted(ledger.balances(tenant, account, REALIZED_GAINS).items())
+        },
         "cleared_today": cleared,
         "clean": clean,
         "known_deltas": [
@@ -753,6 +802,16 @@ def _book_interest(
             source="ib_statement",
             accrued_cents=target,
         )
+
+
+def _realized_today(entries: Sequence[Entry]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for entry in entries:
+        for p in entry.postings:
+            if p.account.startswith(REALIZED_GAINS):
+                ticker = p.account[len(REALIZED_GAINS) :]
+                out[ticker] = out.get(ticker, 0) - p.amount_cents
+    return dict(sorted(out.items()))
 
 
 def _rows(value: object) -> list[Mapping[str, object]]:

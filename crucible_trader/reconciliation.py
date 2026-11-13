@@ -143,6 +143,11 @@ class Fill:
     cash_usd: float
     commission_usd: float | None = dataclasses.field(default=None, compare=False)
     exec_id: str | None = dataclasses.field(default=None, compare=False)
+    #: IB's own realized gain or loss on this execution, NET of its commission
+    #: (the commission report's ``realizedPNL``), carried for the ledger, which
+    #: books a sale's realized result from it. None when IB states none (an
+    #: opening buy carries IB's unset sentinel). Not part of equality.
+    realized_pnl_usd: float | None = dataclasses.field(default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)

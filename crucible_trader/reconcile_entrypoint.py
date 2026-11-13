@@ -116,6 +116,7 @@ class _Execution(Protocol):
 class _CommissionReport(Protocol):
     execId: str  # noqa: N815 - SDK spelling
     commission: float | None
+    realizedPNL: float | None  # noqa: N815 - SDK spelling
 
 
 class _IbFill(Protocol):  # the subset of `ib_async.Fill` read here
@@ -153,14 +154,31 @@ def _commission(report: _CommissionReport | None, exec_id: str) -> float | None:
     return value
 
 
-def _store_commissions(client: _FillReader, exec_ids: set[str]) -> dict[str, float]:
-    found: dict[str, float] = {}
+def _realized(report: _CommissionReport | None, exec_id: str) -> float | None:
+    """IB's realized P&L (net of commission) on execution ``exec_id``, from the
+    report attached to it, or None when IB states none: an opening trade carries
+    the unset sentinel, and a report for another execution says nothing."""
+    if report is None or getattr(report, "execId", None) != exec_id:
+        return None
+    value = getattr(report, "realizedPNL", None)
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or abs(value) >= _UNSET_DOUBLE:
+        return None
+    return value
+
+
+def _store_commissions(
+    client: _FillReader, exec_ids: set[str]
+) -> dict[str, tuple[float, float | None]]:
+    found: dict[str, tuple[float, float | None]] = {}
     for record in client.fills():
         exec_id = record.execution.execId
         if exec_id in exec_ids:
             value = _commission(record.commissionReport, exec_id)
             if value is not None:
-                found[exec_id] = value
+                found[exec_id] = (value, _realized(record.commissionReport, exec_id))
     return found
 
 
@@ -202,7 +220,7 @@ def fills_from_ib(
         executions.setdefault(execution.execId, record)
 
     commissions = {
-        exec_id: value
+        exec_id: (value, _realized(record.commissionReport, exec_id))
         for exec_id, record in executions.items()
         if (value := _commission(record.commissionReport, exec_id)) is not None
     }
@@ -220,13 +238,14 @@ def fills_from_ib(
     fills: list[Fill] = []
     for exec_id, record in executions.items():
         execution = record.execution
-        commission = commissions.get(exec_id)
-        if commission is None:
+        reported = commissions.get(exec_id)
+        if reported is None:
             raise MissingCommissionReportError(
                 f"{record.contract.symbol!r} fill {exec_id!r} at {execution.time} has no "
                 f"commission report of its own after {waited:g}s; a fill cannot be costed "
                 "without one"
             )
+        commission, realized = reported
         sign = _SIDE_SIGN[execution.side]
         # `execution.price`, never `execution.avgPrice`: IB's `avgPrice` is the
         # ORDER's cumulative average up to this execution (it travels with
@@ -244,6 +263,7 @@ def fills_from_ib(
                 cash_usd=-sign * notional - commission,
                 commission_usd=commission,
                 exec_id=exec_id,
+                realized_pnl_usd=realized,
             )
         )
     return tuple(fills)
