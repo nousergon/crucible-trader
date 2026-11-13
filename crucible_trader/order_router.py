@@ -151,7 +151,7 @@ import math
 import os
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from crucible.slots.strategy import CASH_TICKER
 from crucible.store import Store
@@ -218,6 +218,7 @@ __all__ = [
     "book_cash",
     "build_router",
     "held_weights",
+    "rebalance_band_usd",
     "is_staging",
     "open_paper_router",
     "plan_orders",
@@ -624,6 +625,26 @@ def held_weights(
     return weights
 
 
+def rebalance_band_usd(book: TargetBook) -> float:
+    """The engine's no-trade band in dollars of the book notional, or 0 (no band).
+
+    Read from the settings the solve recorded (`TargetBook.optimizer`,
+    ``rebalance_band_pct``), so the router bands exactly what the engine
+    banded and never invents a threshold of its own. A book with no record, or
+    a null band, bands nothing.
+    """
+    record = book.optimizer
+    settings = record.get("settings") if record is not None else None
+    band = (
+        cast("dict[str, object]", settings).get("rebalance_band_pct")
+        if isinstance(settings, dict)
+        else None
+    )
+    if not isinstance(band, (int, float)) or isinstance(band, bool) or not band > 0:
+        return 0.0
+    return float(band) * book.portfolio_notional_usd
+
+
 def plan_orders(
     book: TargetBook,
     *,
@@ -661,6 +682,7 @@ def plan_orders(
             f"the book's tradable weights sum to {gross:.6f} > 1: gross exceeds the book notional"
         )
 
+    band_usd = rebalance_band_usd(book)
     planned = dict(weights)
     for symbol in set(positions) - set(weights):
         planned[symbol] = 0.0  # an inherited name, sold whole
@@ -687,6 +709,13 @@ def plan_orders(
         if delta == 0:
             continue
         notional = abs(delta) * price
+        if held > 0 and target > 0 and notional < band_usd:
+            # A resize of a name held on both sides that is inside the
+            # engine's own no-trade band. The band already held this weight;
+            # what is left is the share floor moving with the quote between
+            # valuing the book and sizing it (2026-11-13: NVDA 974 -> 973, a
+            # $160 sell). Entries and exits are never banded, as in the engine.
+            continue
         if notional > max_order_notional_usd:
             # Clipped to the cap, not refused: the cap bounds one order, and an
             # order cut to it trades less than the book asks, never more. The
@@ -1172,7 +1201,11 @@ class PaperOrderRouter:
         )
         # For the order book's share columns only (`order_book.ShareBasis`):
         # the positions and the memoised prices the plan above was sized at.
-        self._share_basis = ShareBasis(positions=dict(statement.positions), prices=quote.priced())
+        self._share_basis = ShareBasis(
+            positions=dict(statement.positions),
+            prices=quote.priced(),
+            band_usd=rebalance_band_usd(book),
+        )
         gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:
             sells, buys, gapped = self._gap_stop(statement.positions, sells, buys)
