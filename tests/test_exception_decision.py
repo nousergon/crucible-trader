@@ -420,6 +420,38 @@ class TestQueueEvidence:
             {"role": "manifest", "record": f"runs/trader.reconcile/{DAY}/run.json"},
         ]
 
+    def test_a_queue_item_reads_in_plain_words_with_no_code_standing_for_a_sentence(self):
+        """Brian 2026-11-12: the console's queue must be decidable from the row."""
+        record = dict(
+            exception_record(),
+            **{"class": "cash_delta", "detail": "broker cash differs from our books"},
+        )
+        (item,) = score(
+            [proposal(klass="cash_delta", nature="defect")],
+            [],
+            as_of=DAY,
+            generated_at=AT,
+            exceptions={"exc-1": record},
+        )["queue"]
+        assert item["headline"] == "IB shows $107.69 more cash than our books expect"
+        assert (item["our_books"], item["broker_says"], item["difference"]) == (
+            "$1.00",
+            "$2.00",
+            "+$107.69",
+        )
+        assert item["what_checked"] == "broker cash differs from our books"
+        assert item["likely_cause"] == "A mistake on our side"
+        assert (
+            item["proposed_fix"]
+            == "Find the missing or wrong share entry before anything is booked."
+        )
+        assert item["why"] == "why"
+
+    def test_a_queue_item_with_no_record_still_has_a_headline_and_a_fix(self):
+        (item,) = score([proposal()], [], as_of=DAY, generated_at=AT)["queue"]
+        assert item["headline"] and item["proposed_fix"]
+        assert item["our_books"] is None and item["difference"] is None
+
     def test_no_record_or_another_tenants_record_cites_nothing(self):
         for exceptions in (None, {"exc-1": exception_record(tenant="someone-else")}):
             (item,) = score([proposal()], [], as_of=DAY, generated_at=AT, exceptions=exceptions)[
