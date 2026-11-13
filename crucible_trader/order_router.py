@@ -1138,6 +1138,7 @@ class PaperOrderRouter:
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
         self._share_basis: ShareBasis | None = None
+        self._avg_costs: dict[str, float] = {}
         self._records: list[ExecutionRecord] = []
         #: Placed orders not yet terminal when recorded: ``(record index, order,
         #: trade, submitted_at)``, re-read by :meth:`settle`.
@@ -1205,6 +1206,7 @@ class PaperOrderRouter:
             positions=dict(statement.positions),
             prices=quote.priced(),
             band_usd=rebalance_band_usd(book),
+            avg_costs=dict(self._avg_costs),
         )
         gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:
@@ -1932,7 +1934,13 @@ class PaperOrderRouter:
 
     def hard_risk_facts(self) -> BrokerFacts:
         """Average cost, mark and NAV for the hard-risk layer (`hard_risk.read_broker_facts`)."""
-        return read_broker_facts(self._client, trading_day=self._day, quote=self._quote)
+        facts = read_broker_facts(self._client, trading_day=self._day, quote=self._quote)
+        # Kept for the order book's cost column (`order_book.ShareBasis`): the
+        # broker's average cost held INTO the session, what a sale realizes against.
+        self._avg_costs = {
+            t: float(h.avg_cost) for t, h in facts.holdings.items() if h.avg_cost is not None
+        }
+        return facts
 
 
 def open_paper_router(

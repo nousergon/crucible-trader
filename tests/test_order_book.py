@@ -475,6 +475,19 @@ def test_a_book_without_an_optimizer_block_writes_null() -> None:
     assert doc["optimizer"] is None
 
 
+def test_the_book_carries_reader_facing_percentages_and_an_exchange_clock_build_time() -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc="2026-11-13T14:32:14Z")
+    assert doc["built_at_et"] == "2026-11-13 09:32 ET"
+    assert doc["summary"]["cash_weight_pct"] == round(doc["summary"]["cash_weight"] * 100, 3)
+    assert doc["turnover_one_way_pct"] == round(doc["turnover_one_way_ratio"] * 100, 3)
+
+
+@pytest.mark.parametrize("stamp", ["t", "2026-11-13T14:32:14"])
+def test_an_unreadable_or_zoneless_build_time_reads_null(stamp) -> None:
+    doc = order_book_document(_book(), previous_weights=None, written_at_utc=stamp)
+    assert doc["built_at_et"] is None
+
+
 def test_a_resize_the_plan_left_inside_the_band_reads_as_the_shares_held() -> None:
     basis = ShareBasis(
         positions={"AAA": 300, "BBB": 100}, prices={"AAA": 100.0, "BBB": 50.0}, band_usd=1_000.0
@@ -492,14 +505,18 @@ def test_a_resize_the_plan_left_inside_the_band_reads_as_the_shares_held() -> No
     )
 
 
-def test_the_book_carries_reader_facing_percentages_and_an_exchange_clock_build_time() -> None:
-    doc = order_book_document(_book(), previous_weights=None, written_at_utc="2026-11-13T14:32:14Z")
-    assert doc["built_at_et"] == "2026-11-13 09:32 ET"
-    assert doc["summary"]["cash_weight_pct"] == round(doc["summary"]["cash_weight"] * 100, 3)
-    assert doc["turnover_one_way_pct"] == round(doc["turnover_one_way_ratio"] * 100, 3)
-
-
-@pytest.mark.parametrize("stamp", ["t", "2026-11-13T14:32:14"])
-def test_an_unreadable_or_zoneless_build_time_reads_null(stamp) -> None:
-    doc = order_book_document(_book(), previous_weights=None, written_at_utc=stamp)
-    assert doc["built_at_et"] is None
+def test_a_held_row_carries_the_broker_average_cost() -> None:
+    basis = ShareBasis(
+        positions={"AAA": 500, "BBB": 100},
+        prices={"AAA": 110.0, "BBB": 50.0, "CCC": 33.0},
+        avg_costs={"AAA": 95.5, "BBB": 60.0, "CCC": 1.0},
+    )
+    doc = order_book_document(
+        _book(),
+        previous_weights={"AAA": 0.55, "BBB": 0.05},
+        written_at_utc="t",
+        shares=basis,
+    )
+    costs = {r["ticker"]: r["avg_cost_usd"] for r in doc["rows"]}
+    # CCC is not held, so it has no cost basis whatever the map says.
+    assert costs == {"AAA": 95.5, "BBB": 60.0, "CCC": None, "DDD": None, "SPY": None, "$CASH": None}
