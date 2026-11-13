@@ -100,6 +100,7 @@ from crucible_trader.broker_statement import (
     BrokerStatement,
     BrokerStatementError,
 )
+from crucible_trader.exception_proposal import close_proposals_key
 from crucible_trader.exception_record import PAPER_FUND_TENANT
 from crucible_trader.ledger import (
     PRIOR_PERIOD_BOOK,
@@ -729,15 +730,20 @@ def apply_book(
     What is applied: every journal and view the rehearsal posted into the book,
     each backfilled day's own cycle (``keys_to_write``, as :func:`apply_writes`
     applies one day), and the book's close records (an attempt, or the close,
-    its period lock and statement). What is NOT: the review-queue files the
-    dry run's own export, proposal and score steps rehearse -- the live job
-    files those -- and the live pointers.
+    its period lock and statement) with the close's proposals
+    (:func:`~crucible_trader.exception_proposal.close_proposals_key`): its
+    bridge and suspense lines wait in the shared review queue, which the live
+    job will never file for a prior-period book. What is NOT: the per-day
+    review-queue files the dry run's own export, proposal and score steps
+    rehearse -- the live job files those -- and the live pointers.
 
     Date ordered: day by day, each day's books before its reconciliation and
     its run-stamped records (:func:`_tiered`), and the close records last. So
     an apply stopped part-way leaves a book with no gap behind its newest
     journal, and a re-run (dropping the backfilled days it already applied,
-    which are no longer missing) skips what holds the same bytes. Create-only,
+    which are no longer missing; with none left, give no ``--day`` at all)
+    skips what holds the same bytes, given the same ``--now`` and fills.
+    Create-only,
     window-guarded and all-or-nothing up front, as :func:`apply_writes`: every
     refusal below is checked before the first write."""
     if book is None:
@@ -767,6 +773,9 @@ def apply_book(
     by_day: dict[str, list[str]] = {}
     for day in days:
         by_day.setdefault(str(day["trading_day"]), []).extend(day["keys_to_write"])
+    proposals = close_proposals_key(
+        PAPER_FUND_TENANT, str(summary["month"]), str(summary["close_run_day"])
+    )
     closing: list[str] = []
     for key in cast("list[str]", summary["keys_written"]):
         if key.startswith((f"{root}journal/", f"{root}reconciliation/")):
@@ -777,6 +786,8 @@ def apply_book(
     for day in sorted(by_day):
         order.extend(_tiered(list(dict.fromkeys(by_day[day])), day))
     order.extend(k for k in sorted(closing) if k not in order)
+    if proposals in cast("list[str]", summary["keys_written"]):
+        order.append(proposals)  # after the attempt it proposes for
     same = [k for k in order if backend.exists(k) and _same(backend, view, k)]
     existing = [k for k in order if k not in same and backend.exists(k)]
     if existing:
@@ -822,13 +833,12 @@ def main(
     parser.add_argument("--store", default=None, help="store URI (default: $CRUCIBLE_STORE)")
     parser.add_argument(
         "--day",
-        required=True,
         action="append",
-        help="YYYY-MM-DD, the missing trading day (repeat with --close, one per --statement)",
+        help="YYYY-MM-DD, the missing trading day (repeat with --close, one per --statement; "
+        "none with --close books only the stored days, e.g. to resume an apply)",
     )
     parser.add_argument(
         "--statement",
-        required=True,
         action="append",
         type=pathlib.Path,
         help="IB activity statement (Daily Activity CSV or Flex Activity XML), in --day order",
@@ -851,12 +861,14 @@ def main(
         help=f"a declared prior-period book to post into (e.g. {PRIOR_PERIOD_BOOK}; default: live)",
     )
     args = parser.parse_args(argv)
-    days = cast("list[str]", args.day)
-    paths = cast("list[pathlib.Path]", args.statement)
+    days = cast("list[str]", args.day or [])
+    paths = cast("list[pathlib.Path]", args.statement or [])
     if len(days) != len(paths):
         parser.error("give one --statement per --day")
     if args.close is not None:
         return _rehearse(parser, args, days, paths, opener, clock)
+    if not days:
+        parser.error("give the missing --day and its --statement (or --close a month)")
     if len(days) != 1:
         parser.error("more than one --day needs --close")
     day = days[0]
@@ -955,7 +967,7 @@ def _rehearse(
     ]
     bridge = cast("Mapping[str, Any] | None", (close or {}).get("bridge"))  # pyright: ignore[reportExplicitAny]
     sys.stderr.write(
-        f"{month}: backfilled {', '.join(sorted(days))} "
+        f"{month}: backfilled {', '.join(sorted(days)) or 'no day'} "
         + (f"(applied {len(summary['written'])} key(s)); " if args.apply else "(dry run); ")
         + f"close {close['status'] if close else 'not attempted'}, "
         + f"{len(missing)} close_input_missing line(s)"

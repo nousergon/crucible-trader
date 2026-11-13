@@ -1017,3 +1017,98 @@ class TestWholeBookApply:
         view, summary = self._rehearse(gap_root)
         with pytest.raises(BackfillRefused, match=message):
             statement_backfill.apply_book(LocalStore(gap_root), view, summary, book=book, now=now)
+
+
+class TestWholeBookResume:
+    """Codex re-review of crucible-trader#160: an apply stopped part-way is
+    finished by re-running it, with no --day once every missing day has its
+    reconciliation; and the book's close proposals reach the review queue."""
+
+    def _stop_at(self, backend, monkeypatch, target):
+        """The apply (not the rehearsal before it: the capturing view copies
+        the backend's attributes) meets a writer at ``target`` and stops."""
+        from crucible.store import PointerConflictError
+
+        real_apply, real_cas = statement_backfill.apply_book, backend.compare_and_swap
+
+        def cas(key, expected, payload):
+            if key == target:
+                raise PointerConflictError(key)
+            return real_cas(key, expected, payload)
+
+        def apply_book(*a, **k):
+            monkeypatch.setattr(backend, "compare_and_swap", cas)
+            try:
+                return real_apply(*a, **k)
+            finally:
+                monkeypatch.setattr(backend, "compare_and_swap", real_cas)
+                monkeypatch.setattr(statement_backfill, "apply_book", real_apply)
+
+        monkeypatch.setattr(statement_backfill, "apply_book", apply_book)
+
+    def _main(self, backend, tmp_path, *days):
+        args = ["--book", BOOK]
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        for day in days:
+            path = tmp_path / f"{day}.csv"
+            period = dt.date.fromisoformat(day).strftime("%B %-d, %Y")
+            path.write_text(csv_text(account="DU1", period=period), encoding="utf-8")
+            args += ["--day", day, "--statement", str(path)]
+        out = tmp_path / "out"
+        args += ["--close", "2026-09", "--out", str(out), "--now", NOW_STAMP, "--apply"]
+        code = main(args, opener=lambda _uri: backend, clock=lambda: OUTSIDE)
+        return code, out
+
+    ATTEMPT = f"trader/ledger/books/{BOOK}/close/nous-ergon-paper/2026-09/attempts/2026-10-01.json"
+
+    def test_resume_with_no_missing_day_left_finishes_the_close(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        backend = LocalStore(gap_root)
+        self._stop_at(backend, monkeypatch, self.ATTEMPT)
+        code, _ = self._main(backend, tmp_path / "first", DAY, SEP11)
+        assert code == 1 and "written during the apply" in capsys.readouterr().err
+        assert backend.exists(trader_reconciliation_key(SEP11))
+        assert not backend.exists(self.ATTEMPT)
+        code, _ = self._main(backend, tmp_path / "resume")
+        assert code == 0, capsys.readouterr().err
+        assert backend.exists(self.ATTEMPT)
+        for day in (DAY, LATER, SEP11):
+            assert backend.exists(journal_key("nous-ergon-paper", day, BOOK))
+
+    def test_resume_after_a_stop_between_days(self, gap_root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        backend = LocalStore(gap_root)
+        self._stop_at(backend, monkeypatch, journal_key("nous-ergon-paper", LATER, BOOK))
+        code, _ = self._main(backend, tmp_path / "first", DAY, SEP11)
+        assert code == 1
+        assert backend.exists(trader_reconciliation_key(DAY))
+        assert not backend.exists(journal_key("nous-ergon-paper", LATER, BOOK))
+        assert not backend.exists(trader_reconciliation_key(SEP11))
+        code, _ = self._main(backend, tmp_path / "resume", SEP11)  # DAY is no longer missing
+        assert code == 0, capsys.readouterr().err
+        for day in (DAY, LATER, SEP11):
+            assert backend.exists(journal_key("nous-ergon-paper", day, BOOK))
+        assert backend.exists(self.ATTEMPT)
+
+    def test_the_close_proposals_are_applied_with_the_close(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        from crucible_trader.exception_proposal import close_proposals_key
+
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        backend = LocalStore(gap_root)
+        code, out = self._main(backend, tmp_path, DAY, SEP11)
+        assert code == 0, capsys.readouterr().err
+        key = close_proposals_key("nous-ergon-paper", "2026-09", "2026-10-01")
+        applied = json.loads((out / "summary.json").read_text())["applied"]
+        assert key in applied and backend.exists(key)
+        assert applied.index(key) > applied.index(self.ATTEMPT)
+        assert json.loads(backend.get_bytes(key))["proposals"]
+
+
+def test_a_single_day_run_needs_its_day(root, capsys):
+    with pytest.raises(SystemExit):
+        main(["--store", str(root)])
+    assert "give the missing --day" in capsys.readouterr().err
