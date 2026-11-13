@@ -67,6 +67,7 @@ from crucible.store import (
     read_only,
 )
 
+from crucible_trader.exception_plain import plain_fields
 from crucible_trader.exception_proposal import (
     ACTIONS,
     NATURES,
@@ -572,6 +573,7 @@ def score(
                 "overdue": age > AGE_LIMIT_TRADING_DAYS,
                 "expires": _expires(cast("str", proposal["trading_day"])),
                 **_evidence(record),
+                **plain_fields(proposal, record),
             }
         )
     classes: list[dict[str, object]] = []
