@@ -992,6 +992,29 @@ class TestWholeBookApply:
         assert main(args, clock=lambda: OUTSIDE) == 2
         assert "NOT under WORM retention" in capsys.readouterr().err
 
+    def test_the_period_lock_is_applied_before_the_close(self):
+        root = f"trader/ledger/books/{BOOK}/"
+        closing = [
+            f"{root}statements/nous-ergon-paper/2026-09.json",
+            f"{root}close/nous-ergon-paper/2026-09.json",
+            f"{root}periods/nous-ergon-paper/2026-09.json",
+        ]
+        order = statement_backfill._closing_order(closing, root)
+        assert order[0] == f"{root}periods/nous-ergon-paper/2026-09.json"
+        assert order.index(f"{root}close/nous-ergon-paper/2026-09.json") == 1
+
+    def test_a_close_without_its_period_lock_is_refused(self, gap_root):
+        view, summary = self._rehearse(gap_root)
+        LocalStore(gap_root).put_bytes(
+            f"trader/ledger/books/{BOOK}/close/nous-ergon-paper/2026-09.json", b"{}"
+        )
+        before = snapshot(gap_root)
+        with pytest.raises(BackfillRefused, match="close but no period lock"):
+            statement_backfill.apply_book(
+                LocalStore(gap_root), view, summary, book=BOOK, now=OUTSIDE
+            )
+        assert snapshot(gap_root) == before
+
     @pytest.mark.parametrize(
         ("spoil", "message"),
         [

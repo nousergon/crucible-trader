@@ -110,7 +110,9 @@ from crucible_trader.ledger import (
     journal_key,
     journal_prefix,
     ledger_reconciliation_key,
+    period_lock_key,
 )
+from crucible_trader.month_end_close import close_key
 from crucible_trader.reconcile_entrypoint import live_corporate_action_source
 from crucible_trader.reconciliation import Fill
 from crucible_trader.reconciliation_job import RECONCILIATION_PREFIX, run_reconciliation
@@ -769,6 +771,19 @@ def apply_book(
             f"the rehearsal posted no {book} journal for {unposted}; applying the days after "
             "them would leave them unbookable -- nothing applied"
         )
+    month = str(summary["month"])
+    if backend.exists(close_key(PAPER_FUND_TENANT, month, book)) and not backend.exists(
+        period_lock_key(PAPER_FUND_TENANT, month, book)
+    ):
+        # A close with no period lock leaves the month open to later postings,
+        # and a re-run would find the close and never write the lock. This
+        # tool writes the lock first (:func:`_closing_order`), so the state is
+        # not its own; refuse rather than report the month closed (codex
+        # review of crucible-trader#160, third round).
+        raise BackfillRefused(
+            f"{month} has a close but no period lock in {book}: the month is not locked; "
+            "nothing applied -- investigate before any re-run"
+        )
     root = book_root(book)
     by_day: dict[str, list[str]] = {}
     for day in days:
@@ -785,7 +800,7 @@ def apply_book(
     order: list[str] = []
     for day in sorted(by_day):
         order.extend(_tiered(list(dict.fromkeys(by_day[day])), day))
-    order.extend(k for k in sorted(closing) if k not in order)
+    order.extend(k for k in _closing_order(closing, root) if k not in order)
     if proposals in cast("list[str]", summary["keys_written"]):
         order.append(proposals)  # after the attempt it proposes for
     same = [k for k in order if backend.exists(k) and _same(backend, view, k)]
@@ -802,6 +817,16 @@ def apply_book(
         now=now,
     )
     return order
+
+
+def _closing_order(closing: Sequence[str], root: str) -> list[str]:
+    """A book's close records in apply order: the period lock FIRST, as
+    :func:`crucible_trader.month_end_close._attempt` writes them. A plain sort
+    puts ``close/`` before ``periods/``, so an apply stopped between the two
+    would leave a close with no lock, and a re-run, finding the close, would
+    never write it (codex review of crucible-trader#160, third round)."""
+    periods = f"{root}periods/"
+    return sorted(closing, key=lambda k: (0 if k.startswith(periods) else 1, k))
 
 
 #: The books a re-run of the same statement reproduces byte for byte.
