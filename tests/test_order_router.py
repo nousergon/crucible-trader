@@ -1193,3 +1193,42 @@ def test_the_paper_router_values_the_accounts_positions(store) -> None:
     ib = RoutingIB(positions={"AAA": 300, "CCC": 100})
     weights = _router(store, ib, quote=PRICES.get).held_weights(100_000.0)
     assert weights == pytest.approx({"AAA": 0.3, "CCC": 0.02, "__CASH__": 0.68})
+
+
+# -- the engine's no-trade band, at the share level (2026-11-13 NVDA 974 -> 973) ---------
+
+
+def _banded(weights: dict[str, float], band: object) -> TargetBook:
+    return dataclasses.replace(
+        _book(weights), optimizer={"solved": {}, "settings": {"rebalance_band_pct": band}}
+    )
+
+
+def _orders(plan) -> dict[str, tuple[str, int]]:
+    sells, buys = plan
+    return {o.decision.symbol: (o.decision.side, o.decision.quantity) for o in (*sells, *buys)}
+
+
+def test_a_resize_inside_the_engines_band_is_not_traded() -> None:
+    # Band 1% of $100k = $1,000. AAA 300 -> 299 is a $100 sell: the floor
+    # moving with the quote, not a decision. BBB 100 -> 400 is $15,000: traded.
+    book = _banded({"AAA": 0.299, "BBB": 0.2}, 0.01)
+    plan = _plan(book, positions={"AAA": 300, "BBB": 100}, session_cap=1_000_000.0)
+    assert _orders(plan) == {"BBB": ("buy", 300)}
+
+
+def test_entries_and_exits_are_never_banded() -> None:
+    # CCC 10 -> 0 is a $200 exit; AAA 0 -> 5 is a $500 entry. Both trade.
+    book = _banded({"AAA": 0.005, "CCC": 0.0}, 0.01)
+    plan = _plan(book, positions={"CCC": 10})
+    assert _orders(plan) == {"CCC": ("sell", 10), "AAA": ("buy", 5)}
+
+
+@pytest.mark.parametrize("band", [None, 0.0, True, "0.01"])
+def test_no_usable_band_bands_nothing(band) -> None:
+    plan = _plan(_banded({"AAA": 0.299}, band), positions={"AAA": 300})
+    assert _orders(plan) == {"AAA": ("sell", 1)}
+
+
+def test_a_book_without_an_optimizer_record_bands_nothing() -> None:
+    assert _orders(_plan(_book({"AAA": 0.299}), positions={"AAA": 300})) == {"AAA": ("sell", 1)}

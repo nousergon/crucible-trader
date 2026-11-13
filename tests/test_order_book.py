@@ -475,6 +475,23 @@ def test_a_book_without_an_optimizer_block_writes_null() -> None:
     assert doc["optimizer"] is None
 
 
+def test_a_resize_the_plan_left_inside_the_band_reads_as_the_shares_held() -> None:
+    basis = ShareBasis(
+        positions={"AAA": 300, "BBB": 100}, prices={"AAA": 100.0, "BBB": 50.0}, band_usd=1_000.0
+    )
+    # AAA 300 -> 299 is $100 inside the band: held. BBB 100 -> 400 is $15,000: sized.
+    assert basis.target_shares("AAA", 0.299, 100_000.0) == 300
+    assert basis.target_shares("BBB", 0.2, 100_000.0) == 400
+    # Entries are never banded.
+    assert basis.target_shares("CCC", 0.0, 100_000.0) == 0
+    assert (
+        ShareBasis(positions={}, prices={"AAA": 100.0}, band_usd=1_000.0).target_shares(
+            "AAA", 0.005, 100_000.0
+        )
+        == 5
+    )
+
+
 def test_the_book_carries_reader_facing_percentages_and_an_exchange_clock_build_time() -> None:
     doc = order_book_document(_book(), previous_weights=None, written_at_utc="2026-11-13T14:32:14Z")
     assert doc["built_at_et"] == "2026-11-13 09:32 ET"

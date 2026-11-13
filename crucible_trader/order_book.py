@@ -129,15 +129,26 @@ class ShareBasis:
 
     positions: Mapping[str, int]
     prices: Mapping[str, float]
+    #: The engine's no-trade band in dollars the plan applied
+    #: (`order_router._rebalance_band_usd`); 0 when it applied none.
+    band_usd: float = 0.0
 
     def target_shares(self, symbol: str, weight: float, notional_usd: float) -> int | None:
-        """``floor(weight * notional / price)``, as the plan sizes it; None unpriced."""
+        """``floor(weight * notional / price)``, as the plan sizes it; None unpriced.
+
+        A resize of a name held on both sides that the plan left inside the
+        band reads as the shares held, because that is what the plan traded to.
+        """
         if weight <= _ZERO:
             return 0
         price = self.prices.get(symbol)
         if price is None or not (math.isfinite(price) and price > 0):
             return None
-        return math.floor(weight * notional_usd / price + _SHARE_EPSILON)
+        target = math.floor(weight * notional_usd / price + _SHARE_EPSILON)
+        held = int(self.positions.get(symbol, 0))
+        if held > 0 and target > 0 and abs(target - held) * price < self.band_usd:
+            return held
+        return target
 
 
 def sector_labels(
