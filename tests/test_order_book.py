@@ -353,11 +353,24 @@ def test_each_held_row_carries_the_shares_the_session_sized(tmp_path) -> None:
         assert rows[sentinel]["target_shares"] is None
         assert rows[sentinel]["previous_shares"] is None
     assert doc["share_basis"] == "router_plan"
+    # The trade, signed: + buys, - sells; no notional where there is no price.
+    trades = {t: (r["trade_shares"], r["trade_notional_usd"]) for t, r in rows.items()}
+    assert trades == {
+        "AAA": (45, 4950.0),
+        "BBB": (-100, -5000.0),
+        "CCC": (909, 29997.0),
+        "DDD": (0, None),
+        "SPY": (None, None),
+        "$CASH": (None, None),
+    }
+    assert rows["AAA"]["weight_change_pct"] == 5.0
+    assert rows["BBB"]["weight_change_pct"] == -5.0
 
 
 def test_without_a_share_basis_the_share_columns_are_null() -> None:
     doc = order_book_document(_book(), previous_weights=None, written_at_utc="t")
     assert {(r["previous_shares"], r["target_shares"]) for r in doc["rows"]} == {(None, None)}
+    assert {(r["trade_shares"], r["trade_notional_usd"]) for r in doc["rows"]} == {(None, None)}
     assert doc["share_basis"] is None
 
 

@@ -36,6 +36,11 @@ and cash sentinels included and labelled, with:
   the day's trades, and the decision price both were sized at (see
   :class:`ShareBasis`). ``null`` on a session that sized no orders (shadow)
   and on the two sentinels.
+* ``trade_shares`` / ``trade_notional_usd`` -- the day's trade the book asks
+  for, signed (positive buys, negative sells): ``target_shares`` minus
+  ``previous_shares``, and that times ``share_price_usd``. ``null`` wherever
+  either side (or the price, for the notional) is ``null``.
+  ``weight_change_pct`` is ``weight_change`` in percent.
 
 **Never raises into the session.** A book that cannot be written must not
 stop the day's orders -- a no-trade day is a worse outcome than a missing
@@ -231,6 +236,16 @@ def order_book_document(
         target = float(book.weights.get(ticker, 0.0))
         prior = float(previous.get(ticker, 0.0))
         basis = None if sentinel is not None else shares
+        held_shares = None if basis is None else int(basis.positions.get(ticker, 0))
+        book_shares = (
+            None
+            if basis is None
+            else basis.target_shares(ticker, target, book.portfolio_notional_usd)
+        )
+        price = None if basis is None else basis.prices.get(ticker)
+        trade_shares = (
+            None if held_shares is None or book_shares is None else book_shares - held_shares
+        )
         rows.append(
             {
                 "ticker": ticker,
@@ -245,6 +260,7 @@ def order_book_document(
                 # The same weights in percent, for a reader (the console page).
                 "previous_weight_pct": round(prior * 100.0, 3),
                 "target_weight_pct": round(target * 100.0, 3),
+                "weight_change_pct": round((target - prior) * 100.0, 3),
                 "action": _action(
                     previous=prior,
                     target=target,
@@ -259,13 +275,17 @@ def order_book_document(
                     else 0
                 ),
                 "sector_label": None if sentinel is not None else labels.get(ticker),
-                "previous_shares": None if basis is None else int(basis.positions.get(ticker, 0)),
-                "target_shares": (
+                "previous_shares": held_shares,
+                "target_shares": book_shares,
+                "share_price_usd": price,
+                # The size of the day's trade, signed (+ buy, - sell), so a
+                # reader sees the trade rather than two holdings to subtract.
+                "trade_shares": trade_shares,
+                "trade_notional_usd": (
                     None
-                    if basis is None
-                    else basis.target_shares(ticker, target, book.portfolio_notional_usd)
+                    if trade_shares is None or price is None
+                    else round(trade_shares * price, 2)
                 ),
-                "share_price_usd": None if basis is None else basis.prices.get(ticker),
             }
         )
     rows.sort(key=lambda r: (-r["target_weight"], r["alpha_rank"] or 10**9, r["ticker"]))
