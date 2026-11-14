@@ -222,6 +222,17 @@ class Fill:
         }
 
 
+def _status(value: float | None, band: ShortfallBand) -> str:
+    """The session status: above ``upper_bps`` is WATCH while the band is a
+    placeholder (it cannot page on a number nobody calibrated) and FAIL once
+    calibrated. At or below the band, and any shortfall below zero, is OK."""
+    if value is None:
+        return "N/A-LOW-N"
+    if value > band.upper_bps:
+        return "WATCH" if band.placeholder else "FAIL"
+    return "OK"
+
+
 def _metric(
     *,
     trading_day: str,
@@ -233,6 +244,19 @@ def _metric(
     """The session's MetricRecord. Session-level status only: the WEEK is graded
     by `crucible.report` over its own window, so this row states what one day
     measured and makes no claim about the band's verdict."""
+    status = _status(value, band)
+    breach = (
+        ""
+        if status in ("OK", "N/A-LOW-N")
+        else (
+            f"; {value:+.1f} bps is above the {band.upper_bps:g} bps "
+            + (
+                "placeholder band (not yet calibrated, so WATCH)"
+                if status == "WATCH"
+                else "red line"
+            )
+        )
+    )
     return {
         "name": EXECUTION_METRIC_NAME,
         "module": MODULE,
@@ -243,10 +267,10 @@ def _metric(
         "n_floor": 1,
         "target": band.baseline_bps,
         "red_line": band.upper_bps,
-        "status": "N/A-LOW-N" if value is None else "OK",
+        "status": status,
         "status_reason": (
             f"{trading_day}: notional-weighted implementation shortfall over {n_filled} "
-            f"filled order(s) against the sizing-decision price"
+            f"filled order(s) against the sizing-decision price{breach}"
             if value is not None
             else f"{trading_day}: orders placed, none filled — no execution price to measure"
         ),
