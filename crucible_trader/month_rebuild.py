@@ -30,27 +30,22 @@ as step 5g and NEVER raises: it changes nothing the job decides or pages.
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 from collections.abc import Mapping
 from typing import Any, cast
 
-from crucible.keys import trader_broker_statement_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, Store
 
 from crucible_trader.benchmark_closes import with_benchmark_closes
-from crucible_trader.broker_statement import statement_from_document
 from crucible_trader.exception_record import PAPER_FUND_TENANT
-from crucible_trader.ledger import ledger_reconciliation_key, load_journals
 from crucible_trader.month_end_close import (
     LEDGER_CLOSE_PREFIX,
-    CloseInputs,
     CloseSource,
     close_key,
     close_month,
-    month_trading_days,
     panel_close_source,
     previous_month,
+    stored_close_inputs,
 )
 from crucible_trader.performance_statement import (
     FEE_SCHEDULES,
@@ -75,9 +70,9 @@ def _schedule_named_by(published: Mapping[str, object]) -> Mapping[str, object]:
     return FEE_SCHEDULES.get(str(named.get("schedule_id")), SIMULATED_FEE_SCHEDULE)
 
 
-def rebuild_key(tenant: str, month: str) -> str:
+def rebuild_key(tenant: str, month: str, book: str | None = None) -> str:
     """The month's rebuild result: written once, never rewritten."""
-    return f"{close_key(tenant, month)[: -len('.json')]}/rebuild.json"
+    return f"{close_key(tenant, month, book)[: -len('.json')]}/rebuild.json"
 
 
 def _read_json(store: Store, key: str) -> dict[str, Any] | None:  # pyright: ignore[reportExplicitAny]
@@ -109,39 +104,38 @@ def rebuild_month(
     day: str,
     closes: CloseSource,
     now: str,
+    book: str | None = None,
 ) -> dict[str, object] | None:
-    """Rebuild ``month``'s close, statement and fee bill from stored inputs and
-    compare each to what was published. Reads only. ``None`` while the close or
-    the statement is not published yet."""
-    published_close = _read_json(store, close_key(tenant, month))
-    published_statement = _read_json(store, statement_key(tenant, month))
+    """Rebuild ``month``'s close, statement and fee bill in ``book`` (``None``:
+    the live book) from stored inputs and compare each to what was published.
+    Reads only, through the close's own reader
+    (:func:`~crucible_trader.month_end_close.stored_close_inputs`), so a
+    prior-period book's last month is rebuilt against the same bridge. ``None``
+    while the close or the statement is not published yet."""
+    published_close = _read_json(store, close_key(tenant, month, book))
+    published_statement = _read_json(store, statement_key(tenant, month, book))
     if published_close is None or published_statement is None:
         return None
-    nxt = (dt.date.fromisoformat(day) + dt.timedelta(days=1)).isoformat()
-    last_day = month_trading_days(month)[-1]
-    ib = _read_json(store, trader_broker_statement_key(last_day))
     close = close_month(
-        CloseInputs(
+        stored_close_inputs(
+            store,
             tenant=tenant,
             account=account,
             month=month,
-            run_day=day,
-            journals=load_journals(store, tenant, before=nxt),
-            statement=statement_from_document(ib) if ib else None,
-            view=_read_json(store, ledger_reconciliation_key(tenant, last_day)),
-            prior=_read_json(store, close_key(tenant, previous_month(month))),
+            day=day,
             closes=closes,
-            detected_at=now,
+            now=now,
+            book=book,
         )
     )
     documents: dict[str, dict[str, object]] = {
-        "close": _compare(close_key(tenant, month), published_close, close)
+        "close": _compare(close_key(tenant, month, book), published_close, close)
     }
-    statement_at = statement_key(tenant, month)
+    statement_at = statement_key(tenant, month, book)
     try:
         statement = build_statement(
             close,
-            _read_json(store, statement_key(tenant, previous_month(month))),
+            _read_json(store, statement_key(tenant, previous_month(month), book)),
             benchmark_returns(
                 with_benchmark_closes(store, closes),
                 str(close["start_trading_day"]),
@@ -174,6 +168,7 @@ def rebuild_month(
         if not result["matches"]
     ]
     return {
+        **({} if book is None else {"book": book}),
         "schema_version": REBUILD_SCHEMA_VERSION,
         "tenant": tenant,
         "account": account,
@@ -194,15 +189,17 @@ def verify_month_rebuild(
     now: str,
     tenant: str = PAPER_FUND_TENANT,
     closes: CloseSource | None = None,
+    book: str | None = None,
 ) -> dict[str, object] | None:
     """Step 5g of `trader.reconcile`: rebuild the month before ``day``'s month
     once its close and statement are published, unless it is already rebuilt.
-    NEVER raises; returns the rebuild document, or ``None``."""
+    NEVER raises; returns the rebuild document, or ``None``. ``book``: a
+    declared prior-period book to rebuild instead of the live one."""
     month = previous_month(day[:7])
     key = None
     try:
         store = ctx.store
-        key = rebuild_key(tenant, month)
+        key = rebuild_key(tenant, month, book)
         if store.exists(key):
             return None
         document = rebuild_month(
@@ -213,6 +210,7 @@ def verify_month_rebuild(
             day=day,
             closes=closes or panel_close_source(store),
             now=now,
+            book=book,
         )
         if document is None:
             return None

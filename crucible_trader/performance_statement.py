@@ -56,6 +56,7 @@ from typing import Any, cast
 from crucible.store import ETAG_ABSENT, PointerConflictError
 
 from crucible_trader.benchmark_closes import with_benchmark_closes
+from crucible_trader.ledger import book_root
 from crucible_trader.month_end_close import (
     CloseSource,
     close_key,
@@ -102,9 +103,13 @@ class StatementError(ValueError):
     """A statement that cannot be produced from what it was given."""
 
 
-def statement_key(tenant: str, month: str) -> str:
-    close_key(tenant, month)  # validates both
-    return f"{LEDGER_STATEMENTS_PREFIX}{tenant}/{month}.json"
+def statement_key(tenant: str, month: str, book: str | None = None) -> str:
+    """The month's statement in ``book`` (``None``: the live book). A
+    prior-period book's statements chain among themselves only
+    (`alpha-engine-config-I13232`)."""
+    close_key(tenant, month, book)  # validates all three
+    prefix = LEDGER_STATEMENTS_PREFIX if book is None else f"{book_root(book)}statements/"
+    return f"{prefix}{tenant}/{month}.json"
 
 
 def _cents(value: Decimal) -> int:
@@ -149,6 +154,7 @@ def build_statement(
     if close.get("status") != "closed":
         raise StatementError("a statement is produced from a finished close only")
     month, tenant = str(close["month"]), str(close["tenant"])
+    book = cast("str | None", close.get("book"))
     if close.get("external_flows_cents") != 0:
         raise StatementError(f"{month} carries an external flow; daily linking is required")
     nav_start, nav_end = (
@@ -236,8 +242,10 @@ def build_statement(
         "shadow_net_nav_end_cents": net_end,
         "high_water_mark_cents": hwm_end,
         "inputs": {
-            "close": close_key(tenant, month),
-            "prior_statement": statement_key(tenant, previous_month(month)) if prior else None,
+            "close": close_key(tenant, month, book),
+            "prior_statement": statement_key(tenant, previous_month(month), book)
+            if prior
+            else None,
         },
     }
 
@@ -254,11 +262,12 @@ def file_statement(
     key = None
     try:
         tenant, month = str(close["tenant"]), str(close["month"])
-        key = statement_key(tenant, month)
+        book = cast("str | None", close.get("book"))
+        key = statement_key(tenant, month, book)
         store = ctx.store
         if store.exists(key):
             return None
-        prior_key = statement_key(tenant, previous_month(month))
+        prior_key = statement_key(tenant, previous_month(month), book)
         prior = (
             cast("dict[str, Any]", json.loads(store.get_bytes(prior_key).decode("utf-8")))  # pyright: ignore[reportExplicitAny]
             if store.exists(prior_key)

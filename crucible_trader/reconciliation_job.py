@@ -334,8 +334,15 @@ def reconcile_cycle(
     reconciler: Reconciler = reconcile,
     order_records: tuple[Sequence[BrokerOrder], Sequence[BrokerExecution]] | None = None,
     dividend_waivers: Sequence[DividendWaiver] | None = None,
+    ledger_book: str | None = None,
 ) -> ReconciliationResult:
     """The job body. See the module docstring for the order and the raises.
+
+    ``ledger_book`` names a declared prior-period book
+    (:data:`~crucible_trader.ledger.PRIOR_PERIOD_BOOKS`) for steps 5d, 5f and
+    5g and the ledger leg to read and post (`alpha-engine-config-I13232`: an
+    IB-statement backfill of a day before the live book opened). The live
+    evening job never passes it: ``None`` is the live book, unchanged.
 
     ``corporate_actions`` is either the day's set, or a
     :data:`CorporateActionProvider` asked for it once the statements are read.
@@ -364,7 +371,7 @@ def reconcile_cycle(
         ctx.record_input(key, payload, RECONCILIATION_SCHEMA_VERSION)
         documents[prior_day] = json.loads(payload.decode("utf-8"))
     owed = owed_dividends(documents, today=day, declared=load_declared_entitlements())
-    ledger_positions, ledger_source = ledger_leg(ctx.store, day, broker.account)
+    ledger_positions, ledger_source = ledger_leg(ctx.store, day, broker.account, ledger_book)
 
     inputs = ReconciliationInputs(
         trading_day=day,
@@ -431,6 +438,7 @@ def reconcile_cycle(
             corporate_actions=corporate_actions,
             reconciliation=document,
             now=now,
+            book=ledger_book,
         )
         # Step 5f': the statement's benchmark closes the panel does not carry,
         # captured before 5f so the month's last close is there when the
@@ -443,10 +451,11 @@ def reconcile_cycle(
             account=broker.account,
             now=now,
             after_close=lambda close: file_statement(ctx, close, now=now),
+            book=ledger_book,
         )
         # Step 5g: once a month's close and statement are published, rebuild
         # them and the fee bill from stored inputs (1h). Never raises.
-        verify_month_rebuild(ctx, day=day, account=broker.account, now=now)
+        verify_month_rebuild(ctx, day=day, account=broker.account, now=now, book=ledger_book)
         # Step 5e runs LAST: after 5c and 5f, so today's proposals and a
         # refused close's proposals are both in the queue it files.
         file_exception_score(ctx, now=now)
@@ -477,18 +486,22 @@ def _unfiled_breaks(ctx: RunContext) -> str | None:
     return None
 
 
-def ledger_leg(store: Store, day: str, account: str) -> tuple[dict[str, int] | None, str]:
+def ledger_leg(
+    store: Store, day: str, account: str, book: str | None = None
+) -> tuple[dict[str, int] | None, str]:
     """The ledger's share counts before ``day``: the third leg of the
     corporate-action check. NEVER raises: an unreadable ledger is an
     unavailable leg (recorded with its reason), and step 5d reports the ledger's
-    own failure, so this read cannot change what the job decides or pages."""
+    own failure, so this read cannot change what the job decides or pages.
+    ``book``: the prior-period book a backfill posts into (``None``: live)."""
+    named = PAPER_FUND_TENANT if book is None else f"{PAPER_FUND_TENANT}, book {book}"
     try:
-        ledger = load_ledger(store, PAPER_FUND_TENANT, before=day)
+        ledger = load_ledger(store, PAPER_FUND_TENANT, before=day, book=book)
         if not ledger.has_account(PAPER_FUND_TENANT, account):
-            return None, f"unavailable: no {PAPER_FUND_TENANT} ledger for {account} before {day}"
+            return None, f"unavailable: no {named} ledger for {account} before {day}"
         return (
             dict(ledger.positions(PAPER_FUND_TENANT, account)),
-            f"ledger journals ({PAPER_FUND_TENANT}) before {day}",
+            f"ledger journals ({named}) before {day}",
         )
     except Exception as exc:  # noqa: BLE001 - a missing leg is recorded, never a raise
         return None, f"unavailable: {type(exc).__name__}: {exc}"[:300]
@@ -991,8 +1004,12 @@ def run_reconciliation(
     genesis: bool = False,
     run_mode: str | None = None,
     body: Callable[..., ReconciliationResult] = reconcile_cycle,
+    ledger_book: str | None = None,
 ) -> RunContext:
-    """Run one cycle as job :data:`RECONCILE_JOB` under the harness runner."""
+    """Run one cycle as job :data:`RECONCILE_JOB` under the harness runner.
+    ``ledger_book`` reaches the body only when given (a backfill's
+    prior-period book), so the live job's call is exactly what it was."""
+    book = {} if ledger_book is None else {"ledger_book": ledger_book}
     return run_job(
         RECONCILE_JOB,
         lambda ctx: body(
@@ -1002,6 +1019,7 @@ def run_reconciliation(
             cash_flows=cash_flows,
             corporate_actions=corporate_actions,
             genesis=genesis,
+            **book,
         ),
         store=store,
         trading_day=trading_day,
