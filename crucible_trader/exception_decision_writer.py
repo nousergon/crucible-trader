@@ -5,9 +5,12 @@
 this small handler, deployed as its own Lambda with its own narrow role, behind
 the same Cloudflare Access login as the console.
 
-``GET`` serves the reviewer's form (:mod:`crucible_trader.exception_decision_form`)
-behind the same identity check: the queue of the approver's tenants, one small
-form per proposal, which posts JSON back to this same URL. It only reads.
+``GET`` sends the reviewer to the console's back-office page (a ``303`` to
+``{ALLOWED_ORIGIN}/page/back-office``), where each waiting break is decided on
+its own card (Brian 2026-11-13: decide on the page you land on). It reads
+nothing and needs no identity: the page it names sits behind the same Access
+login. The standalone form it used to serve read the exception records, which
+this role cannot read, and answered 502 (`alpha-engine-config-I13653`).
 
 What it does, per ``POST``:
 
@@ -69,7 +72,6 @@ import hashlib
 import hmac
 import json
 import math
-import secrets
 import time
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -86,15 +88,8 @@ from crucible_trader.books_retention import (
 from crucible_trader.exception_decision import (
     DecisionError,
     decide,
-    load_decisions,
-    load_exception_records,
     load_proposals,
     record_decision,
-)
-from crucible_trader.exception_decision_form import (
-    content_security_policy,
-    queue_items,
-    render_queue_page,
 )
 
 __all__ = [
@@ -400,41 +395,18 @@ def _approver(
     return approver
 
 
-def _form(event: Mapping[str, object], *, approver: Approver, store: Store) -> dict[str, object]:
-    """``GET``: the queue of the approver's tenants as one form per proposal
-    (:mod:`crucible_trader.exception_decision_form`). Reads only."""
-    query = cast("dict[str, str]", event.get("queryStringParameters") or {})
-    wanted = query.get("tenant")
-    tenants = approver.tenants if wanted is None else approver.tenants & {wanted}
-    who = {"reviewer": approver.reviewer, "tenant": wanted}
-    if wanted is not None and not tenants:
-        return _refuse(403, f"{approver.reviewer} may not decide for tenant {wanted}", **who)
-    reader = read_only(store, reason="the decision form only reads proposals and decisions")
-    try:
-        items = queue_items(load_proposals(reader), load_decisions(reader), tenants=tenants)
-        exceptions = load_exception_records(
-            reader, (str(item.proposal.get("trading_day")) for item in items)
-        )
-    except (DecisionError, ValueError) as exc:
-        return _refuse(503, f"cannot read the queue: {exc}", **who)
-    nonce = secrets.token_urlsafe(18)
-    _log(200, "form", items=len(items), **who)
+BACK_OFFICE_PAGE = "/page/back-office"
+
+
+def _to_the_page(config: WriterConfig) -> dict[str, object]:
+    """``GET``: send the reviewer to the console page where decisions are made.
+    Reads nothing, so it holds no identity check of its own."""
+    location = config.allowed_origin.rstrip("/") + BACK_OFFICE_PAGE
+    _log(303, "to_page", location=location)
     return {
-        "statusCode": 200,
-        "headers": {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store",
-            "content-security-policy": content_security_policy(nonce),
-            "referrer-policy": "no-referrer",
-            "x-content-type-options": "nosniff",
-        },
-        "body": render_queue_page(
-            items,
-            reviewer=approver.reviewer,
-            tenants=tenants,
-            nonce=nonce,
-            exceptions=exceptions,
-        ),
+        "statusCode": 303,
+        "headers": {"location": location, "cache-control": "no-store"},
+        "body": "",
     }
 
 
@@ -451,12 +423,9 @@ def handle(
     method = request_context.get("http", {}).get("method")
     headers = {k.lower(): v for k, v in cast("dict[str, str]", event.get("headers") or {}).items()}
     if method == "GET":
-        found = _approver(headers, config=config, keys=keys, now=now)
-        if not isinstance(found, Approver):
-            return found
-        return _form(event, approver=found, store=store)
+        return _to_the_page(config)
     if method != "POST":
-        return _refuse(405, "only POST records a decision (GET serves the form)")
+        return _refuse(405, "only POST records a decision (GET goes to the back-office page)")
     origin = headers.get("origin")
     if origin is not None and origin != config.allowed_origin:
         return _refuse(403, "request from another origin")
