@@ -30,6 +30,7 @@ from crucible_trader.paper_smoke import (
     run_smoke,
     running_wheel_disagreement,
     smoke_cycle,
+    staging_running_wheel_disagreement,
 )
 
 SHA = "c" * 40
@@ -100,6 +101,34 @@ class TestPinDisagreementPageCondition:
     def test_a_pin_naming_the_running_wheel_agrees(self, store) -> None:
         self._pin(store, SHA)
         assert running_wheel_disagreement(store, VERSION) is None
+
+
+class TestStagingRunningWheelDisagreement:
+    """alpha-engine-config-I12507: staging has no IB paper smoke, so its trader pin
+    can never be set; a staging session checks the wheel against the staging
+    store's `releases/current`, which is what its box installed. Not relaxed: an
+    unset or different pointer still disagrees."""
+
+    @staticmethod
+    def _current(store, sha: str) -> None:
+        store.put_bytes(
+            "releases/current",
+            json.dumps(
+                {"sha": sha, "target": "current", "pinned_at": "2026-11-17T04:50:00Z"}
+            ).encode(),
+        )
+
+    def test_an_unset_pointer_is_a_disagreement(self, store) -> None:
+        assert "unset" in staging_running_wheel_disagreement(store, VERSION)
+
+    def test_a_pointer_naming_another_wheel_is_a_disagreement(self, store) -> None:
+        self._current(store, "d" * 40)
+        assert "staging trader is running" in staging_running_wheel_disagreement(store, VERSION)
+
+    def test_a_pointer_naming_the_running_wheel_agrees_with_no_trader_pin(self, store) -> None:
+        self._current(store, SHA)
+        assert staging_running_wheel_disagreement(store, VERSION) is None
+        assert "unset" in running_wheel_disagreement(store, VERSION)  # prod's check is unchanged
 
 
 class TestSmokeCycle:

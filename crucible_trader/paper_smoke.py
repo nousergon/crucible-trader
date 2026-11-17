@@ -38,9 +38,11 @@ from typing import Any
 
 from crucible.keys import TRADER_PAPER_SMOKE_PREFIX, trader_paper_smoke_key
 from crucible.release import (
+    POINTER_KEY,
     TRADER_PIN_KEY,
     TRADER_SMOKE_JOB,
     assert_sha,
+    read_pointer,
     wheel_filename_for,
 )
 from crucible.runner import RunContext, run_job
@@ -106,6 +108,31 @@ def running_wheel_disagreement(store: Store, installed_version: str) -> str | No
     if installed_version != want:
         return (
             f"{TRADER_PIN_KEY} names {sha} ({want!r}) but the trader is running crucible "
+            f"{installed_version!r}"
+        )
+    return None
+
+
+def staging_running_wheel_disagreement(store: Store, installed_version: str) -> str | None:
+    """The same start-of-session check for a STAGING session (alpha-engine-config-I12507).
+
+    Prod pins the trader separately from the harness, and `trader/release_pin` moves
+    only on the trader's own IB-paper smoke. Staging has no IB Gateway, so no paper
+    smoke runs and that pin can never be set there. A dispatched staging box installs
+    the staging store's `releases/current`, the wheel staging declares it runs, so
+    that pointer is what the running wheel must match. The check is not relaxed: an
+    unset pointer, or a wheel that differs from it, still fails the session.
+    """
+    listed = POINTER_KEY in set(store.list_keys(POINTER_KEY))
+    sha = read_pointer(store, POINTER_KEY)[0] if listed else None
+    if sha is None:
+        return (
+            f"{POINTER_KEY} is unset while the staging trader runs crucible {installed_version!r}"
+        )
+    want = expected_version(sha)
+    if installed_version != want:
+        return (
+            f"{POINTER_KEY} names {sha} ({want!r}) but the staging trader is running crucible "
             f"{installed_version!r}"
         )
     return None

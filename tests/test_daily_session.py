@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 from crucible.execution import execution_shortfall_key
 from crucible.keys import TRADER_EVIDENCE_KEY, manifest_key, predictions_key
-from crucible.release import TRADER_PIN_KEY
+from crucible.release import POINTER_KEY, TRADER_PIN_KEY
 from crucible.store import LocalStore
 from ib_fakes import FakeIB, FakeSdk, ctx_for, environ_for
 from test_contract import ARM, _feed, _put
@@ -52,6 +52,7 @@ from crucible_trader.order_router import (
     StagingRoutingRefusedError,
     build_router,
 )
+from crucible_trader.paper_smoke import RunningWheelMismatchError
 from crucible_trader.simulated_broker import (
     SIMULATED_FILLS_SCHEMA_VERSION,
     SimulatedFillsRefusedError,
@@ -86,7 +87,13 @@ def _construct(store_, **kwargs):
 def store(tmp_path) -> LocalStore:
     s = LocalStore(tmp_path)
     s.put_bytes(TRADER_PIN_KEY, json.dumps(_pin_document(SHA)).encode())
+    # What a dispatched STAGING box installs, and so what its session checks against.
+    s.put_bytes(POINTER_KEY, json.dumps(_current_document(SHA)).encode())
     return s
+
+
+def _current_document(sha: str) -> dict:
+    return {"sha": sha, "target": "current", "pinned_at": "2026-09-05T22:00:00Z"}
 
 
 class LiveRouter:
@@ -506,6 +513,46 @@ class TestAStagingSession:
         ]
         assert simulated["value"] == 2.0
         assert "no broker" in simulated["status_reason"]
+
+    @pytest.mark.parametrize("pointer", ["unset", "other"])
+    def test_it_checks_the_wheel_against_the_staging_release_pointer(
+        self, store, monkeypatch, pointer
+    ) -> None:
+        """Staging has no IB paper smoke, so `trader/release_pin` is never set there
+        (measured 2026-11-17: the first staging session past bootstrap failed on it).
+        The session still checks its running wheel, against `releases/current`."""
+        _simulated_world(store, monkeypatch)
+        store._path(TRADER_PIN_KEY).unlink()
+        if pointer == "unset":
+            store._path(POINTER_KEY).unlink()
+        else:
+            store.put_bytes(POINTER_KEY, json.dumps(_current_document("d" * 40)).encode())
+        with pytest.raises(RunningWheelMismatchError, match="releases/current"):
+            main(
+                [],
+                environ=_staging_env(store),
+                sdk_loader=_no_sdk,
+                version_reader=lambda: VERSION,
+                clock=lambda: NOW,
+                printer=lambda line: None,
+                router_factory=lambda config, **kw: pytest.fail("the prod router was built"),
+            )
+
+    def test_it_serves_with_no_trader_pin(self, store, monkeypatch) -> None:
+        _simulated_world(store, monkeypatch)
+        store._path(TRADER_PIN_KEY).unlink()
+        code = main(
+            [],
+            environ=_staging_env(store),
+            sdk_loader=_no_sdk,
+            version_reader=lambda: VERSION,
+            clock=lambda: NOW,
+            printer=lambda line: None,
+            router_factory=lambda config, **kw: pytest.fail("the prod router was built"),
+        )
+        assert code == 0
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
 
     def test_the_session_document_says_simulated(self, store, monkeypatch) -> None:
         _simulated_world(store, monkeypatch)
