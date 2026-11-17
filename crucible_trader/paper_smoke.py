@@ -111,6 +111,39 @@ def running_wheel_disagreement(store: Store, installed_version: str) -> str | No
     return None
 
 
+#: The crucible sha a dispatched box installed and exports (the Dispatcher's
+#: bootstrap, `CRUCIBLE_RELEASE_SHA=$SHA`). In staging that sha is the candidate
+#: release manifest's `repos.crucible` (alpha-engine-config-I13800).
+RELEASE_SHA_VAR = "CRUCIBLE_RELEASE_SHA"
+
+
+def staging_running_wheel_disagreement(
+    installed_version: str, release_sha: str | None
+) -> str | None:
+    """The start-of-session wheel check for a STAGING session (alpha-engine-config-I12507).
+
+    Prod pins the trader separately from the harness, and `trader/release_pin` moves
+    only on the trader's own IB-paper smoke. Staging has no IB Gateway, so no paper
+    smoke runs and that pin can never be set there. A dispatched staging box installs
+    the crucible its candidate release manifest names and exports that sha as
+    :data:`RELEASE_SHA_VAR`, so that is the wheel this session must be running. The
+    check is not relaxed: an unset or malformed sha, or a different wheel, still fails
+    the session.
+    """
+    if not release_sha:
+        return (
+            f"{RELEASE_SHA_VAR} is unset while the staging trader runs crucible "
+            f"{installed_version!r}"
+        )
+    want = expected_version(assert_sha(release_sha))
+    if installed_version != want:
+        return (
+            f"{RELEASE_SHA_VAR} names {release_sha} ({want!r}) but the staging trader is "
+            f"running crucible {installed_version!r}"
+        )
+    return None
+
+
 def smoke_cycle(ctx: RunContext, *, sha: str, client: Any, installed_version: str) -> dict:
     """The job body. Raises on every failure; returns the output document."""
     assert_running_wheel(sha, installed_version)
