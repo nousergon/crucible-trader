@@ -144,6 +144,7 @@ from crucible_trader.exception_record import (
     records_from_order_intent_reconciliation,
 )
 from crucible_trader.ledger import load_ledger, post_daily_ledger
+from crucible_trader.ledger_views import publish_ledger_views
 from crucible_trader.month_end_close import close_prior_month
 from crucible_trader.month_rebuild import verify_month_rebuild
 from crucible_trader.order_intent_reconciliation import (
@@ -432,6 +433,10 @@ def reconcile_cycle(
             reconciliation=document,
             now=now,
         )
+        # Step 5d': the ledger laid out for /page/books (trial balance by
+        # account, running balances, tie-out), derived from the journals 5d
+        # just wrote. Never raises (alpha-engine-config-I13753).
+        publish_ledger_views(ctx.store, day=day)
         # Step 5f': the statement's benchmark closes the panel does not carry,
         # captured before 5f so the month's last close is there when the
         # statement is filed (alpha-engine-config-I13201). Never raises.
