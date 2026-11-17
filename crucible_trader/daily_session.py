@@ -119,6 +119,7 @@ import datetime as dt
 import functools
 import json
 import logging
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -158,6 +159,7 @@ from crucible_trader.kill_switch import (
 )
 from crucible_trader.order_router import RouterConfig, ShadowRouter, build_router
 from crucible_trader.paper_smoke import (
+    RELEASE_SHA_VAR,
     installed_crucible_version,
     open_configured_store,
     staging_running_wheel_disagreement,
@@ -640,7 +642,9 @@ def run_staging_session(
             installed_version=installed_version,
             clock=clock,
             environ=environ,
-            wheel_check=staging_running_wheel_disagreement,
+            wheel_check=lambda _store, version: staging_running_wheel_disagreement(
+                version, (os.environ if environ is None else environ).get(RELEASE_SHA_VAR)
+            ),
         )
         if not isinstance(router, SimulatedFillRouter) or result["outcome"] != "served":
             return result

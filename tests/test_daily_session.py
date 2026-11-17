@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 from crucible.execution import execution_shortfall_key
 from crucible.keys import TRADER_EVIDENCE_KEY, manifest_key, predictions_key
-from crucible.release import POINTER_KEY, TRADER_PIN_KEY
+from crucible.release import TRADER_PIN_KEY
 from crucible.store import LocalStore
 from ib_fakes import FakeIB, FakeSdk, ctx_for, environ_for
 from test_contract import ARM, _feed, _put
@@ -87,13 +87,7 @@ def _construct(store_, **kwargs):
 def store(tmp_path) -> LocalStore:
     s = LocalStore(tmp_path)
     s.put_bytes(TRADER_PIN_KEY, json.dumps(_pin_document(SHA)).encode())
-    # What a dispatched STAGING box installs, and so what its session checks against.
-    s.put_bytes(POINTER_KEY, json.dumps(_current_document(SHA)).encode())
     return s
-
-
-def _current_document(sha: str) -> dict:
-    return {"sha": sha, "target": "current", "pinned_at": "2026-09-05T22:00:00Z"}
 
 
 class LiveRouter:
@@ -441,7 +435,8 @@ def _staging_env(store, **extra):
         CRUCIBLE_TRADER_SIMULATED_FILLS="on",
         CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD="50000",
         CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD="100000",
-        **extra,
+        # What a dispatched staging box exports for the crucible it installed.
+        **{"CRUCIBLE_RELEASE_SHA": SHA, **extra},
     )
 
 
@@ -514,23 +509,19 @@ class TestAStagingSession:
         assert simulated["value"] == 2.0
         assert "no broker" in simulated["status_reason"]
 
-    @pytest.mark.parametrize("pointer", ["unset", "other"])
-    def test_it_checks_the_wheel_against_the_staging_release_pointer(
-        self, store, monkeypatch, pointer
+    @pytest.mark.parametrize("release_sha", ["", "d" * 40])
+    def test_it_checks_the_wheel_against_the_installed_release(
+        self, store, monkeypatch, release_sha
     ) -> None:
         """Staging has no IB paper smoke, so `trader/release_pin` is never set there
         (measured 2026-11-17: the first staging session past bootstrap failed on it).
-        The session still checks its running wheel, against `releases/current`."""
+        The session still checks its running wheel, against the sha the box installed."""
         _simulated_world(store, monkeypatch)
         store._path(TRADER_PIN_KEY).unlink()
-        if pointer == "unset":
-            store._path(POINTER_KEY).unlink()
-        else:
-            store.put_bytes(POINTER_KEY, json.dumps(_current_document("d" * 40)).encode())
-        with pytest.raises(RunningWheelMismatchError, match="releases/current"):
+        with pytest.raises(RunningWheelMismatchError, match="CRUCIBLE_RELEASE_SHA"):
             main(
                 [],
-                environ=_staging_env(store),
+                environ=_staging_env(store, CRUCIBLE_RELEASE_SHA=release_sha),
                 sdk_loader=_no_sdk,
                 version_reader=lambda: VERSION,
                 clock=lambda: NOW,
@@ -641,7 +632,12 @@ class TestAStagingSession:
         config = StagingSessionConfig.from_env(_staging_env(store))
         assert config is not None
         ctx = run_staging_session(
-            store, config=config, installed_version=VERSION, clock=lambda: NOW, run_mode="live"
+            store,
+            config=config,
+            installed_version=VERSION,
+            clock=lambda: NOW,
+            run_mode="live",
+            environ=_staging_env(store),
         )
 
         manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, BOUND)))

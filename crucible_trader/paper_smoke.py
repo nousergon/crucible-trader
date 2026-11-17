@@ -38,11 +38,9 @@ from typing import Any
 
 from crucible.keys import TRADER_PAPER_SMOKE_PREFIX, trader_paper_smoke_key
 from crucible.release import (
-    POINTER_KEY,
     TRADER_PIN_KEY,
     TRADER_SMOKE_JOB,
     assert_sha,
-    read_pointer,
     wheel_filename_for,
 )
 from crucible.runner import RunContext, run_job
@@ -113,27 +111,35 @@ def running_wheel_disagreement(store: Store, installed_version: str) -> str | No
     return None
 
 
-def staging_running_wheel_disagreement(store: Store, installed_version: str) -> str | None:
-    """The same start-of-session check for a STAGING session (alpha-engine-config-I12507).
+#: The crucible sha a dispatched box installed and exports (the Dispatcher's
+#: bootstrap, `CRUCIBLE_RELEASE_SHA=$SHA`). In staging that sha is the candidate
+#: release manifest's `repos.crucible` (alpha-engine-config-I13800).
+RELEASE_SHA_VAR = "CRUCIBLE_RELEASE_SHA"
+
+
+def staging_running_wheel_disagreement(
+    installed_version: str, release_sha: str | None
+) -> str | None:
+    """The start-of-session wheel check for a STAGING session (alpha-engine-config-I12507).
 
     Prod pins the trader separately from the harness, and `trader/release_pin` moves
     only on the trader's own IB-paper smoke. Staging has no IB Gateway, so no paper
     smoke runs and that pin can never be set there. A dispatched staging box installs
-    the staging store's `releases/current`, the wheel staging declares it runs, so
-    that pointer is what the running wheel must match. The check is not relaxed: an
-    unset pointer, or a wheel that differs from it, still fails the session.
+    the crucible its candidate release manifest names and exports that sha as
+    :data:`RELEASE_SHA_VAR`, so that is the wheel this session must be running. The
+    check is not relaxed: an unset or malformed sha, or a different wheel, still fails
+    the session.
     """
-    listed = POINTER_KEY in set(store.list_keys(POINTER_KEY))
-    sha = read_pointer(store, POINTER_KEY)[0] if listed else None
-    if sha is None:
+    if not release_sha:
         return (
-            f"{POINTER_KEY} is unset while the staging trader runs crucible {installed_version!r}"
+            f"{RELEASE_SHA_VAR} is unset while the staging trader runs crucible "
+            f"{installed_version!r}"
         )
-    want = expected_version(sha)
+    want = expected_version(assert_sha(release_sha))
     if installed_version != want:
         return (
-            f"{POINTER_KEY} names {sha} ({want!r}) but the staging trader is running crucible "
-            f"{installed_version!r}"
+            f"{RELEASE_SHA_VAR} names {release_sha} ({want!r}) but the staging trader is "
+            f"running crucible {installed_version!r}"
         )
     return None
 
