@@ -208,6 +208,9 @@ class TestTieout:
         ]
         assert rows[0]["unit"] == "cents"
         assert rows[1]["unit"] == "shares"
+        assert rows[0]["ledger_cents"] == 69_900
+        assert rows[1]["broker_shares"] == 10
+        assert "ledger_shares" not in rows[0]
 
     def test_a_break_today_shows_the_ledger_before_the_gap_entry(self):
         rows = {r["item"]: r for r in day_views(JOURNALS, GAP_DAY, tenant=T, day=D2)["tieout"]}

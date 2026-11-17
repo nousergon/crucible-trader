@@ -251,6 +251,17 @@ def _tieout(
                 "broker": broker,
                 "delta": _int(broker) - _int(ledger),
                 "in_suspense": in_suspense,
+                # The same four figures split by unit, so a page can show cash as
+                # dollars and instruments as shares in their own columns.
+                **{
+                    f"{name}_{unit}": figure
+                    for name, figure in (
+                        ("ledger", ledger),
+                        ("broker", broker),
+                        ("delta", _int(broker) - _int(ledger)),
+                        ("in_suspense", in_suspense),
+                    )
+                },
                 "status": status,
                 "tier": None if today is None else today.get("tier"),
                 "exception_ids": ids,
