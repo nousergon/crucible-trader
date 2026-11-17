@@ -298,9 +298,20 @@ class TestPublish:
         write(store, JOURNALS, {D1: recon(D1), D2: GAP_DAY})
         assert publish_ledger_views(store, day=D1) == [ledger_views_key(T, D1)]
 
+    def test_unreadable_exception_records_drop_only_the_card_links(self, store):
+        write(store, JOURNALS, {D2: GAP_DAY})
+        store.put_bytes(exceptions_key(D2), b"not json")
+        assert publish_ledger_views(store, day=D2) == [ledger_views_key(T, D2)]
+        assert read(store, D2)["tieout"][0]["break_card"] is None
+
     def test_a_failure_never_raises(self, store):
         store.put_bytes(journal_key(T, D1), b"not json")
         assert publish_ledger_views(store, day=D1) is None
+
+
+def test_views_live_under_the_ledger_reconciliation_grant():
+    # Both the trader's write and the console's read are scoped to this prefix.
+    assert ledger_views_key(T, D1) == f"trader/ledger/reconciliation/{T}/views/{D1}.json"
 
 
 def test_a_bad_tenant_has_no_views_key():

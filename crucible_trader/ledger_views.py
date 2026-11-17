@@ -3,7 +3,7 @@
 Brian, 2026-11-16 17:27Z: "having the master ledgers and access to the master
 ledgers to review are important pieces of this project". The console's
 /page/books reads one views document per tenant per trading day, at
-``trader/ledger/views/{tenant}/{day}.json``, holding three arrays:
+``trader/ledger/reconciliation/{tenant}/views/{day}.json``, holding three arrays:
 
 * ``accounts`` -- the trial balance by account after the day closes: every
   ledger account's balance in cents (and shares, for the accounts that carry
@@ -40,6 +40,7 @@ from crucible.store import Store
 
 from crucible_trader.exception_record import EXCEPTIONS_PREFIX
 from crucible_trader.ledger import (
+    LEDGER_RECONCILIATION_PREFIX,
     PAPER_FUND_TENANT,
     Entry,
     Ledger,
@@ -51,7 +52,13 @@ from crucible_trader.order_intent_reconciliation import order_intent_reconciliat
 
 log = logging.getLogger(__name__)
 
-LEDGER_VIEWS_PREFIX = "trader/ledger/views/"
+#: Under the ledger reconciliation prefix on purpose: the trader role's
+#: ``WriteItsOwnLedgerReconciliationView`` grant (rewritable, derived documents)
+#: and the console's read grant both name ``trader/ledger/reconciliation/*`` and
+#: nothing else under ``trader/ledger/`` they could use, so a sibling prefix
+#: would be AccessDenied on both sides (measured 2026-11-17). The ``views/``
+#: segment keeps them out of the daily-check adapter's ``{tenant}/{day}.json``.
+LEDGER_VIEWS_DIR = "views"
 LEDGER_VIEWS_SCHEMA_VERSION = "ledger_views.v1"
 CASH_ITEM = "USD"
 _AFTER_EVERY_DAY = "9999-12-31"
@@ -65,7 +72,7 @@ BREAK_CARD = "/signal/crucible-trading:exception@{day}:{exception_id}"
 
 def ledger_views_key(tenant: str, trading_day: str) -> str:
     journal_key(tenant, trading_day)  # the journal's tenant and date checks
-    return f"{LEDGER_VIEWS_PREFIX}{tenant}/{trading_day}.json"
+    return f"{LEDGER_RECONCILIATION_PREFIX}{tenant}/{LEDGER_VIEWS_DIR}/{trading_day}.json"
 
 
 def source_key(entry: Entry) -> str:
@@ -324,8 +331,14 @@ def publish_ledger_views(
     Returns the keys written; NEVER raises (``None`` on failure)."""
     try:
         journals = load_journals(store, tenant, before=_AFTER_EVERY_DAY)
-        present = set(store.list_keys(f"{LEDGER_VIEWS_PREFIX}{tenant}/"))
-        filed = _filed(store)
+        present = set(
+            store.list_keys(f"{LEDGER_RECONCILIATION_PREFIX}{tenant}/{LEDGER_VIEWS_DIR}/")
+        )
+        try:
+            filed = _filed(store)
+        except Exception:  # noqa: BLE001 - break-card links are optional; the views are not
+            log.warning("exception records unreadable; views publish without card links")
+            filed = {}
         written: list[str] = []
         for d in sorted(x for x in journals if x <= day):
             key = ledger_views_key(tenant, d)
