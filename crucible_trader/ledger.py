@@ -424,6 +424,9 @@ class Ledger:
     def cents(self, tenant: str, account: str, ledger_account: str) -> int:
         return self._cents.get(f"{tenant}|{account}|{ledger_account}", 0)
 
+    def shares(self, tenant: str, account: str, ledger_account: str) -> int:
+        return self._shares.get(f"{tenant}|{account}|{ledger_account}", 0)
+
     def positions(self, tenant: str, account: str) -> dict[str, int]:
         prefix = f"{tenant}|{account}|{SECURITIES}"
         return {k[len(prefix) :]: v for k, v in self._shares.items() if k.startswith(prefix) and v}
