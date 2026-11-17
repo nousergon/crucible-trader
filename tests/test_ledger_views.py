@@ -9,6 +9,7 @@ import pytest
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.store import LocalStore
 
+from crucible_trader.exception_record import exceptions_key
 from crucible_trader.ledger import (
     CASH,
     COMMISSIONS,
@@ -168,6 +169,7 @@ class TestPostings:
         assert buy["source_key"] == order_intent_reconciliation_key(D1)
         assert buy["journal_key"] == journal_key(T, D1)
         assert cash[0]["running_quantity"] is None
+        assert buy["entry_page"] == f"/signal/books:entry@{BUY.entry_id}"
 
     def test_only_the_days_entries_are_listed(self):
         views = day_views(JOURNALS, GAP_DAY, tenant=T, day=D2)
@@ -221,6 +223,12 @@ class TestTieout:
         assert rows["AAA"]["exception_ids"] == ["ex-aaa"]
         assert rows["AAA"]["open_since"] == D2
 
+    def test_a_row_links_the_first_of_its_ids_that_has_a_card(self):
+        views = day_views(JOURNALS, GAP_DAY, tenant=T, day=D2, filed={"ex-ledger": D2})
+        rows = {r["item"]: r for r in views["tieout"]}
+        assert rows["USD"]["break_card"] == f"/signal/crucible-trading:exception@{D2}:ex-ledger"
+        assert rows["AAA"]["break_card"] is None
+
     def test_suspense_from_an_earlier_day_stays_visible(self):
         later = recon(
             D3,
@@ -261,6 +269,18 @@ class TestPublish:
         ]
         assert read(store, D1)["trading_day"] == D1
         assert read(store, D2)["tieout"][0]["status"] == "break_today"
+
+    def test_a_break_links_the_card_filed_for_it(self, store):
+        write(store, JOURNALS, {D2: GAP_DAY})
+        store.put_bytes(
+            exceptions_key(D2),
+            json.dumps(
+                {"records": [{"exception_id": "ex-broker"}, {"exception_id": "x"}]}
+            ).encode(),
+        )
+        publish_ledger_views(store, day=D2)
+        usd = read(store, D2)["tieout"][0]
+        assert usd["break_card"] == f"/signal/crucible-trading:exception@{D2}:ex-broker"
 
     def test_an_existing_earlier_day_is_not_rewritten_but_today_is(self, store):
         write(store, JOURNALS, {D1: recon(D1), D2: GAP_DAY})

@@ -38,6 +38,7 @@ from typing import cast
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.store import Store
 
+from crucible_trader.exception_record import EXCEPTIONS_PREFIX
 from crucible_trader.ledger import (
     PAPER_FUND_TENANT,
     Entry,
@@ -55,6 +56,11 @@ LEDGER_VIEWS_SCHEMA_VERSION = "ledger_views.v1"
 CASH_ITEM = "USD"
 _AFTER_EVERY_DAY = "9999-12-31"
 _GAP_ITEM_PREFIX = "gap/"
+#: Console pages the rows link to: the ids the console's adapters give a journal
+#: entry (nous-ergon-ops `books-journal-entries.yaml`) and a filed exception
+#: (`crucible-trading-exceptions.yaml`). Paths, so they open inside the console.
+ENTRY_PAGE = "/signal/books:entry@{entry_id}"
+BREAK_CARD = "/signal/crucible-trading:exception@{day}:{exception_id}"
 
 
 def ledger_views_key(tenant: str, trading_day: str) -> str:
@@ -126,6 +132,7 @@ def _replay(
                         ),
                         "source": entry.evidence.get("source"),
                         "source_key": source_key(entry),
+                        "entry_page": ENTRY_PAGE.format(entry_id=entry.entry_id),
                         "journal_key": journal_key(tenant, d),
                         "reason": entry.evidence.get("reason"),
                         "decision_id": entry.evidence.get("decision_id"),
@@ -193,6 +200,7 @@ def _tieout(
     journals: Mapping[str, Sequence[Entry]],
     tenant: str,
     day: str,
+    filed: Mapping[str, str],
 ) -> list[dict[str, object]]:
     breaks = {str(b.get("instrument")): b for b in _rows(reconciliation.get("breaks"))}
     gaps = _open_gaps(reconciliation, journals)
@@ -224,6 +232,15 @@ def _tieout(
             if in_suspense or open_gaps
             else "ties"
         )
+        ids: list[str] = list(
+            dict[str, None].fromkeys(
+                [
+                    *([] if today is None else _ids(today.get("exception_ids"))),
+                    *(i for gap in open_gaps for i in _ids(gap["exception_ids"])),
+                ]
+            )
+        )
+        card = next((i for i in ids if i in filed), None)
         rows.append(
             {
                 "tenant": tenant,
@@ -236,13 +253,9 @@ def _tieout(
                 "in_suspense": in_suspense,
                 "status": status,
                 "tier": None if today is None else today.get("tier"),
-                "exception_ids": list(
-                    dict.fromkeys(
-                        [
-                            *([] if today is None else _ids(today.get("exception_ids"))),
-                            *(i for gap in open_gaps for i in _ids(gap["exception_ids"])),
-                        ]
-                    )
+                "exception_ids": ids,
+                "break_card": (
+                    None if card is None else BREAK_CARD.format(day=filed[card], exception_id=card)
                 ),
                 "open_since": min((str(g["day"]) for g in open_gaps), default=None),
                 "suspense_entry_ids": [str(g["entry_id"]) for g in open_gaps],
@@ -257,10 +270,13 @@ def day_views(
     *,
     tenant: str,
     day: str,
+    filed: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """The views document of ``tenant`` on ``day``: ``journals`` holds every
-    journal of the tenant (days after ``day`` are ignored) and
-    ``reconciliation`` that day's ledger reconciliation view."""
+    journal of the tenant (days after ``day`` are ignored), ``reconciliation``
+    that day's ledger reconciliation view, and ``filed`` the day each filed
+    exception record was filed on, by id (a tie-out row links the first of its
+    ids that has a card)."""
     ledger, postings, counts, carries_shares = _replay(journals, tenant, day)
     return {
         "schema_version": LEDGER_VIEWS_SCHEMA_VERSION,
@@ -275,8 +291,19 @@ def day_views(
         },
         "accounts": _accounts(ledger, counts, carries_shares, tenant, day),
         "postings": postings,
-        "tieout": _tieout(reconciliation, journals, tenant, day),
+        "tieout": _tieout(reconciliation, journals, tenant, day, filed or {}),
     }
+
+
+def _filed(store: Store) -> dict[str, str]:
+    """Every filed exception record's id, with the day it was filed on."""
+    filed: dict[str, str] = {}
+    for key in sorted(store.list_keys(EXCEPTIONS_PREFIX)):
+        day = key[len(EXCEPTIONS_PREFIX) : -len(".json")]
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        for record in _rows(cast("Mapping[str, object]", document).get("records")):
+            filed.setdefault(str(record.get("exception_id")), day)
+    return filed
 
 
 def publish_ledger_views(
@@ -287,6 +314,7 @@ def publish_ledger_views(
     try:
         journals = load_journals(store, tenant, before=_AFTER_EVERY_DAY)
         present = set(store.list_keys(f"{LEDGER_VIEWS_PREFIX}{tenant}/"))
+        filed = _filed(store)
         written: list[str] = []
         for d in sorted(x for x in journals if x <= day):
             key = ledger_views_key(tenant, d)
@@ -294,7 +322,7 @@ def publish_ledger_views(
             if (d != day and key in present) or not store.exists(view_key):
                 continue
             reconciliation = json.loads(store.get_bytes(view_key).decode("utf-8"))
-            document = day_views(journals, reconciliation, tenant=tenant, day=d)
+            document = day_views(journals, reconciliation, tenant=tenant, day=d, filed=filed)
             store.put_bytes(key, json.dumps(document, indent=2, sort_keys=True).encode("utf-8"))
             written.append(key)
     except Exception:  # noqa: BLE001 - a view must never change what the job decides or pages
