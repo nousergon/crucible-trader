@@ -45,7 +45,12 @@ happened. Reviewer decisions can then be recorded against that tree without
 touching S3 and the score rebuilt from it:
 
     python -m crucible_trader.back_office_dry_run --store URI --month 2026-10 \\
-        --out DIR [--fills PATH] [--now YYYY-MM-DDTHH:MM:SSZ]
+        --out DIR [--fills PATH] [--now YYYY-MM-DDTHH:MM:SSZ] [--book pre-v2]
+
+``--book`` books and closes the month in a declared prior-period book
+(`crucible_trader.ledger.PRIOR_PERIOD_BOOKS`, `alpha-engine-config-I13232`)
+instead of the live one: October 2026 is the v1-era book ``pre-v2``, whose
+close must also bridge into the live book's opening balance.
     python -m crucible_trader.exception_decision record --store DIR/store ...
     python -m crucible_trader.exception_decision score --store DIR/store
 """
@@ -91,7 +96,7 @@ from crucible_trader.exception_proposal import (
     propose,
 )
 from crucible_trader.exception_record import exceptions_key
-from crucible_trader.ledger import LEDGER_JOURNAL_PREFIX, post_daily_ledger
+from crucible_trader.ledger import book_root, post_daily_ledger
 from crucible_trader.month_end_close import CloseSource, close_prior_month, month_trading_days
 from crucible_trader.performance_statement import file_statement
 from crucible_trader.reconciliation import CorporateActionSet, Fill
@@ -182,19 +187,31 @@ class _JournalsAsOf(Store):
     It carries ``inner``'s capture (``_capture_ledger``), so a backfill handed
     this view joins the dry run's capture instead of wrapping a fresh one whose
     writes the dry run would never see (crucible-trader#147 review).
+
+    It hides the journals of the book being booked (``book``), and only those: a
+    prior-period book's run reads the live book's journals as they stand, since
+    its last close bridges into the live book's opening (aec#13232).
     """
 
-    def __init__(self, inner: Store, as_of: str, *, include_as_of: bool = True) -> None:
+    def __init__(
+        self,
+        inner: Store,
+        as_of: str,
+        *,
+        include_as_of: bool = True,
+        book: str | None = None,
+    ) -> None:
         self._inner = inner
         self._as_of = as_of
         self._include_as_of = include_as_of
+        self._prefix = f"{book_root(book)}journal/"  # every tenant's journals of the book
 
     @property
     def _capture_ledger(self) -> CaptureLedger | None:
         return capture_ledger_of(self._inner)
 
     def _hidden(self, key: str) -> bool:
-        if not (key.startswith(LEDGER_JOURNAL_PREFIX) and key.endswith(".json")):
+        if not (key.startswith(self._prefix) and key.endswith(".json")):
             return False
         day = key.rsplit("/", 1)[-1].removesuffix(".json")
         return day > self._as_of or (day == self._as_of and not self._include_as_of)
@@ -243,6 +260,7 @@ def dry_run(
     fills: Mapping[str, Sequence[Fill]] | None = None,
     closes: CloseSource | None = None,
     backfill: Mapping[str, Callable[[Store], object]] | None = None,
+    book: str | None = None,
 ) -> dict[str, object]:
     """Run the month's loop against ``store``, which must be a capturing
     (dry-run) store, and return the summary. Raises only for a store that
@@ -256,7 +274,11 @@ def dry_run(
     runs in date order between the stored days' postings, never all first: a
     backfilled day's journal posted ahead of an earlier stored day would have
     the ledger refuse that day as inserted behind a later journal (codex
-    d411bf68)."""
+    d411bf68).
+
+    ``book`` books and closes the month in a declared prior-period book
+    instead of the live one (`alpha-engine-config-I13232`); the backfills it
+    is handed must post into the same book."""
     capture = capture_ledger_of(store)
     if capture is None:
         raise ValueError("the dry run needs a capturing store: open it with dry_run=True")
@@ -286,7 +308,7 @@ def dry_run(
     # Steps 3 and 4 read the store as of the close run day (`_JournalsAsOf`):
     # step 3 without the run day's own journal, step 4 with it (codex facd7a3e).
     run_day = _next_trading_day(trading_days[-1])
-    as_of = _JournalsAsOf(store, run_day, include_as_of=False)
+    as_of = _JournalsAsOf(store, run_day, include_as_of=False, book=book)
     ledger: list[dict[str, object]] = []
     anchor: BrokerStatement | None = None
     anchor_day: str | None = None
@@ -317,6 +339,7 @@ def dry_run(
             corporate_actions=_NO_ACTIONS,
             reconciliation=reconciliation,
             now=now,
+            book=book,
         )
         ledger.extend(
             {"trading_day": day, "status": m["status"], "reason": m["status_reason"]}
@@ -353,7 +376,7 @@ def dry_run(
             )
 
     # 4: close the month as the next month's first run would.
-    ctx = _ctx(_JournalsAsOf(store, run_day), run_day, now)
+    ctx = _ctx(_JournalsAsOf(store, run_day, book=book), run_day, now)
     account = _statement(store, stored[-1]).account
     close = close_prior_month(
         ctx,
@@ -362,6 +385,7 @@ def dry_run(
         now=now,
         closes=closes,
         after_close=lambda c: file_statement(ctx, c, now=now, closes=closes),
+        book=book,
     )
 
     # 5: the queue the reviewer would see, with each item's exception record
@@ -379,6 +403,7 @@ def dry_run(
     )
     return {
         "schema_version": SUMMARY_SCHEMA_VERSION,
+        "book": book,
         "month": month,
         "generated_at": now,
         "close_run_day": run_day,
@@ -395,6 +420,7 @@ def dry_run(
         if close is None
         else {
             "status": close.get("status"),
+            **({"bridge": close["bridge"]} if "bridge" in close else {}),
             "exceptions": [
                 {"class": e["class"], "instrument": e["instrument"], "detail": e["detail"]}
                 for e in cast("list[Mapping[str, object]]", close.get("exceptions", []))
@@ -474,6 +500,11 @@ def main(
     parser.add_argument("--out", required=True, type=pathlib.Path, help="local directory")
     parser.add_argument("--fills", default=None, type=pathlib.Path, help="fills as JSON lines")
     parser.add_argument("--now", default=None, help="stamp for every record (default: now)")
+    parser.add_argument(
+        "--book",
+        default=None,
+        help="a declared prior-period book to book and close the month in (default: live)",
+    )
     args = parser.parse_args(argv)
     out = cast("pathlib.Path", args.out)
     if out.exists() and any(out.iterdir()):
@@ -484,6 +515,7 @@ def main(
         month=cast("str", args.month),
         now=cast("str | None", args.now) or _now(),
         fills=load_fills(cast("pathlib.Path | None", args.fills)),
+        book=cast("str | None", args.book),
     )
     out.mkdir(parents=True, exist_ok=True)
     write_out(store, summary, out)
