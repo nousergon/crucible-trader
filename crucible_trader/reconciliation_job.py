@@ -119,6 +119,8 @@ from crucible_trader.dividend_entitlements import (
     owed_dividends,
 )
 from crucible_trader.exception_decision import (
+    RULE_CLEARS_PREFIX,
+    RULE_CLEARS_SCHEMA_VERSION,
     SCORE_CURRENT_KEY,
     SCORE_SCHEMA_VERSION,
     SCORES_PREFIX,
@@ -126,6 +128,7 @@ from crucible_trader.exception_decision import (
     load_decisions,
     load_exception_records,
     load_proposals,
+    load_rule_clears,
     score,
 )
 from crucible_trader.exception_proposal import (
@@ -143,6 +146,7 @@ from crucible_trader.exception_record import (
     records_from_broker_reconciliation,
     records_from_order_intent_reconciliation,
 )
+from crucible_trader.exception_rules import file_rule_clears, registry
 from crucible_trader.ledger import load_ledger, post_daily_ledger
 from crucible_trader.ledger_views import publish_ledger_views
 from crucible_trader.month_end_close import close_prior_month
@@ -452,6 +456,11 @@ def reconcile_cycle(
         # Step 5g: once a month's close and statement are published, rebuild
         # them and the fee bill from stored inputs (1h). Never raises.
         verify_month_rebuild(ctx, day=day, account=broker.account, now=now)
+        # Step 5c'': the approved tier-2 rules clear the breaks their records
+        # explain (alpha-engine-config-I13747). After 5c and 5f, so today's and a
+        # refused close's proposals are both there; before 5e, so the queue it
+        # files leaves them out. Never raises.
+        apply_rule_clears(ctx, now=now)
         # Step 5e runs LAST: after 5c and 5f, so today's proposals and a
         # refused close's proposals are both in the queue it files.
         file_exception_score(ctx, now=now)
@@ -721,6 +730,69 @@ def file_exception_proposals(
         _LOG.warning("exception proposals metric for %s was NOT recorded", day, exc_info=True)
 
 
+#: The MetricRecord that says whether step 5c'' filed the day's rule clears.
+EXCEPTION_RULE_CLEARS_METRIC = "exception_rule_clears_filed"
+
+
+def apply_rule_clears(ctx: RunContext, *, now: str) -> None:
+    """Step 5c'': file the clears of the approved tier-2 rules. Never raises.
+
+    `alpha-engine-config-I13747`, Brian's rulings of 2026-11-16 ("approve once,
+    then audit") and 2026-11-17 (R1 to R4 approved, aec#13791). For every
+    undecided queue item an approved, undemoted rule covers, the rule's
+    condition is checked on the stored records
+    (:func:`~crucible_trader.exception_rules.file_rule_clears`); each one that
+    holds becomes a clear at
+    :func:`~crucible_trader.exception_decision.rule_clears_key`, citing its
+    evidence and arithmetic. A clear books nothing. The job's identity writes
+    it under the proposals prefix it already writes, never under
+    ``trader/exception_decisions/``, which stays the people-only writer's.
+
+    Like 5c, ANY failure is logged and swallowed and reported as the
+    ``exception_rule_clears_filed`` metric with status FAIL: a failed rule
+    costs a clear, so the item stays in the queue for a person, never the
+    reconciliation. The reason names each covered item left uncleared and why.
+    """
+    day = ctx.trading_day.isoformat()
+    key = RULE_CLEARS_PREFIX
+    try:
+        key, document, misses = file_rule_clears(ctx.store, as_of=day, now=now)
+        filed = len(cast("list[object]", document["clears"])) if document is not None else 0
+        if document is not None:
+            ctx.record_output(
+                key,
+                json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+                RULE_CLEARS_SCHEMA_VERSION,
+            )
+    except Exception as exc:  # noqa: BLE001 - see docstring: never reaches the job
+        _LOG.warning("rule clears for %s were NOT filed", day, exc_info=True)
+        status, value = "FAIL", None
+        reason = f"rule clears for {day} were NOT filed: " + (f"{type(exc).__name__}: {exc}")[:400]
+    else:
+        status, value = "OK", float(filed)
+        left = "; ".join(f"{m.get('trading_day')} {m.get('class')}: {m['why']}" for m in misses)
+        reason = (
+            f"{filed} rule clears filed for {day}" + (f"; not cleared: {left}" if left else "")
+        )[:1000]
+    try:
+        ctx.record_metric(
+            {
+                "name": EXCEPTION_RULE_CLEARS_METRIC,
+                "module": "crucible_trader.exception_rules",
+                "metric_type": "operational",
+                "value": value,
+                "unit": "count" if value is not None else None,
+                "n_floor": 0,
+                "status": status,
+                "status_reason": reason,
+                "source_path": key,
+                "last_updated_utc": now,
+            }
+        )
+    except Exception:  # noqa: BLE001 - see docstring
+        _LOG.warning("rule clears metric for %s was NOT recorded", day, exc_info=True)
+
+
 #: The MetricRecord that says whether step 5e filed the day's score.
 EXCEPTION_SCORE_METRIC = "exception_score_filed"
 
@@ -778,6 +850,8 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
             exceptions=load_exception_records(
                 ctx.store, (str(p["trading_day"]) for p in proposals)
             ),
+            clears=load_rule_clears(ctx.store, until=day),
+            rules=registry(),
         )
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         ctx.record_output(key, payload, SCORE_SCHEMA_VERSION)
@@ -808,7 +882,8 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
         reason = (
             f"back-office queue for {day}: {totals['queue']} open, {overdue} overdue, "
             f"agreement {totals['agreement']} over {totals['agree']} agreed and "
-            f"{totals['correct']} corrected"
+            f"{totals['correct']} corrected; {totals['cleared']} cleared by approved rules, "
+            f"{totals['audit']} back for audit"
         )
         overdue_row = _overdue_metric(document, day=day, key=key, now=now)
     except Exception as exc:  # noqa: BLE001 - see docstring: shadow, must never reach the job
