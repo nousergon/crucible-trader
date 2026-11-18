@@ -95,13 +95,14 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 from crucible.calendar import is_trading_day
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext, run_job
-from crucible.store import ETAG_ABSENT, PointerConflictError, Store
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store, open_store
 
 from crucible_trader.benchmark_closes import capture_benchmark_closes
 from crucible_trader.books_retention import lock_cycle_books
@@ -328,6 +329,104 @@ def stored_results(store: Store, trading_day: str) -> dict[str, tuple[str, bytes
     return out
 
 
+FLEX_URI_ENV = "CRUCIBLE_TRADER_IB_FLEX_URI"
+DEFAULT_FLEX_URI = "s3://alpha-engine-research/ops/daily-summaries/back-office/ib-flex/"
+
+
+def apply_waiting_statements(
+    ctx: RunContext,
+    *,
+    now: dt.datetime,
+    clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+    corporate_actions: CorporateActionSet | CorporateActionProvider | None = None,
+) -> None:
+    """Recover missing days without changing the live reconcile's failure contract.
+
+    Read/parse/apply failures are isolated and named in one MetricRecord; the
+    live broker comparison must still run. If metric recording itself fails,
+    the logger is the fallback recording surface. Replay never enters here.
+    """
+    outcomes: list[str] = []
+    applied = 0
+    failed = False
+    uri = os.environ.get(FLEX_URI_ENV, DEFAULT_FLEX_URI)
+    try:
+        # Local import breaks the replay runner's dependency cycle.
+        from crucible_trader.statement_backfill import (
+            apply_writes,
+            backfill_day,
+            parse_flex_statement,
+        )
+
+        if not uri.strip():
+            raise ValueError(f"{FLEX_URI_ENV} is empty")
+        source = open_store(uri)
+        first = now.date().replace(day=1)
+        months = sorted({first.strftime("%Y-%m"), (first - dt.timedelta(days=1)).strftime("%Y-%m")})
+        for month in months:
+            try:
+                keys = sorted(source.list_keys(month + "/"))
+            except Exception as exc:
+                # A denied month must not hide the other month; metric below records it.
+                failed = True
+                outcomes.append(f"{month}: FAIL {type(exc).__name__}: {exc}")
+                continue
+            for key in keys:
+                if not key.endswith(".xml"):
+                    continue
+                day_text = key
+                try:
+                    day = dt.datetime.strptime(key.rsplit("/", 1)[-1][:8], "%Y%m%d").date()
+                    if day.strftime("%Y-%m") != month or day >= min(now.date(), ctx.trading_day):
+                        raise ValueError(
+                            "statement date outside its month or not before the live trading day"
+                        )
+                    day_text = day.isoformat()
+                    if ctx.store.exists(trader_broker_statement_key(day_text)):
+                        if not ctx.store.exists(trader_reconciliation_key(day_text)):
+                            raise RuntimeError(
+                                "statement exists but missing reconciliation; skipped"
+                            )
+                        outcomes.append(f"{day_text}: skipped (statement exists)")
+                        continue
+                    statement = parse_flex_statement(
+                        source.get_bytes(key).decode("utf-8"), trading_day=day_text
+                    )
+                    view, summary = backfill_day(
+                        ctx.store, statement, corporate_actions=corporate_actions
+                    )
+                    apply_writes(ctx.store, view, summary, now=clock())
+                    if summary.get("lock_refused"):
+                        raise RuntimeError(f"books retention refused: {summary['lock_refused']}")
+                    applied += 1
+                    outcomes.append(f"{day_text}: applied")
+                except Exception as exc:
+                    # One failed day cannot abort recovery; its refusal remains in the metric.
+                    failed = True
+                    outcomes.append(f"{day_text}: FAIL {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        # Opening/listing failures do not suppress today's broker comparison.
+        failed = True
+        outcomes.append(f"FAIL {type(exc).__name__}: {exc}")
+    try:
+        ctx.record_metric(
+            {
+                "name": "statement_backfill_applied",
+                "module": METRIC_MODULE,
+                "metric_type": "operational",
+                "value": float(applied),
+                "unit": "count",
+                "n_floor": 0,
+                "status": "FAIL" if failed else "OK",
+                "status_reason": "; ".join(outcomes) or "no waiting Flex statements",
+                "source_path": uri,
+                "last_updated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+    except Exception:
+        _LOG.exception("statement_backfill_applied metric NOT recorded: %s", outcomes)
+
+
 def reconcile_cycle(
     ctx: RunContext,
     *,
@@ -349,6 +448,8 @@ def reconcile_cycle(
     when given, step 5a runs. ``dividend_waivers`` defaults to the declared file
     (:func:`~crucible_trader.dividend_entitlements.load_declared_waivers`).
     """
+    if ctx.run_mode != "replay":
+        apply_waiting_statements(ctx, now=dt.datetime.now(dt.UTC))
     day = ctx.trading_day.isoformat()
     broker = source.read_statement(day)
     anchor_entry = latest_anchor(ctx.store, day)
@@ -1086,4 +1187,6 @@ def run_reconciliation(
         store=store,
         trading_day=trading_day,
         run_mode=run_mode,
+        # A nested replay must return reclamation to the live dispatcher immediately.
+        transient_retry=run_mode != "replay",
     )

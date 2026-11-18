@@ -313,3 +313,9 @@ def _gateway_port_listens(monkeypatch) -> None:
 
     monkeypatch.setattr(broker_session, "port_listening", lambda host, port: True)
     monkeypatch.setattr(broker_session, "read_uptime_s", lambda: LONG_UPTIME_S)
+
+
+@pytest.fixture(autouse=True)
+def _local_flex_source(tmp_path, monkeypatch):
+    """Daily recovery reads an empty local source unless a test supplies Flex files."""
+    monkeypatch.setenv("CRUCIBLE_TRADER_IB_FLEX_URI", str(tmp_path / "empty-flex"))
