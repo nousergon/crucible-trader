@@ -143,8 +143,14 @@ jobs:
       # one. pip-audit is installed with bare `pip`, not `uv run --with`: it is a
       # CI-only tool, so it belongs in neither `pyproject.toml` nor `uv.lock`,
       # and `uv run --with` would re-resolve an environment.
-      - name: Install pip-audit
-        run: python3 -m pip install --quiet --upgrade pip pip-audit
+      #
+      # On the project's Python, never the runner's: pip-audit builds its
+      # resolver venv from the interpreter it runs under, and on 2026-11-18 the
+      # runner's `python3` became 3.14, outside `requires-python` (>=3.12,<3.13),
+      # so every audit failed with "requires a different Python". `uvx` runs it
+      # in its own tool environment, so the project's lockfile is untouched.
+      - name: Install the project's Python for pip-audit
+        run: uv python install 3.12
 
       - name: Security audit (pip-audit)
         run: |
@@ -156,7 +162,7 @@ jobs:
               IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
             done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
           fi
-          pip-audit -r /tmp/requirements-audit.txt "${IGNORE_ARGS[@]}"
+          uvx --python 3.12 pip-audit -r /tmp/requirements-audit.txt "${IGNORE_ARGS[@]}"
 
       # The blocking gate. `--cov=crucible_trader` measures the WHOLE package
       # (`repository-baseline-policy` §4.2 C1), not just the modules this
