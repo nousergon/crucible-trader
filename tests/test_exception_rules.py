@@ -750,3 +750,29 @@ def test_an_unsampled_clear_leaves_the_queue():
     assert [q["proposal_id"] for q in doc["queue"]] == [first["proposal_id"]]
     assert [c["status"] for c in doc["rule_clears"]] == ["cleared", "audit"]
     assert doc["totals"]["cleared"] == 2 and doc["totals"]["audit"] == 1
+
+
+def test_an_audit_item_ages_from_the_day_it_was_cleared():
+    """alpha-engine-config-I14054: a 10-trading-day-old break cleared today is
+    age 0 and not overdue; an undecided break keeps its break-day age."""
+    from crucible_trader.exception_decision import _expires
+
+    old, open_ = proposal(1, "2026-11-04", "cash_delta"), proposal(2, "2026-11-04", "stale_anchor")
+    today = "2026-11-18"
+    clear = rule_clear(
+        old,
+        rule_id="R1",
+        evidence=[{"role": "r", "record": "k"}],
+        arithmetic={},
+        note="n",
+        decided_at=f"{today}T22:00:00Z",
+    )
+    doc = score([old, open_], [], as_of=today, generated_at=NOW, clears=[clear])
+    by_id = {q["proposal_id"]: q for q in doc["queue"]}
+    audit, undecided = by_id[old["proposal_id"]], by_id[open_["proposal_id"]]
+    assert audit["status"] == "audit"
+    assert audit["age_trading_days"] == 0 and audit["overdue"] is False
+    assert audit["expires"] == _expires(today)
+    assert undecided["status"] == "undecided"
+    assert undecided["age_trading_days"] == 10 and undecided["overdue"] is True
+    assert undecided["expires"] == _expires("2026-11-04")
