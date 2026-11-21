@@ -839,7 +839,12 @@ def score(
             continue
         elif decision is not None and verdict == "reject":
             clear = by_id.get(cast("str", decision["supersedes"]))
-        age = _age(cast("str", proposal["trading_day"]), as_of)
+        # An audit item has been cleared, not left: its clock starts the day
+        # the rule cleared it, not the break day (alpha-engine-config-I14054).
+        since = cast("str", proposal["trading_day"])
+        if verdict == RULE_VERDICT:
+            since = cast("str", cast("Mapping[str, object]", decision)["decided_at"])[:10]
+        age = _age(since, as_of)
         record = (exceptions or {}).get(cast("str", proposal["exception_id"]))
         if record is not None and record.get("tenant") != proposal["tenant"]:
             record = None
@@ -857,7 +862,7 @@ def score(
                 "standing_decision_id": decision["decision_id"] if decision is not None else None,
                 "age_trading_days": age,
                 "overdue": age > AGE_LIMIT_TRADING_DAYS,
-                "expires": _expires(cast("str", proposal["trading_day"])),
+                "expires": _expires(since),
                 **_evidence(record),
                 **plain_fields(proposal, record),
                 "rule_clear": _clear_view(clear, sampled=sampled, demoted=demoted),
