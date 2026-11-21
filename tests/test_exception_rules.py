@@ -239,9 +239,11 @@ class TestTheThreeRealBreaks:
         # Each rule's first clear is sampled, so all three return for audit.
         assert len(sampled) == 3
         assert {q["status"] for q in doc["queue"]} == {"audit"}
+        assert {q["review"] for q in doc["queue"]} == {"audit"}
         assert doc["totals"]["cleared"] == 3 and doc["totals"]["audit"] == 3
         assert {c["cleared_by_rule"] for c in doc["rule_clears"]} == {"R1", "R2", "R3"}
         assert all(q["rule_clear"]["sampled"] for q in doc["queue"])
+        assert all(q["supersedes"] == q["rule_clear"]["decision_id"] for q in doc["queue"])
 
 
 class TestWhenARuleDoesNotClear:
@@ -352,8 +354,11 @@ class TestAuditAndDemotion:
         clears = load_rule_clears(store)
         r1 = next(c for c in clears if c["decided_by"] == "rule:R1")
         p = next(q for q in load_proposals(store) if q["proposal_id"] == r1["proposal_id"])
+        before = score(load_proposals(store), [], as_of=AS_OF, generated_at=NOW, clears=clears)
+        item = next(q for q in before["queue"] if q["proposal_id"] == p["proposal_id"])
+        assert item["review"] == "audit" and item["supersedes"] == r1["decision_id"]
         ok = decide(
-            p, verdict="confirm", decided_by="brian", decided_at=NOW, supersedes=r1["decision_id"]
+            p, verdict="confirm", decided_by="brian", decided_at=NOW, supersedes=item["supersedes"]
         )
         record_decision(store, ok)
         doc = score(load_proposals(store), [ok], as_of=AS_OF, generated_at=NOW, clears=clears)
@@ -771,8 +776,10 @@ def test_an_audit_item_ages_from_the_day_it_was_cleared():
     by_id = {q["proposal_id"]: q for q in doc["queue"]}
     audit, undecided = by_id[old["proposal_id"]], by_id[open_["proposal_id"]]
     assert audit["status"] == "audit"
+    assert audit["review"] == "audit" and audit["supersedes"] == clear["decision_id"]
     assert audit["age_trading_days"] == 0 and audit["overdue"] is False
     assert audit["expires"] == _expires(today)
     assert undecided["status"] == "undecided"
+    assert undecided["review"] == "break" and undecided["supersedes"] is None
     assert undecided["age_trading_days"] == 10 and undecided["overdue"] is True
     assert undecided["expires"] == _expires("2026-11-04")
