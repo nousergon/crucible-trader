@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily v2 market-close Telegram notice (alpha-engine-config-I12024)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:07:00 America/New_York
+Persistent=false
+Unit=alpha-engine-v2-market-close-alert.service
+
+[Install]
+WantedBy=timers.target
