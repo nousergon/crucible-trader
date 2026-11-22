@@ -367,3 +367,91 @@ class TestInterestPosting:
         assert result.clean
         assert result.interest_posted_usd is None
         assert result.cash_rounded_to_broker_usd == 0.02
+
+
+class TestCashComponents:
+    """The arithmetic behind expected cash is recorded (alpha-engine-config-I14133)."""
+
+    PARTS = ("start_balance_usd", "fills_usd", "flows_usd", "dividends_usd", "interest_usd")
+
+    def total(self, components):
+        return round(sum(components[k] for k in self.PARTS), 2)
+
+    def test_five_parts_sum_to_expected_cash_to_the_cent(self):
+        div = CorporateAction(
+            ticker="AAA", kind="cash_dividend", amount_per_share=0.5, entitled_shares=10
+        )
+        result = reconcile(
+            inputs(
+                statement({"AAA": 10}, cash=1_000.0, day=PREV),
+                statement({"AAA": 15}, cash=1_000.0 - 500.0 + 3.5 + 5.0),
+                fills=(Fill("AAA", 5, -500.0),),
+                cash_flows=(CashFlow("interest", 3.5),),
+                corporate_actions=resolved("AAA", actions=(div,)),
+            )
+        )
+        assert result.clean
+        components = result.cash_components
+        assert components is not None
+        assert components["anchor_trading_day"] == PREV
+        assert components["start_balance_usd"] == 1_000.0
+        assert components["fills_usd"] == -500.0
+        assert components["flows_usd"] == 3.5
+        assert components["dividends_usd"] == 5.0
+        assert components["interest_usd"] == 0.0
+        assert components["broker_cash_usd"] == 508.5
+        assert components["expected_cash_usd"] == result.expected_cash_usd
+        assert self.total(components) == result.expected_cash_usd
+        assert result.to_document()["cash_components"] == dict(components)
+
+    def test_posted_interest_is_a_component(self):
+        result = reconcile(TestInterestPosting().eleven_four())
+        components = result.cash_components
+        assert components is not None
+        assert components["interest_usd"] == 107.69
+        assert self.total(components) == result.expected_cash_usd
+
+    def test_credited_owed_dividend_counts_in_dividends(self):
+        from crucible_trader.reconciliation import OwedDividend
+
+        owed = OwedDividend("AAA", "2026-09-01", 7.25)
+        result = reconcile(
+            inputs(
+                statement({}, cash=100.0, day=PREV),
+                statement({}, cash=107.25),
+                owed_dividends=(owed,),
+            )
+        )
+        assert result.dividend_credits
+        components = result.cash_components
+        assert components is not None
+        assert components["dividends_usd"] == 7.25
+        assert self.total(components) == result.expected_cash_usd
+
+    def test_a_cash_break_still_carries_the_components(self):
+        result = reconcile(inputs(statement({}, cash=100.0, day=PREV), statement({}, cash=112.0)))
+        components = result.cash_components
+        assert components is not None
+        assert components["expected_cash_usd"] == 100.0
+        assert components["broker_cash_usd"] == 112.0
+        assert self.total(components) == 100.0
+
+    def test_genesis_and_no_anchor_carry_null(self):
+        genesis = reconcile(inputs(None, statement({}, cash=50.0), genesis=True))
+        assert genesis.cash_components is None
+        assert genesis.to_document()["cash_components"] is None
+        no_anchor = reconcile(inputs(None, statement({}, cash=50.0)))
+        assert classes(no_anchor) == ["no_anchor"]
+        assert no_anchor.cash_components is None
+        assert no_anchor.to_document()["cash_components"] is None
+
+    def test_the_field_is_additive_and_schema_version_unchanged(self):
+        document = reconcile(
+            inputs(statement({}, cash=100.0, day=PREV), statement({}, cash=100.0))
+        ).to_document()
+        assert document["schema_version"] == "broker_reconciliation.v1"
+        legacy = {k: v for k, v in document.items() if k != "cash_components"}
+        # A reader that picks fields by name sees exactly what it saw before.
+        assert legacy["expected_cash_usd"] == 100.0
+        assert legacy["cash_residual_usd"] == 0.0
+        assert "cash_components" in document
