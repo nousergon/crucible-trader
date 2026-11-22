@@ -858,6 +858,8 @@ def score(
                 "status": {"defer": "deferred", RULE_VERDICT: "audit", "reject": "rejected"}.get(
                     verdict, verdict
                 ),
+                "review": "audit" if verdict == RULE_VERDICT else "break",
+                "supersedes": clear["decision_id"] if verdict == RULE_VERDICT and clear else None,
                 "note": decision["note"] if decision is not None else None,
                 "standing_decision_id": decision["decision_id"] if decision is not None else None,
                 "age_trading_days": age,
