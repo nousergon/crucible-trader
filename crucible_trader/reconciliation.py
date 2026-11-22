@@ -387,6 +387,12 @@ class ReconciliationResult:
     #: and credited only within :data:`INTEREST_RATE_CAP` (:func:`_interest_posted`).
     #: ``None`` when nothing was credited.
     interest_posted_usd: float | None = None
+    #: The arithmetic behind ``expected_cash_usd``, so a reviewer of a cash break
+    #: can see which input is wrong: ``start_balance_usd + fills_usd + flows_usd
+    #: + dividends_usd + interest_usd`` (each rounded to cents) is the expected
+    #: cash before the cents-wide rounding to IB's figure. ``None`` when there
+    #: was no anchor (genesis or ``no_anchor``). Additive: schema version unchanged.
+    cash_components: Mapping[str, float | str | None] | None = None
 
     @property
     def match_rate(self) -> float | None:
@@ -424,6 +430,9 @@ class ReconciliationResult:
             "dividends_owed": [d.to_document() for d in self.dividends_owed],
             "dividends_waived": [d.to_document() for d in self.dividends_waived],
             "interest_posted_usd": self.interest_posted_usd,
+            "cash_components": (
+                None if self.cash_components is None else dict(self.cash_components)
+            ),
             "corporate_action_check": (
                 None if self.corporate_action_check is None else dict(self.corporate_action_check)
             ),
@@ -679,6 +688,14 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
     interest = _interest_posted(inputs, expected_cash)
     if interest is not None:
         expected_cash += interest
+    cash_components: dict[str, float | str | None] = {
+        "anchor_trading_day": inputs.anchor.trading_day,
+        "start_balance_usd": round(inputs.anchor.cash_usd, 2),
+        "fills_usd": round(sum(f.cash_usd for f in inputs.fills), 2),
+        "flows_usd": round(sum(c.cash_usd for c in inputs.cash_flows), 2),
+        "dividends_usd": round(sum(dividends.values()) + sum(c.amount_usd for c in credits), 2),
+        "interest_usd": round(interest or 0.0, 2),
+    }
     residual = inputs.broker.cash_usd - expected_cash
     unpaid_today: list[OwedDividend] = []
     if abs(_cash_cents_off(inputs.broker.cash_usd, expected_cash)) > _CASH_TOLERANCE_CENTS:
@@ -755,6 +772,7 @@ def reconcile(inputs: ReconciliationInputs) -> ReconciliationResult:
         dividends_waived=waived,
         corporate_action_check=check,
         interest_posted_usd=interest,
+        cash_components=cash_components,
     )
 
 
@@ -774,6 +792,7 @@ def _result(
     dividends_waived: tuple[DividendWaiver, ...] = (),
     corporate_action_check: Mapping[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
     interest_posted_usd: float | None = None,
+    cash_components: dict[str, float | str | None] | None = None,
 ) -> ReconciliationResult:
     order = {klass: i for i, klass in enumerate(DISCREPANCY_CLASSES)}
     return ReconciliationResult(
@@ -807,6 +826,20 @@ def _result(
         dividends_waived=dividends_waived,
         corporate_action_check=corporate_action_check,
         interest_posted_usd=interest_posted_usd,
+        cash_components=(
+            None
+            if cash_components is None or expected_cash is None
+            else {
+                **cash_components,
+                "expected_cash_usd": round(
+                    inputs.broker.cash_usd
+                    if cash_rounded_to_broker_usd is not None
+                    else expected_cash,
+                    2,
+                ),
+                "broker_cash_usd": round(inputs.broker.cash_usd, 2),
+            }
+        ),
     )
 
 
