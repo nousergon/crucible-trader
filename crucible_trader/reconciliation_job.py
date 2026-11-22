@@ -148,7 +148,7 @@ from crucible_trader.exception_record import (
     records_from_order_intent_reconciliation,
 )
 from crucible_trader.exception_rules import file_rule_clears, registry
-from crucible_trader.ledger import load_ledger, post_daily_ledger
+from crucible_trader.ledger import Entry, load_journals, load_ledger, post_daily_ledger
 from crucible_trader.ledger_views import publish_ledger_views
 from crucible_trader.month_end_close import close_prior_month
 from crucible_trader.month_rebuild import verify_month_rebuild
@@ -181,6 +181,7 @@ from crucible_trader.reconciliation_control import (
     ReconciliationVoidError,
     run_control_arm,
 )
+from crucible_trader.tier3_evidence import cash_pack, trading_days_between
 
 _LOG = logging.getLogger(__name__)
 
@@ -910,6 +911,56 @@ EXCEPTION_OVERDUE_METRIC = "exception_queue_overdue"
 _OVERDUE_NAMED = 5
 
 
+def _tier3_packs(
+    store: Store, records: Sequence[Mapping[str, object]], as_of: str
+) -> dict[str, Mapping[str, object]]:
+    """The tier-3 evidence pack (:func:`~crucible_trader.tier3_evidence.cash_pack`)
+    of each queued exception ``record`` that has one, by exception id.
+
+    A pack that cannot be built is left out, so that item shows ``tier3: null``
+    and the score still files. Deviation from refuse-never-degrade
+    (CONTRIBUTING rule 1): the failure swallowed is any error reading the
+    reconciliation document, the exception history or the
+    journals for one item; the primary deliverable, the score and queue, does
+    not depend on the pack and survives; the recording surface is a logged
+    warning naming the exception id and the item's null ``tier3``."""
+    after = (dt.date.fromisoformat(as_of) + dt.timedelta(days=1)).isoformat()
+    journals: dict[str, dict[str, tuple[Entry, ...]]] = {}
+    packs: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        exception_id = str(record["exception_id"])
+        try:
+            if record.get("unit") != "usd":
+                continue
+            detected = cast("Mapping[str, object]", record["detected_by"])
+            document = cast(
+                "Mapping[str, object]",
+                json.loads(store.get_bytes(str(detected["document_key"])).decode("utf-8")),
+            )
+            tenant = str(record["tenant"])
+            if tenant not in journals:
+                journals[tenant] = load_journals(store, tenant, before=after)
+            gap = next(
+                (
+                    e
+                    for entries in journals[tenant].values()
+                    for e in entries
+                    if e.kind == "cash_gap"
+                    and exception_id in cast("list[object]", e.evidence.get("exception_ids") or [])
+                ),
+                None,
+            )
+            history = load_exception_records(
+                store, trading_days_between(str(record["trading_day"]), as_of)
+            )
+            pack = cash_pack(record, document, list(history.values()), gap, as_of=as_of)
+            if pack is not None:
+                packs[exception_id] = pack
+        except Exception:  # noqa: BLE001 - see docstring: a pack never fails the score
+            _LOG.warning("tier-3 pack for exception %s was NOT built", exception_id, exc_info=True)
+    return packs
+
+
 def file_exception_score(ctx: RunContext, *, now: str) -> None:
     """Step 5e: file the back office's score and queue for the day. Never raises.
 
@@ -943,16 +994,35 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
     try:
         key = exception_score_key(day)
         proposals = load_proposals(ctx.store, until=day)
+        decisions = load_decisions(ctx.store)
+        records = load_exception_records(ctx.store, (str(p["trading_day"]) for p in proposals))
+        clears = load_rule_clears(ctx.store, until=day)
+        rules = registry()
         document = score(
             proposals,
-            load_decisions(ctx.store),
+            decisions,
             as_of=day,
             generated_at=now,
-            exceptions=load_exception_records(
-                ctx.store, (str(p["trading_day"]) for p in proposals)
-            ),
-            clears=load_rule_clears(ctx.store, until=day),
-            rules=registry(),
+            exceptions=records,
+            clears=clears,
+            rules=rules,
+        )
+        # The queue is known only once scored, so the packs are built for its
+        # items and the score is derived again with them
+        # (`alpha-engine-config-I14134`).
+        queued = {
+            str(q["exception_id"]) for q in cast("list[Mapping[str, object]]", document["queue"])
+        }
+        packs = _tier3_packs(ctx.store, [r for i, r in records.items() if i in queued], day)
+        document = score(
+            proposals,
+            decisions,
+            as_of=day,
+            generated_at=now,
+            exceptions=records,
+            clears=clears,
+            rules=rules,
+            packs=packs,
         )
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         ctx.record_output(key, payload, SCORE_SCHEMA_VERSION)

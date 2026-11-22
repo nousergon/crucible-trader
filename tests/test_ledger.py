@@ -34,6 +34,7 @@ from crucible_trader.ledger import (
     Posting,
     book_day,
     clearing_decisions,
+    clearing_postings,
     entry_from_document,
     journal_digest,
     journal_key,
@@ -931,6 +932,24 @@ class TestClearingADecidedBreak:
         }
         assert ledger.positions(T, "DU1") == {"AAA": 9}
         assert posting.document["suspense"]["shares"] == {}
+
+    def test_clearing_postings_are_exactly_what_the_booking_posts(self):
+        for kwargs, verdict in (
+            ({}, {}),
+            (
+                {"positions": {"AAA": 9}, "cash": 1_000.0},
+                {
+                    "verdict": "correct",
+                    "nature": "event",
+                    "action": "investigate_shares",
+                    "note": "n",
+                },
+            ),
+        ):
+            ledger, gap = gapped_ledger(DAY, **kwargs)
+            decision = decision_on(gap.evidence["exception_ids"][0], **verdict)
+            (adjustment,) = next_day(ledger, [decision], **kwargs).entries
+            assert list(adjustment.postings) == clearing_postings(gap)
 
     def test_defer_superseded_conflicted_other_tenant_and_same_day_clear_nothing(self):
         ledger, gap = gapped_ledger(DAY)

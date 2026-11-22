@@ -751,6 +751,7 @@ def score(
     exceptions: Mapping[str, Mapping[str, object]] | None = None,
     clears: Sequence[Mapping[str, object]] = (),
     rules: Sequence[Mapping[str, object]] = (),
+    packs: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """The `exception_score.v1` document over every proposal up to ``as_of``.
 
@@ -773,6 +774,11 @@ def score(
     (:func:`cash_tier`) and ``cited_records``; with no such record those are
     null and an empty list (a month-end close line has none under
     ``trader/exceptions/``).
+
+    ``packs`` are the tier-3 evidence packs
+    (:func:`crucible_trader.tier3_evidence.cash_pack`) by exception id; each
+    queue item carries its own as ``tier3``, null when it has none
+    (`alpha-engine-config-I14134`).
     """
     _day(as_of)
     clears = [c for c in clears if str(c["trading_day"]) <= as_of]
@@ -865,6 +871,7 @@ def score(
                 "expires": _expires(since),
                 **_evidence(record),
                 **plain_fields(proposal, record),
+                "tier3": (packs or {}).get(cast("str", proposal["exception_id"])),
                 "rule_clear": _clear_view(clear, sampled=sampled, demoted=demoted),
             }
         )
