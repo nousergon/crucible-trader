@@ -1,0 +1,12 @@
+[Unit]
+Description=v2 trading session watchdog, every 5 minutes in market hours (alpha-engine-config-I12024)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09..15:00/5:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:05:00 America/New_York
+AccuracySec=10s
+Persistent=false
+Unit=alpha-engine-v2-session-watchdog.service
+
+[Install]
+WantedBy=timers.target

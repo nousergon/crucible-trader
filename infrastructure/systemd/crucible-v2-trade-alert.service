@@ -1,0 +1,31 @@
+[Unit]
+Description=Telegram alerts for the v2 trader's daily session (alpha-engine-config-I13005)
+# Started by alpha-engine-trader-session.service through OnSuccess= and
+# OnFailure=. It never starts, retries or touches the trader: it reads what the
+# session wrote to the v2 store (as the trader's role, via the profile in the
+# trader's env file, which it reads itself) and sends one alert per filled
+# order to the #trades topic plus one session summary, through the executor's
+# existing Telegram path. It runs from the EXECUTOR's venv, not the trader's.
+# alpha-engine-config-I13284: it exits non-zero when the session summary was
+# not delivered, the run record could not be read, or the fills the run wrote
+# could not be read, and that pages through the notifier the trader units use.
+OnFailure=alpha-engine-trader-failed@%n.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/crucible-trader
+# alpha-engine-config-I13544: the session's OnSuccess= fires even when its
+# hours gate skipped it (systemd starts OnSuccess= on any activating->inactive
+# transition). Skip quietly when the session never ran; anything else,
+# including an unreadable Result, sends the alert.
+ExecCondition=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/session-hours-gate.sh session-ran
+ExecStart=/usr/bin/env bash /home/ec2-user/crucible-trader/scripts/trader_box.sh trade_alert
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1
+Environment=ALPHA_ENGINE_DEPLOYED=1

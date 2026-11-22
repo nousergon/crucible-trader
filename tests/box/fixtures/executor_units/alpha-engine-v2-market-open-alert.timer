@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily v2 market-open Telegram notice (alpha-engine-config-I12024)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:40:00 America/New_York
+Persistent=false
+Unit=alpha-engine-v2-market-open-alert.service
+
+[Install]
+WantedBy=timers.target
