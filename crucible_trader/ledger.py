@@ -932,6 +932,28 @@ def clearing_decisions(
     return out
 
 
+def clearing_postings(gap: Entry) -> list[Posting]:
+    """The postings that clear ``gap``: its suspense moved to
+    :data:`RECONCILIATION_ADJUSTMENTS` (cash) or :data:`SHARE_ADJUSTMENTS`
+    (shares). Pure; :func:`_book_clearances` books exactly these, and the
+    back-office evidence pack shows them before a reviewer approves
+    (`alpha-engine-config-I14134`)."""
+    postings: list[Posting] = []
+    for p in gap.postings:
+        if p.account == SUSPENSE_CASH and p.amount_cents:
+            postings += [
+                Posting(SUSPENSE_CASH, -p.amount_cents),
+                Posting(RECONCILIATION_ADJUSTMENTS, p.amount_cents),
+            ]
+        elif p.account.startswith(SUSPENSE_POSITION) and p.quantity:
+            ticker = p.account[len(SUSPENSE_POSITION) :]
+            postings += [
+                Posting(p.account, 0, -p.quantity),
+                Posting(SHARE_ADJUSTMENTS + ticker, 0, p.quantity),
+            ]
+    return postings
+
+
 def _book_clearances(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[str, object]]:  # pyright: ignore[reportExplicitAny]
     """Book one ``adjustment`` per open gap a reviewer has decided, moving its
     suspense to :data:`RECONCILIATION_ADJUSTMENTS` / :data:`SHARE_ADJUSTMENTS`.
@@ -965,19 +987,7 @@ def _book_clearances(ledger: Ledger, inputs: DayInputs, book: Any) -> list[dict[
         decision = next((decided[i] for i in (*ids, *lines) if i in decided), None)
         if decision is None:
             continue
-        postings: list[Posting] = []
-        for p in gap.postings:
-            if p.account == SUSPENSE_CASH and p.amount_cents:
-                postings += [
-                    Posting(SUSPENSE_CASH, -p.amount_cents),
-                    Posting(RECONCILIATION_ADJUSTMENTS, p.amount_cents),
-                ]
-            elif p.account.startswith(SUSPENSE_POSITION) and p.quantity:
-                ticker = p.account[len(SUSPENSE_POSITION) :]
-                postings += [
-                    Posting(p.account, 0, -p.quantity),
-                    Posting(SHARE_ADJUSTMENTS + ticker, 0, p.quantity),
-                ]
+        postings = clearing_postings(gap)
         decision_id = str(decision["decision_id"])
         book(
             "adjustment",

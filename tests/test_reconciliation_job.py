@@ -944,3 +944,60 @@ class TestExceptionScore:
         assert "share_delta: AAA" in page
         assert store.exists(exception_score_key(DAY.isoformat()))
         assert "score metric for 2026-09-11 was NOT recorded" in caplog.text
+
+
+class TestTier3Packs:
+    """`alpha-engine-config-I14134`: each queued dollar break carries its
+    evidence pack, a share break carries none, and a pack that cannot be built
+    never fails the score."""
+
+    def _cash_break(self, store, ctx, cash=830.74):
+        put_anchor(store)
+        with pytest.raises(ReconciliationDiscrepancyError):
+            reconcile_cycle(
+                ctx,
+                source=FixedSource({"AAA": 12}, cash),
+                fills=(Fill("AAA", 2, -200.0),),
+                cash_flows=(),
+                corporate_actions=CorporateActionSet(frozenset({"AAA"})),
+            )
+
+    def test_a_cash_break_carries_its_pack_and_a_share_break_none(self, store):
+        from crucible_trader.reconciliation_job import file_exception_score
+
+        ctx = ctx_for(store)
+        self._cash_break(store, ctx)
+        file_exception_score(ctx, now="2026-09-11T22:00:00Z")
+        (item,) = output(store, exception_score_key(DAY.isoformat()))["queue"]
+        pack = item["tier3"]
+        assert pack["start_balance"] == "$1,000.00" and pack["fills"] == "-$200.00"
+        assert pack["expected"] == "$800.00" and pack["broker"] == "$830.74"
+        assert [r["status"] for r in pack["break_history"]] == ["open"]
+        (first, second) = pack["approval_journal"]
+        assert first == {"account": "suspense:cash_gap", "debit": "$30.74", "credit": "$0.00"}
+        assert second["account"] == "income:reconciliation_adjustments"
+        assert second["credit"] == "$30.74"
+
+    def test_a_share_break_has_no_pack(self, store):
+        from crucible_trader.reconciliation_job import file_exception_score
+
+        ctx = ctx_for(store)
+        TestExceptionRecords()._discrepant(store, ctx)
+        file_exception_score(ctx, now="2026-09-11T22:00:00Z")
+        (item,) = output(store, exception_score_key(DAY.isoformat()))["queue"]
+        assert item["tier3"] is None
+
+    def test_a_pack_that_cannot_be_built_never_fails_the_score(self, store, caplog):
+        from crucible_trader.reconciliation_job import file_exception_score
+
+        ctx = ctx_for(store)
+        self._cash_break(store, ctx)
+        (record,) = output(store, exceptions_key(DAY.isoformat()))["records"]
+        (store.root / record["detected_by"]["document_key"]).unlink()
+        ctx = ctx_for(store)
+        file_exception_score(ctx, now="2026-09-11T22:00:00Z")
+        (item,) = output(store, exception_score_key(DAY.isoformat()))["queue"]
+        assert item["tier3"] is None
+        (metric,) = [m for m in ctx.metrics if m["name"] == EXCEPTION_SCORE_METRIC]
+        assert metric["status"] == "OK"
+        assert "was NOT built" in caplog.text
