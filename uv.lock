@@ -226,7 +226,7 @@ wheels = [
 [[package]]
 name = "crucible"
 version = "0.1.0"
-source = { git = "https://github.com/nousergon/crucible?rev=4142c57b55555e3281334afe430fa9b1c693781f#4142c57b55555e3281334afe430fa9b1c693781f" }
+source = { git = "https://github.com/nousergon/crucible?rev=4de391a4aeb825ff10b9bd1710baf2bf285134d3#4de391a4aeb825ff10b9bd1710baf2bf285134d3" }
 dependencies = [
     { name = "boto3" },
     { name = "cvxpy" },
@@ -265,7 +265,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "crucible", git = "https://github.com/nousergon/crucible?rev=4142c57b55555e3281334afe430fa9b1c693781f" },
+    { name = "crucible", git = "https://github.com/nousergon/crucible?rev=4de391a4aeb825ff10b9bd1710baf2bf285134d3" },
     { name = "ib-async", marker = "extra == 'ib'", specifier = "==2.1.0" },
     { name = "packaging", specifier = ">=24.0" },
 ]
@@ -528,7 +528,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.90"
+version = "0.59.96"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -536,9 +536,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/46/09/94ef1014344b1c9ac20ffae9d45bd8f4865c03451f5b8b3592300f172711/krepis-0.59.90.tar.gz", hash = "sha256:cd4ac986c07574033221751cbd94ddd4c29d72a5c75d9c35a6f0e23a52b3cf7b", size = 821185, upload-time = "2026-11-03T03:47:15.117Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/b8/4e25d7bfbdb1fcad6ce7c80ea514e6e35341a1b8ac7051c1dec27eb47360/krepis-0.59.96.tar.gz", hash = "sha256:916ece5de1a31d61c9a9d6043739bb3ed6dcb798f3d3f416d39d39bf7519f3fa", size = 831767, upload-time = "2026-11-06T18:32:19.848Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/da/dc4edd2efce7d8a5e97958c4d2699c3cdffc9c015b8e9ce382232cf4ed67/krepis-0.59.90-py3-none-any.whl", hash = "sha256:4bf7cbb2203a884bdc018cb6b604336cf7149675d86044250f0a588fa9dbb29f", size = 508630, upload-time = "2026-11-03T03:47:13.497Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/43/1da5e2fe6d8814728eb8d9cabecbdd2a29a09f8f5ec3994202d115c86cb1/krepis-0.59.96-py3-none-any.whl", hash = "sha256:9dbcea42cf92a02a61d23f279b23ed76ea322efe7e4ad32f094c53082ebb848f", size = 515127, upload-time = "2026-11-06T18:32:17.69Z" },
 ]
 
 [package.optional-dependencies]
