@@ -30,6 +30,7 @@ from crucible_trader.paper_smoke import (
     run_smoke,
     running_wheel_disagreement,
     smoke_cycle,
+    staging_running_wheel_disagreement,
 )
 
 SHA = "c" * 40
@@ -100,6 +101,27 @@ class TestPinDisagreementPageCondition:
     def test_a_pin_naming_the_running_wheel_agrees(self, store) -> None:
         self._pin(store, SHA)
         assert running_wheel_disagreement(store, VERSION) is None
+
+
+class TestStagingRunningWheelDisagreement:
+    """alpha-engine-config-I12507: staging has no IB paper smoke, so its trader pin
+    can never be set; a staging session checks the wheel against the crucible sha its
+    box installed. Not relaxed: an unset, malformed or different sha disagrees."""
+
+    def test_an_unset_sha_is_a_disagreement(self) -> None:
+        assert "unset" in staging_running_wheel_disagreement(VERSION, None)
+        assert "unset" in staging_running_wheel_disagreement(VERSION, "")
+
+    def test_a_malformed_sha_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            staging_running_wheel_disagreement(VERSION, "main")
+
+    def test_another_wheel_is_a_disagreement(self) -> None:
+        assert "staging trader is running" in staging_running_wheel_disagreement(VERSION, "d" * 40)
+
+    def test_the_running_wheel_agrees_with_no_trader_pin(self, store) -> None:
+        assert staging_running_wheel_disagreement(VERSION, SHA) is None
+        assert "unset" in running_wheel_disagreement(store, VERSION)  # prod's check is unchanged
 
 
 class TestSmokeCycle:

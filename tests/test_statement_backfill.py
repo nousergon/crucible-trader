@@ -449,10 +449,10 @@ class TestCli:
 
 
 def test_nothing_on_the_trading_path_imports_the_backfill():
-    """Failure isolation: an operator command, never reachable from the trader."""
+    """Only daily reconciliation may recover statements; order paths never import it."""
     pkg = pathlib.Path(statement_backfill.__file__).parent
     for path in pkg.glob("*.py"):
-        if path.name == "statement_backfill.py":
+        if path.name in {"statement_backfill.py", "reconciliation_job.py"}:
             continue
         assert not re.search(r"\bstatement_backfill\b", path.read_text(encoding="utf-8")), path.name
 

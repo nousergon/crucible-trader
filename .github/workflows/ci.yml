@@ -66,7 +66,7 @@ jobs:
             https://raw.githubusercontent.com/nousergon/nousergon-lib/main/scripts/hardcoded_env_refs.py
           python3 "$RUNNER_TEMP/hardcoded_env_refs.py" --repo .
 
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -95,7 +95,7 @@ jobs:
 
       # Strict typing, BLOCKING (fleet strict-typing rollout, 2026-10-23). Errors
       # recorded in `.basedpyright/baseline.json` are tolerated; any new one fails.
-      # On a PR, the baseline may only shrink: a count that grew for any rule means
+      # On a PR, the baseline may only shrink: a count that grew for any (file, rule) pair means
       # someone regenerated the baseline to absorb new errors, which is refused.
       - name: Type check (basedpyright strict, baseline may only shrink)
         env:
@@ -107,8 +107,18 @@ jobs:
             echo "::warning::type errors were fixed but .basedpyright/baseline.json was not shrunk; run basedpyright locally and commit the smaller baseline."
             git checkout -- .basedpyright/baseline.json
           fi
-          if [ -n "${BASE_REF}" ] && git fetch --quiet --depth=1 origin "${BASE_REF}" \
-             && git cat-file -e "FETCH_HEAD:.basedpyright/baseline.json" 2>/dev/null; then
+          if [ -n "${BASE_REF}" ]; then
+            fetched=0
+            for attempt in 1 2 3; do
+              if git fetch --quiet --depth=1 origin "${BASE_REF}"; then fetched=1; break; fi
+              sleep 5
+            done
+            if [ "${fetched}" -ne 1 ]; then
+              echo "::error::could not fetch the PR base ${BASE_REF} after 3 tries; the shrink-only baseline check cannot run, so this step fails (alpha-engine-config-I13481)."
+              exit 1
+            fi
+          fi
+          if [ -n "${BASE_REF}" ] && git cat-file -e "FETCH_HEAD:.basedpyright/baseline.json" 2>/dev/null; then
             git show "FETCH_HEAD:.basedpyright/baseline.json" > /tmp/baseline-base.json
             git show "HEAD:.basedpyright/baseline.json" > /tmp/baseline-head.json 2>/dev/null \
               || echo '{"files": {}}' > /tmp/baseline-head.json
@@ -116,11 +126,11 @@ jobs:
           import collections, json, sys
           def counts(path):
               files = json.load(open(path))["files"]
-              return collections.Counter(e["code"] for es in files.values() for e in es)
+              return collections.Counter((f, e["code"]) for f, es in files.items() for e in es)
           base, head = counts("/tmp/baseline-base.json"), counts("/tmp/baseline-head.json")
-          grown = {c: (base[c], n) for c, n in head.items() if n > base[c]}
-          for code, (b, n) in sorted(grown.items()):
-              print(f"::error::type baseline grew for {code}: {b} -> {n}. Fix the new errors instead of re-baselining.")
+          grown = {k: (base[k], n) for k, n in head.items() if n > base[k]}
+          for (path, code), (b, n) in sorted(grown.items()):
+              print(f"::error::type baseline grew for {code} in {path}: {b} -> {n}. Fix the new errors instead of re-baselining.")
           sys.exit(1 if grown else 0)
           PY
           fi
@@ -133,8 +143,14 @@ jobs:
       # one. pip-audit is installed with bare `pip`, not `uv run --with`: it is a
       # CI-only tool, so it belongs in neither `pyproject.toml` nor `uv.lock`,
       # and `uv run --with` would re-resolve an environment.
-      - name: Install pip-audit
-        run: python3 -m pip install --quiet --upgrade pip pip-audit
+      #
+      # On the project's Python, never the runner's: pip-audit builds its
+      # resolver venv from the interpreter it runs under, and on 2026-11-18 the
+      # runner's `python3` became 3.14, outside `requires-python` (>=3.12,<3.13),
+      # so every audit failed with "requires a different Python". `uvx` runs it
+      # in its own tool environment, so the project's lockfile is untouched.
+      - name: Install the project's Python for pip-audit
+        run: uv python install 3.12
 
       - name: Security audit (pip-audit)
         run: |
@@ -146,7 +162,7 @@ jobs:
               IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
             done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
           fi
-          pip-audit -r /tmp/requirements-audit.txt "${IGNORE_ARGS[@]}"
+          uvx --python 3.12 pip-audit -r /tmp/requirements-audit.txt "${IGNORE_ARGS[@]}"
 
       # The blocking gate. `--cov=crucible_trader` measures the WHOLE package
       # (`repository-baseline-policy` §4.2 C1), not just the modules this
@@ -175,7 +191,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
 
       - name: Build twice and require one sha256
         id: build

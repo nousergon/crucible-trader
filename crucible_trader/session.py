@@ -91,14 +91,20 @@ def session_cycle(
     construct: Callable[..., TargetBook] = construct_target_book,
     rules_guard: Callable[[RunContext], object] = enforce_v1_rules,
     hard_risk_facts: BrokerFacts | None = None,
+    wheel_check: Callable[[Store, str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Run one trading session's decision and orders. Raises on every refusal.
 
     ``hard_risk_facts`` (the broker's average costs, marks and NAV) switches the
     hard-risk layer on for the session; ``None`` (no broker: shadow, staging)
     leaves it off, and ``construct`` is then called exactly as before.
+
+    ``wheel_check`` is the start-of-session running-wheel check. ``None`` (prod)
+    is `running_wheel_disagreement` (the trader pin); a staging session passes
+    `staging_running_wheel_disagreement` (the staging store's release pointer).
     """
-    disagreement = running_wheel_disagreement(ctx.store, installed_version)
+    check = running_wheel_disagreement if wheel_check is None else wheel_check
+    disagreement = check(ctx.store, installed_version)
     if disagreement is not None:
         raise RunningWheelMismatchError(disagreement)
     rules_guard(ctx)  # reports only; never raises (no trading holds)

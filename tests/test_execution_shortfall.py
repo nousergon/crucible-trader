@@ -190,6 +190,36 @@ class TestTheThreeOutcomes:
         assert SHORTFALL_BAND.placeholder is True
         assert SHORTFALL_BAND.upper_bps > SHORTFALL_BAND.baseline_bps
 
+    @staticmethod
+    def _status(fill: float, band: ShortfallBand) -> dict:
+        doc = build_shortfall_document(
+            trading_day=DAY,
+            champion=CHAMPION,
+            fills=[_fill(side="sell", price=169.90, fill=fill, qty=1.0)],
+            now=NOW,
+            band=band,
+        )
+        return doc["metrics"][0]
+
+    def test_above_a_placeholder_band_reads_watch_not_ok(self) -> None:
+        # The 2026-11-12 NVDA sell: decided 169.90, filled 161.93, +469 bps.
+        metric = self._status(161.93, SHORTFALL_BAND)
+        assert metric["value"] == pytest.approx(469.1, abs=0.1)
+        assert metric["status"] == "WATCH"
+        assert "placeholder" in metric["status_reason"]
+
+    def test_above_a_calibrated_band_reads_fail(self) -> None:
+        band = ShortfallBand(baseline_bps=0.0, upper_bps=25.0, placeholder=False)
+        assert self._status(161.93, band)["status"] == "FAIL"
+
+    def test_within_the_band_or_better_than_decision_reads_ok(self) -> None:
+        for band in (
+            SHORTFALL_BAND,
+            ShortfallBand(baseline_bps=0.0, upper_bps=25.0, placeholder=False),
+        ):
+            assert self._status(169.89, band)["status"] == "OK"  # ~0.6 bps cost
+            assert self._status(170.50, band)["status"] == "OK"  # sold above decision
+
 
 class TestTheHarnessReadsWhatTheTraderWrote:
     """The producer/consumer contract end to end: written here, reduced by

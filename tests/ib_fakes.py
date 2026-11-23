@@ -47,6 +47,7 @@ def broker_fill(
     price: float | None = None,
     order_ref: str = "",
     account: str = "DU1",
+    realized_pnl: float | None = None,
 ) -> SimpleNamespace:
     """An `ib_async.Fill`-shaped record as the session's fill store holds it:
     `reconcile_entrypoint.fills_from_ib` reads exactly this subset
@@ -60,7 +61,11 @@ def broker_fill(
     order's cumulative average, so the two differ from a second partial fill
     on."""
     exec_id = exec_id or f"{symbol}.{side}.{shares:g}.{time:%Y%m%d%H%M%S}.{client_id}"
-    report = None if commission is None else SimpleNamespace(execId=exec_id, commission=commission)
+    report = (
+        None
+        if commission is None
+        else SimpleNamespace(execId=exec_id, commission=commission, realizedPNL=realized_pnl)
+    )
     return SimpleNamespace(
         contract=SimpleNamespace(symbol=symbol),
         execution=SimpleNamespace(

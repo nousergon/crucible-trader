@@ -71,6 +71,37 @@ class TestFillsFromIb:
         (fill,) = fills_from_ib(client, DAY)
         assert fill == Fill(ticker="AAA", shares=-10, cash_usd=199.0)
 
+    def test_a_sale_carries_ibs_realized_figure_and_an_opening_buy_none(self):
+        """Brian 2026-11-13: each sale's realized gain is booked from IB's own
+        figure; an opening buy carries IB's unset sentinel, which is no figure."""
+        client = _Client(
+            [
+                broker_fill(
+                    "AAA",
+                    side="SLD",
+                    shares=4,
+                    avg_price=25.0,
+                    commission=1.0,
+                    realized_pnl=19.0,
+                    time=T,
+                    exec_id="s1",
+                ),
+                broker_fill(
+                    "BBB",
+                    side="BOT",
+                    shares=1,
+                    avg_price=1.0,
+                    commission=1.0,
+                    realized_pnl=1.7976931348623157e308,
+                    time=T,
+                    exec_id="b1",
+                ),
+            ]
+        )
+        by_id = {f.exec_id: f for f in fills_from_ib(client, DAY)}
+        assert by_id["s1"].realized_pnl_usd == 19.0
+        assert by_id["b1"].realized_pnl_usd is None
+
     def test_fills_on_another_day_are_excluded(self):
         client = _Client(
             [

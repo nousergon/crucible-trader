@@ -334,6 +334,8 @@ def test_every_planted_break_is_caught(tmp_path, monkeypatch):
     for i, plant in enumerate(PLANTS):
         store = LocalStore(tmp_path / str(i))
         monkeypatch.undo()
+        # undo() also drops conftest's Flex override; never read the real prefix.
+        monkeypatch.setenv("CRUCIBLE_TRADER_IB_FLEX_URI", str(tmp_path / "empty-flex"))
         arm(monkeypatch, plant)
         monkeypatch.setattr(
             ledger, "_panel_closes", lambda _s: lambda _d, names: dict.fromkeys(names, 1.0)

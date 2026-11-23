@@ -29,7 +29,8 @@ Three properties, enforced rather than requested:
    reconcile and the trader own the store. Nothing is overwritten, so there is
    nothing to back up; the refusal is the backup.
 3. **Failure-isolated from the trader.** Nothing in the trading path imports
-   this module; it is an operator command. A paging or void reconcile is an
+   this module; daily reconciliation also invokes it for missing days, with
+   replay excluded to prevent recursion. A paging or void reconcile is an
    expected OUTCOME of a backfill (the day may have real breaks) and is
    reported in the summary, never raised; the run manifest records it as the
    live job would.
@@ -76,10 +77,12 @@ import csv
 import datetime as dt
 import io
 import json
+import os
 import pathlib
 import sys
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -424,6 +427,34 @@ class FiledStatementSource:
 # -- 2. the cycle, captured --------------------------------------------------------
 
 
+@contextmanager
+def isolated_replay() -> Generator[None, None, None]:
+    """Keep the nested runner from replacing the live dispatch's identity.
+
+    The harness runner is process-scoped: the daily reconcile is single-threaded.
+    Mask its dispatch directory BEFORE replay, so even an abrupt process death
+    leaves the live manifest breadcrumb intact. Release only a provider capture
+    owned by this replay; an outer rehearsal keeps its own capture.
+    """
+    from crucible.llm import active_provider_ledger, end_provider_capture
+
+    outer_capture = active_provider_ledger()
+    names = ("KREPIS_RUN_ID", "CRUCIBLE_STATE_DIR", "CRUCIBLE_DISPATCH_ATTEMPTS")
+    saved = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            os.environ.pop(name, None)
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if outer_capture is None:
+            end_provider_capture()
+
+
 def backfill_day(
     backend: Store,
     statement: BrokerStatement,
@@ -472,18 +503,19 @@ def backfill_day(
     start = len(shared.writes) if shared is not None else 0
     outcome, error = "ok", None
     try:
-        runner(
-            view,
-            FiledStatementSource(statement),
-            trading_day=dt.date.fromisoformat(day),
-            fills=tuple(fills),
-            cash_flows=(),
-            corporate_actions=corporate_actions
-            if corporate_actions is not None
-            else live_corporate_action_source(),
-            run_mode="replay",
-            **({} if book is None else {"ledger_book": book}),
-        )
+        with isolated_replay():
+            runner(
+                view,
+                FiledStatementSource(statement),
+                trading_day=dt.date.fromisoformat(day),
+                fills=tuple(fills),
+                cash_flows=(),
+                corporate_actions=corporate_actions
+                if corporate_actions is not None
+                else live_corporate_action_source(),
+                run_mode="replay",
+                **({} if book is None else {"ledger_book": book}),
+            )
     except Exception as exc:  # noqa: BLE001 - a paging day is an outcome, not a crash
         outcome, error = "failed", f"{type(exc).__name__}: {exc}"
     ledger = capture_ledger_of(view)

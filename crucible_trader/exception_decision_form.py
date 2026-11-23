@@ -30,6 +30,13 @@ from dataclasses import dataclass
 from typing import cast
 
 from crucible_trader.exception_decision import effective_decisions
+from crucible_trader.exception_plain import (
+    ACTION_TEXT,
+    NATURE_TEXT,
+    headline,
+    side_figures,
+    sub,
+)
 from crucible_trader.exception_proposal import ACTIONS, NATURES
 
 __all__ = [
@@ -98,107 +105,30 @@ def content_security_policy(nonce: str) -> str:
     )
 
 
+#: The nature choices as the reviewer reads them in "Change the fix".
+_NATURE_CHOICE: dict[str, str] = {
+    "event": "A real event at the broker",
+    "defect": "A mistake on our side",
+    "detector": "Our checker misfired or lacked data",
+}
+
+
 def _e(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
-def _options(values: Iterable[str], *, blank: str | None = None) -> str:
+def _options(
+    values: Iterable[str], *, blank: str | None = None, words: Mapping[str, str] | None = None
+) -> str:
+    """``<option>`` tags whose value is the code the writer takes and whose text
+    is the plain sentence the reviewer reads (a code is the fallback)."""
     head = f'<option value="">{_e(blank)}</option>' if blank is not None else ""
-    return head + "".join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values)
-
-
-#: The proposed fix in plain words (Brian 2026-11-12: "I need to be able to
-#: understand what we are doing here. From the UX alone."). One sentence per
-#: action in :data:`~crucible_trader.exception_proposal.ACTIONS`; a test holds
-#: the two sets equal so a new action cannot reach the page as a bare code.
-ACTION_TEXT: dict[str, str] = {
-    "await_broker_corporate_action": "Wait for IB to book it. Nothing changes in our books yet.",
-    "book_corporate_action_manually": (
-        "Book the corporate action in our books by hand, from IB's notice."
-    ),
-    "accept_partial_fill": "Accept the partial fill as final.",
-    "investigate_cash": "Find the missing or wrong cash entry before anything is booked.",
-    "investigate_shares": "Find the missing or wrong share entry before anything is booked.",
-    "investigate_position_count": "Find which holding is missing on one side.",
-    "investigate_order": "Check the order with IB before anything is booked.",
-    "rerun_after_feed": "Run the check again once the late data has arrived.",
-    "refresh_anchor": "Restart the daily comparison from today's IB statement.",
-    "investigate_detector": (
-        "Check our own checker: the difference looks like a fault in detection."
-    ),
-}
-
-#: What kind of difference the machine thinks this is, in plain words.
-NATURE_TEXT: dict[str, str] = {
-    "event": "a real event at the broker",
-    "defect": "a mistake on our side",
-    "detector": "our checker misfired or lacked data",
-}
-
-
-def _money(value: float) -> str:
-    return f"${abs(value):,.2f}"
-
-
-def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    return float(value)
-
-
-def _sub(record: Mapping[str, object], name: str) -> Mapping[str, object]:
-    """A nested object of the record, or an empty one."""
-    found = record.get(name)
-    return cast("Mapping[str, object]", found) if isinstance(found, Mapping) else {}
-
-
-def _side_value(record: Mapping[str, object], side: str) -> float | None:
-    return _number(_sub(record, side).get("value"))
-
-
-def _signed_money(value: float) -> str:
-    return _money(value) if value >= 0 else "-" + _money(value)
-
-
-def _plain(value: float) -> str:
-    return f"{value:,g}"
-
-
-def headline(proposal: Mapping[str, object], record: Mapping[str, object] | None) -> str:
-    """One plain sentence saying what is different, from the exception record
-    when there is one. Unescaped: the caller escapes."""
-    rec = record or {}
-    kind = proposal.get("class")
-    amount = _number(rec.get("amount"))
-    instrument = rec.get("instrument")
-    if kind == "cash_delta" and amount is not None:
-        more = amount > 0
-        return f"IB shows {_money(amount)} {'more' if more else 'less'} cash than our books expect"
-    if kind == "stale_anchor":
-        return (
-            "The daily check skipped a day, so this day's comparison started from an old statement"
-        )
-    if kind == "corporate_action" and instrument:
-        return f"A corporate action on {instrument} is not yet booked at IB"
-    detail = rec.get("detail") or proposal.get("rationale") or kind
-    return str(detail)
+    said = words or {}
+    return head + "".join(f'<option value="{_e(v)}">{_e(said.get(v, v))}</option>' for v in values)
 
 
 def _sides(record: Mapping[str, object] | None) -> str:
-    if not record:
-        return ""
-    expected, actual = _side_value(record, "expected"), _side_value(record, "actual")
-    amount = _number(record.get("amount"))
-    usd = record.get("unit") == "usd"
-    fmt = _signed_money if usd else _plain
-    cells: list[tuple[str, str]] = []
-    if expected is not None:
-        cells.append(("Our books", fmt(expected)))
-    if actual is not None:
-        cells.append(("IB says", fmt(actual)))
-    if amount is not None:
-        sign = "+" if amount > 0 else "-" if amount < 0 else ""
-        cells.append(("Difference", sign + (_money(amount) if usd else f"{abs(amount):,g}")))
+    cells = side_figures(record)
     if not cells:
         return ""
     body = "".join(f'<div class="cell"><span>{_e(k)}</span><b>{_e(v)}</b></div>' for k, v in cells)
@@ -213,10 +143,10 @@ def _evidence(record: Mapping[str, object] | None) -> str:
         ("expected", "Our figure comes from"),
         ("actual", "IB's figure comes from"),
     ):
-        key = _sub(record, side).get("record")
+        key = sub(record, side).get("record")
         if key:
             rows.append((label, key))
-    manifest = _sub(record, "detected_by").get("manifest_key")
+    manifest = sub(record, "detected_by").get("manifest_key")
     if manifest:
         rows.append(("The check's run record", manifest))
     if not rows:
@@ -272,10 +202,10 @@ def _row(item: QueueItem, record: Mapping[str, object] | None = None) -> str:
             '<button type="submit" class="approve" data-verdict="agree">Approve the fix</button>'
             '<button type="submit" data-verdict="defer">Not now</button></div>'
             "<details><summary>Change the fix</summary>"
-            '<label>It is <select name="nature">'
-            f"{_options(NATURES, blank='-')}</select></label> "
-            '<label>Do instead <select name="action">'
-            f"{_options(ACTIONS, blank='-')}</select></label> "
+            '<label>What it really is <select name="nature">'
+            f"{_options(NATURES, blank='(keep)', words=_NATURE_CHOICE)}</select></label> "
+            '<label>What to do instead <select name="action">'
+            f"{_options(ACTIONS, blank='(keep)', words=ACTION_TEXT)}</select></label> "
             '<button type="submit" data-verdict="correct">Save my change</button></details>'
             "<output></output></form>"
         )
@@ -368,6 +298,14 @@ def render_queue_page(
         if waiting
         else ""
     )
+    books_line = (
+        f'<p class="books"><b>Are the books right today?</b> Not yet: {waiting} '
+        f"difference{'s' if waiting != 1 else ''} between our books and IB "
+        "still need a decision.</p>"
+        if waiting
+        else '<p class="books"><b>Are the books right today?</b> '
+        "Yes: nothing waits for a decision.</p>"
+    )
     scope = ", ".join(sorted(tenants)) or "none"
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -382,7 +320,7 @@ def render_queue_page(
         ".cell{flex:1 1 8rem;border:1px solid #8884;border-radius:8px;padding:.5rem}"
         ".cell span{display:block;font-size:.8rem;opacity:.7}.cell b{font-size:1.1rem}"
         ".fix{background:#8881;border-radius:8px;padding:.5rem .75rem}"
-        ".why{opacity:.75;font-size:.9rem}"
+        ".why{opacity:.75;font-size:.9rem}.books{font-size:1.05rem}"
         ".buttons{display:flex;gap:.5rem;flex-wrap:wrap;margin:.5rem 0}"
         "button{font:inherit;padding:.5rem 1rem;border-radius:8px;"
         "border:1px solid #8888;cursor:pointer}"
@@ -394,7 +332,7 @@ def render_queue_page(
         "dt{opacity:.7}dd{margin:0;overflow-wrap:anywhere}output{display:block;font-weight:600}"
         "</style></head><body>"
         "<h1>Back office: differences to decide</h1>"
-        f"{summary}"
+        f"{books_line}{summary}"
         f'<p class="meta">Signed in as <strong>{_e(reviewer)}</strong>, deciding for: {_e(scope)}. '
         "Each decision is saved permanently; a later one replaces it and both stay on record.</p>"
         f'{rows}<script nonce="{_e(nonce)}">{_SCRIPT}</script></body></html>'

@@ -52,6 +52,7 @@ from crucible_trader.order_router import (
     StagingRoutingRefusedError,
     build_router,
 )
+from crucible_trader.paper_smoke import RunningWheelMismatchError
 from crucible_trader.simulated_broker import (
     SIMULATED_FILLS_SCHEMA_VERSION,
     SimulatedFillsRefusedError,
@@ -434,7 +435,8 @@ def _staging_env(store, **extra):
         CRUCIBLE_TRADER_SIMULATED_FILLS="on",
         CRUCIBLE_TRADER_MAX_ORDER_NOTIONAL_USD="50000",
         CRUCIBLE_TRADER_MAX_SESSION_NOTIONAL_USD="100000",
-        **extra,
+        # What a dispatched staging box exports for the crucible it installed.
+        **{"CRUCIBLE_RELEASE_SHA": SHA, **extra},
     )
 
 
@@ -506,6 +508,42 @@ class TestAStagingSession:
         ]
         assert simulated["value"] == 2.0
         assert "no broker" in simulated["status_reason"]
+
+    @pytest.mark.parametrize("release_sha", ["", "d" * 40])
+    def test_it_checks_the_wheel_against_the_installed_release(
+        self, store, monkeypatch, release_sha
+    ) -> None:
+        """Staging has no IB paper smoke, so `trader/release_pin` is never set there
+        (measured 2026-11-17: the first staging session past bootstrap failed on it).
+        The session still checks its running wheel, against the sha the box installed."""
+        _simulated_world(store, monkeypatch)
+        store._path(TRADER_PIN_KEY).unlink()
+        with pytest.raises(RunningWheelMismatchError, match="CRUCIBLE_RELEASE_SHA"):
+            main(
+                [],
+                environ=_staging_env(store, CRUCIBLE_RELEASE_SHA=release_sha),
+                sdk_loader=_no_sdk,
+                version_reader=lambda: VERSION,
+                clock=lambda: NOW,
+                printer=lambda line: None,
+                router_factory=lambda config, **kw: pytest.fail("the prod router was built"),
+            )
+
+    def test_it_serves_with_no_trader_pin(self, store, monkeypatch) -> None:
+        _simulated_world(store, monkeypatch)
+        store._path(TRADER_PIN_KEY).unlink()
+        code = main(
+            [],
+            environ=_staging_env(store),
+            sdk_loader=_no_sdk,
+            version_reader=lambda: VERSION,
+            clock=lambda: NOW,
+            printer=lambda line: None,
+            router_factory=lambda config, **kw: pytest.fail("the prod router was built"),
+        )
+        assert code == 0
+        manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, BOUND)))
+        assert manifest["status"] == "ok", manifest.get("reason")
 
     def test_the_session_document_says_simulated(self, store, monkeypatch) -> None:
         _simulated_world(store, monkeypatch)
@@ -594,7 +632,12 @@ class TestAStagingSession:
         config = StagingSessionConfig.from_env(_staging_env(store))
         assert config is not None
         ctx = run_staging_session(
-            store, config=config, installed_version=VERSION, clock=lambda: NOW, run_mode="live"
+            store,
+            config=config,
+            installed_version=VERSION,
+            clock=lambda: NOW,
+            run_mode="live",
+            environ=_staging_env(store),
         )
 
         manifest = json.loads(store.get_bytes(manifest_key(SESSION_JOB, BOUND)))

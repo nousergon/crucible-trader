@@ -3,6 +3,7 @@ performance statement and simulated fee bill built on it (1f, `-I13123`)."""
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import pathlib
@@ -149,15 +150,17 @@ def fill(ticker, shares, price, commission, exec_id):
     )
 
 
-def november(store, *, ib_cash_end=946.0):
+def november(store, *, ib_cash_end=946.0, ib_realized_net=None):
     """Genesis 11-25 (10 AAA, $1,000); buy 5 BBB at 20 on 11-27; sell 4 AAA at
-    12 on 11-30. Each with a $1 commission."""
+    12 on 11-30. Each with a $1 commission. ``ib_realized_net`` is IB's
+    ``realizedPNL`` on the sale, when it states one."""
     d1 = stmt("2026-11-25", {"AAA": 10}, 1_000.0)
     post(store, d1, None)
     d2 = stmt("2026-11-27", {"AAA": 10, "BBB": 5}, 899.0)
     post(store, d2, d1, [fill("BBB", 5, 20.0, 1.0, "e1")])
     d3 = stmt("2026-11-30", {"AAA": 6, "BBB": 5}, ib_cash_end)
-    post(store, d3, d2, [fill("AAA", -4, 12.0, 1.0, "e2")])
+    sale = dataclasses.replace(fill("AAA", -4, 12.0, 1.0, "e2"), realized_pnl_usd=ib_realized_net)
+    post(store, d3, d2, [sale])
 
 
 @pytest.fixture
@@ -180,6 +183,14 @@ def run(store, day="2026-12-01", **kw):
 
 
 class TestClose:
+    def test_a_sale_booked_at_ibs_realized_figure_leaves_the_close_unchanged(self, store):
+        """The ledger books IB's realized gain on the sale beside a holding
+        relieved at IB's cost; the close's average-cost P&L is the same."""
+        november(store, ib_realized_net=19.0)  # IB's cost basis $28: gain $20 gross
+        _, close = run(store)
+        assert close is not None and close["status"] == "closed", close
+        assert close["pnl"]["realised_cents"] == 800 and close["pnl"]["total_cents"] == 1_700
+
     def test_cash_rounded_to_ib_is_its_own_attribution_line_and_still_closes(self, store):
         november(store, ib_cash_end=946.03)  # 3 cents over: inside the band
         _, close = run(store)

@@ -95,13 +95,14 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 from crucible.calendar import is_trading_day
 from crucible.keys import trader_broker_statement_key, trader_reconciliation_key
 from crucible.runner import RunContext, run_job
-from crucible.store import ETAG_ABSENT, PointerConflictError, Store
+from crucible.store import ETAG_ABSENT, PointerConflictError, Store, open_store
 
 from crucible_trader.benchmark_closes import capture_benchmark_closes
 from crucible_trader.books_retention import lock_cycle_books
@@ -119,6 +120,8 @@ from crucible_trader.dividend_entitlements import (
     owed_dividends,
 )
 from crucible_trader.exception_decision import (
+    RULE_CLEARS_PREFIX,
+    RULE_CLEARS_SCHEMA_VERSION,
     SCORE_CURRENT_KEY,
     SCORE_SCHEMA_VERSION,
     SCORES_PREFIX,
@@ -126,6 +129,7 @@ from crucible_trader.exception_decision import (
     load_decisions,
     load_exception_records,
     load_proposals,
+    load_rule_clears,
     score,
 )
 from crucible_trader.exception_proposal import (
@@ -143,7 +147,9 @@ from crucible_trader.exception_record import (
     records_from_broker_reconciliation,
     records_from_order_intent_reconciliation,
 )
-from crucible_trader.ledger import load_ledger, post_daily_ledger
+from crucible_trader.exception_rules import file_rule_clears, registry
+from crucible_trader.ledger import Entry, load_journals, load_ledger, post_daily_ledger
+from crucible_trader.ledger_views import publish_ledger_views
 from crucible_trader.month_end_close import close_prior_month
 from crucible_trader.month_rebuild import verify_month_rebuild
 from crucible_trader.order_intent_reconciliation import (
@@ -175,6 +181,7 @@ from crucible_trader.reconciliation_control import (
     ReconciliationVoidError,
     run_control_arm,
 )
+from crucible_trader.tier3_evidence import cash_pack, trading_days_between
 
 _LOG = logging.getLogger(__name__)
 
@@ -323,6 +330,104 @@ def stored_results(store: Store, trading_day: str) -> dict[str, tuple[str, bytes
     return out
 
 
+FLEX_URI_ENV = "CRUCIBLE_TRADER_IB_FLEX_URI"
+DEFAULT_FLEX_URI = "s3://alpha-engine-research/ops/daily-summaries/back-office/ib-flex/"
+
+
+def apply_waiting_statements(
+    ctx: RunContext,
+    *,
+    now: dt.datetime,
+    clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+    corporate_actions: CorporateActionSet | CorporateActionProvider | None = None,
+) -> None:
+    """Recover missing days without changing the live reconcile's failure contract.
+
+    Read/parse/apply failures are isolated and named in one MetricRecord; the
+    live broker comparison must still run. If metric recording itself fails,
+    the logger is the fallback recording surface. Replay never enters here.
+    """
+    outcomes: list[str] = []
+    applied = 0
+    failed = False
+    uri = os.environ.get(FLEX_URI_ENV, DEFAULT_FLEX_URI)
+    try:
+        # Local import breaks the replay runner's dependency cycle.
+        from crucible_trader.statement_backfill import (
+            apply_writes,
+            backfill_day,
+            parse_flex_statement,
+        )
+
+        if not uri.strip():
+            raise ValueError(f"{FLEX_URI_ENV} is empty")
+        source = open_store(uri)
+        first = now.date().replace(day=1)
+        months = sorted({first.strftime("%Y-%m"), (first - dt.timedelta(days=1)).strftime("%Y-%m")})
+        for month in months:
+            try:
+                keys = sorted(source.list_keys(month + "/"))
+            except Exception as exc:
+                # A denied month must not hide the other month; metric below records it.
+                failed = True
+                outcomes.append(f"{month}: FAIL {type(exc).__name__}: {exc}")
+                continue
+            for key in keys:
+                if not key.endswith(".xml"):
+                    continue
+                day_text = key
+                try:
+                    day = dt.datetime.strptime(key.rsplit("/", 1)[-1][:8], "%Y%m%d").date()
+                    if day.strftime("%Y-%m") != month or day >= min(now.date(), ctx.trading_day):
+                        raise ValueError(
+                            "statement date outside its month or not before the live trading day"
+                        )
+                    day_text = day.isoformat()
+                    if ctx.store.exists(trader_broker_statement_key(day_text)):
+                        if not ctx.store.exists(trader_reconciliation_key(day_text)):
+                            raise RuntimeError(
+                                "statement exists but missing reconciliation; skipped"
+                            )
+                        outcomes.append(f"{day_text}: skipped (statement exists)")
+                        continue
+                    statement = parse_flex_statement(
+                        source.get_bytes(key).decode("utf-8"), trading_day=day_text
+                    )
+                    view, summary = backfill_day(
+                        ctx.store, statement, corporate_actions=corporate_actions
+                    )
+                    apply_writes(ctx.store, view, summary, now=clock())
+                    if summary.get("lock_refused"):
+                        raise RuntimeError(f"books retention refused: {summary['lock_refused']}")
+                    applied += 1
+                    outcomes.append(f"{day_text}: applied")
+                except Exception as exc:
+                    # One failed day cannot abort recovery; its refusal remains in the metric.
+                    failed = True
+                    outcomes.append(f"{day_text}: FAIL {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        # Opening/listing failures do not suppress today's broker comparison.
+        failed = True
+        outcomes.append(f"FAIL {type(exc).__name__}: {exc}")
+    try:
+        ctx.record_metric(
+            {
+                "name": "statement_backfill_applied",
+                "module": METRIC_MODULE,
+                "metric_type": "operational",
+                "value": float(applied),
+                "unit": "count",
+                "n_floor": 0,
+                "status": "FAIL" if failed else "OK",
+                "status_reason": "; ".join(outcomes) or "no waiting Flex statements",
+                "source_path": uri,
+                "last_updated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+    except Exception:
+        _LOG.exception("statement_backfill_applied metric NOT recorded: %s", outcomes)
+
+
 def reconcile_cycle(
     ctx: RunContext,
     *,
@@ -351,6 +456,8 @@ def reconcile_cycle(
     when given, step 5a runs. ``dividend_waivers`` defaults to the declared file
     (:func:`~crucible_trader.dividend_entitlements.load_declared_waivers`).
     """
+    if ctx.run_mode != "replay":
+        apply_waiting_statements(ctx, now=dt.datetime.now(dt.UTC))
     day = ctx.trading_day.isoformat()
     broker = source.read_statement(day)
     anchor_entry = latest_anchor(ctx.store, day)
@@ -440,6 +547,10 @@ def reconcile_cycle(
             now=now,
             book=ledger_book,
         )
+        # Step 5d': the ledger laid out for /page/books (trial balance by
+        # account, running balances, tie-out), derived from the journals 5d
+        # just wrote. Never raises (alpha-engine-config-I13753).
+        publish_ledger_views(ctx.store, day=day)
         # Step 5f': the statement's benchmark closes the panel does not carry,
         # captured before 5f so the month's last close is there when the
         # statement is filed (alpha-engine-config-I13201). Never raises.
@@ -456,6 +567,11 @@ def reconcile_cycle(
         # Step 5g: once a month's close and statement are published, rebuild
         # them and the fee bill from stored inputs (1h). Never raises.
         verify_month_rebuild(ctx, day=day, account=broker.account, now=now, book=ledger_book)
+        # Step 5c'': the approved tier-2 rules clear the breaks their records
+        # explain (alpha-engine-config-I13747). After 5c and 5f, so today's and a
+        # refused close's proposals are both there; before 5e, so the queue it
+        # files leaves them out. Never raises.
+        apply_rule_clears(ctx, now=now)
         # Step 5e runs LAST: after 5c and 5f, so today's proposals and a
         # refused close's proposals are both in the queue it files.
         file_exception_score(ctx, now=now)
@@ -729,6 +845,69 @@ def file_exception_proposals(
         _LOG.warning("exception proposals metric for %s was NOT recorded", day, exc_info=True)
 
 
+#: The MetricRecord that says whether step 5c'' filed the day's rule clears.
+EXCEPTION_RULE_CLEARS_METRIC = "exception_rule_clears_filed"
+
+
+def apply_rule_clears(ctx: RunContext, *, now: str) -> None:
+    """Step 5c'': file the clears of the approved tier-2 rules. Never raises.
+
+    `alpha-engine-config-I13747`, Brian's rulings of 2026-11-16 ("approve once,
+    then audit") and 2026-11-17 (R1 to R4 approved, aec#13791). For every
+    undecided queue item an approved, undemoted rule covers, the rule's
+    condition is checked on the stored records
+    (:func:`~crucible_trader.exception_rules.file_rule_clears`); each one that
+    holds becomes a clear at
+    :func:`~crucible_trader.exception_decision.rule_clears_key`, citing its
+    evidence and arithmetic. A clear books nothing. The job's identity writes
+    it under the proposals prefix it already writes, never under
+    ``trader/exception_decisions/``, which stays the people-only writer's.
+
+    Like 5c, ANY failure is logged and swallowed and reported as the
+    ``exception_rule_clears_filed`` metric with status FAIL: a failed rule
+    costs a clear, so the item stays in the queue for a person, never the
+    reconciliation. The reason names each covered item left uncleared and why.
+    """
+    day = ctx.trading_day.isoformat()
+    key = RULE_CLEARS_PREFIX
+    try:
+        key, document, misses = file_rule_clears(ctx.store, as_of=day, now=now)
+        filed = len(cast("list[object]", document["clears"])) if document is not None else 0
+        if document is not None:
+            ctx.record_output(
+                key,
+                json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+                RULE_CLEARS_SCHEMA_VERSION,
+            )
+    except Exception as exc:  # noqa: BLE001 - see docstring: never reaches the job
+        _LOG.warning("rule clears for %s were NOT filed", day, exc_info=True)
+        status, value = "FAIL", None
+        reason = f"rule clears for {day} were NOT filed: " + (f"{type(exc).__name__}: {exc}")[:400]
+    else:
+        status, value = "OK", float(filed)
+        left = "; ".join(f"{m.get('trading_day')} {m.get('class')}: {m['why']}" for m in misses)
+        reason = (
+            f"{filed} rule clears filed for {day}" + (f"; not cleared: {left}" if left else "")
+        )[:1000]
+    try:
+        ctx.record_metric(
+            {
+                "name": EXCEPTION_RULE_CLEARS_METRIC,
+                "module": "crucible_trader.exception_rules",
+                "metric_type": "operational",
+                "value": value,
+                "unit": "count" if value is not None else None,
+                "n_floor": 0,
+                "status": status,
+                "status_reason": reason,
+                "source_path": key,
+                "last_updated_utc": now,
+            }
+        )
+    except Exception:  # noqa: BLE001 - see docstring
+        _LOG.warning("rule clears metric for %s was NOT recorded", day, exc_info=True)
+
+
 #: The MetricRecord that says whether step 5e filed the day's score.
 EXCEPTION_SCORE_METRIC = "exception_score_filed"
 
@@ -743,6 +922,56 @@ EXCEPTION_OVERDUE_METRIC = "exception_queue_overdue"
 
 #: How many overdue items the overdue row's reason names, oldest first.
 _OVERDUE_NAMED = 5
+
+
+def _tier3_packs(
+    store: Store, records: Sequence[Mapping[str, object]], as_of: str
+) -> dict[str, Mapping[str, object]]:
+    """The tier-3 evidence pack (:func:`~crucible_trader.tier3_evidence.cash_pack`)
+    of each queued exception ``record`` that has one, by exception id.
+
+    A pack that cannot be built is left out, so that item shows ``tier3: null``
+    and the score still files. Deviation from refuse-never-degrade
+    (CONTRIBUTING rule 1): the failure swallowed is any error reading the
+    reconciliation document, the exception history or the
+    journals for one item; the primary deliverable, the score and queue, does
+    not depend on the pack and survives; the recording surface is a logged
+    warning naming the exception id and the item's null ``tier3``."""
+    after = (dt.date.fromisoformat(as_of) + dt.timedelta(days=1)).isoformat()
+    journals: dict[str, dict[str, tuple[Entry, ...]]] = {}
+    packs: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        exception_id = str(record["exception_id"])
+        try:
+            if record.get("unit") != "usd":
+                continue
+            detected = cast("Mapping[str, object]", record["detected_by"])
+            document = cast(
+                "Mapping[str, object]",
+                json.loads(store.get_bytes(str(detected["document_key"])).decode("utf-8")),
+            )
+            tenant = str(record["tenant"])
+            if tenant not in journals:
+                journals[tenant] = load_journals(store, tenant, before=after)
+            gap = next(
+                (
+                    e
+                    for entries in journals[tenant].values()
+                    for e in entries
+                    if e.kind == "cash_gap"
+                    and exception_id in cast("list[object]", e.evidence.get("exception_ids") or [])
+                ),
+                None,
+            )
+            history = load_exception_records(
+                store, trading_days_between(str(record["trading_day"]), as_of)
+            )
+            pack = cash_pack(record, document, list(history.values()), gap, as_of=as_of)
+            if pack is not None:
+                packs[exception_id] = pack
+        except Exception:  # noqa: BLE001 - see docstring: a pack never fails the score
+            _LOG.warning("tier-3 pack for exception %s was NOT built", exception_id, exc_info=True)
+    return packs
 
 
 def file_exception_score(ctx: RunContext, *, now: str) -> None:
@@ -778,14 +1007,35 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
     try:
         key = exception_score_key(day)
         proposals = load_proposals(ctx.store, until=day)
+        decisions = load_decisions(ctx.store)
+        records = load_exception_records(ctx.store, (str(p["trading_day"]) for p in proposals))
+        clears = load_rule_clears(ctx.store, until=day)
+        rules = registry()
         document = score(
             proposals,
-            load_decisions(ctx.store),
+            decisions,
             as_of=day,
             generated_at=now,
-            exceptions=load_exception_records(
-                ctx.store, (str(p["trading_day"]) for p in proposals)
-            ),
+            exceptions=records,
+            clears=clears,
+            rules=rules,
+        )
+        # The queue is known only once scored, so the packs are built for its
+        # items and the score is derived again with them
+        # (`alpha-engine-config-I14134`).
+        queued = {
+            str(q["exception_id"]) for q in cast("list[Mapping[str, object]]", document["queue"])
+        }
+        packs = _tier3_packs(ctx.store, [r for i, r in records.items() if i in queued], day)
+        document = score(
+            proposals,
+            decisions,
+            as_of=day,
+            generated_at=now,
+            exceptions=records,
+            clears=clears,
+            rules=rules,
+            packs=packs,
         )
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         ctx.record_output(key, payload, SCORE_SCHEMA_VERSION)
@@ -816,7 +1066,8 @@ def file_exception_score(ctx: RunContext, *, now: str) -> None:
         reason = (
             f"back-office queue for {day}: {totals['queue']} open, {overdue} overdue, "
             f"agreement {totals['agreement']} over {totals['agree']} agreed and "
-            f"{totals['correct']} corrected"
+            f"{totals['correct']} corrected; {totals['cleared']} cleared by approved rules, "
+            f"{totals['audit']} back for audit"
         )
         overdue_row = _overdue_metric(document, day=day, key=key, now=now)
     except Exception as exc:  # noqa: BLE001 - see docstring: shadow, must never reach the job
@@ -1024,4 +1275,6 @@ def run_reconciliation(
         store=store,
         trading_day=trading_day,
         run_mode=run_mode,
+        # A nested replay must return reclamation to the live dispatcher immediately.
+        transient_retry=run_mode != "replay",
     )

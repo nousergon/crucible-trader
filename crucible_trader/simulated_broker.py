@@ -128,6 +128,7 @@ from crucible_trader.order_router import (
     held_weights,
     is_staging,
     plan_orders,
+    rebalance_band_usd,
 )
 
 __all__ = [
@@ -513,6 +514,7 @@ class SimulatedFillRouter:
         self._planned: tuple[PlannedOrder, ...] = ()
         #: The names the plan priced, for the order book's share columns.
         self._sized_names: frozenset[str] | None = None
+        self._band_usd = 0.0
         self._records: list[ExecutionRecord] = []
         self._opening, self._carried_from = opening_positions(store, trading_day)
         self._splits: list[dict[str, object]] | None = None
@@ -590,6 +592,7 @@ class SimulatedFillRouter:
             max_session_notional_usd=session_cap,
         )
         self._planned = sells + buys
+        self._band_usd = rebalance_band_usd(book)
         self._sized_names = frozenset(t for t, w in book.weights.items() if w > 0) | set(
             self._opening
         )
@@ -604,7 +607,7 @@ class SimulatedFillRouter:
         if self._sized_names is None:
             return None
         prices = {s: p for s in sorted(self._sized_names) if (p := self._closes(s)) is not None}
-        return ShareBasis(positions=dict(self._opening), prices=prices)
+        return ShareBasis(positions=dict(self._opening), prices=prices, band_usd=self._band_usd)
 
     def send(self, batch: Sequence[PlannedOrder]) -> None:
         for order in batch:

@@ -31,6 +31,24 @@ adds the other half of the loop:
 **No class ever auto-applies** (:data:`AUTO_APPLY` is ``False`` and every score
 says so). The score is evidence for a later promotion gate, never the gate.
 
+**Rule clears** (tier 2, `alpha-engine-config-I13747`; Brian's ruling of
+2026-11-16, "approve once, then audit"). A rule Brian approved
+(:mod:`crucible_trader.exception_rules`) may CLEAR a queue item whose break its
+records explain. A clear is an `exception_decision.v1` record with verdict
+:data:`RULE_VERDICT`, reviewer ``rule:<id>`` and a ``rule`` object carrying the
+evidence and the arithmetic (:func:`rule_clear`). It books nothing, so
+:data:`AUTO_APPLY` stays ``False``. The reconcile job files clears under
+:data:`RULE_CLEARS_PREFIX`, never under :data:`DECISIONS_PREFIX`, which only the
+people-only decision writer may write; :func:`decide` refuses both the verdict
+and a ``rule:`` reviewer, so no person files a clear and no rule files a
+person's call.
+
+A tenth of each rule's clears (:data:`AUDIT_EVERY`, starting with its first)
+stays in the queue as an ``audit`` item until a person confirms or rejects
+it (:data:`AUDIT_VERDICTS`), superseding the clear. One ``reject``
+demotes the rule (:func:`demoted_rules`): it clears nothing more, and every
+clear of it nobody has confirmed returns to the queue.
+
 Who writes what. The decision is written by the REVIEWER's identity through
 ``record`` below (today the operator CLI; a console write path is a separate
 ruling). The score is a derived document: the daily reconcile job files it as
@@ -67,6 +85,7 @@ from crucible.store import (
     read_only,
 )
 
+from crucible_trader.exception_plain import plain_fields
 from crucible_trader.exception_proposal import (
     ACTIONS,
     NATURES,
@@ -79,9 +98,15 @@ from crucible_trader.reconciliation import CASH_PAGE_THRESHOLD_USD, CASH_TOLERAN
 
 __all__ = [
     "AGE_LIMIT_TRADING_DAYS",
+    "AUDIT_EVERY",
+    "AUDIT_VERDICTS",
     "AUTO_APPLY",
     "DECISIONS_PREFIX",
     "DECISION_SCHEMA_VERSION",
+    "REVIEWER_VERDICTS",
+    "RULE_CLEARS_PREFIX",
+    "RULE_CLEARS_SCHEMA_VERSION",
+    "RULE_VERDICT",
     "SCORES_PREFIX",
     "SCORE_CURRENT_KEY",
     "SCORE_SCHEMA_VERSION",
@@ -89,6 +114,12 @@ __all__ = [
     "DecisionError",
     "decide",
     "decision_key",
+    "demoted_rules",
+    "audit_sample",
+    "is_rule_clear",
+    "load_rule_clears",
+    "rule_clear",
+    "rule_clears_key",
     "cash_tier",
     "effective_decisions",
     "exception_score_key",
@@ -121,6 +152,27 @@ SCORE_CURRENT_KEY = f"{SCORES_PREFIX}current.json"
 
 VERDICTS: tuple[str, ...] = ("agree", "correct", "defer")
 
+#: A person's call on a rule clear returned for audit: ``confirm`` (the rule was
+#: right) or ``reject`` (it was not; the rule is demoted and the item needs a
+#: real call). Each supersedes the clear it judges.
+AUDIT_VERDICTS: tuple[str, ...] = ("confirm", "reject")
+
+#: Every verdict a person may record.
+REVIEWER_VERDICTS: tuple[str, ...] = (*VERDICTS, *AUDIT_VERDICTS)
+
+#: The verdict of a clear filed by an approved rule, never by a person.
+RULE_VERDICT = "cleared"
+
+#: Where the reconcile job files rule clears, one file per run day,
+#: ``{RULE_CLEARS_PREFIX}{run_day}.json``. Under the proposals prefix: the
+#: trader already writes there, and :data:`DECISIONS_PREFIX` is the decision
+#: writer's alone (the bucket's ``OnlyTheDecisionWriterWritesExceptionDecisions``).
+RULE_CLEARS_PREFIX = f"{PROPOSALS_PREFIX}rule_clears/"
+RULE_CLEARS_SCHEMA_VERSION = "exception_rule_clears.v1"
+
+#: One clear in this many returns for audit, per rule, starting with its first.
+AUDIT_EVERY = 10
+
 #: A queue item older than this many trading days is overdue (back-office plan,
 #: control standard "Break aging").
 AGE_LIMIT_TRADING_DAYS = 3
@@ -129,6 +181,7 @@ AGE_LIMIT_TRADING_DAYS = 3
 AUTO_APPLY = False
 
 _REVIEWER_RE = re.compile(r"^[a-z0-9][a-z0-9._@-]{0,63}$")
+_RULE_REVIEWER_RE = re.compile(r"^rule:(R[0-9]{1,3})$")
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _NOTE_MAX = 2000
@@ -159,6 +212,10 @@ _DECISION_KEYS = frozenset(
         "supersedes",
     }
 )
+
+#: A rule clear carries one more field, ``rule``: the rule id, the evidence it
+#: cites and its arithmetic.
+_RULE_CLEAR_KEYS = _DECISION_KEYS | {"rule"}
 
 
 class DecisionError(ValueError):
@@ -219,11 +276,14 @@ def decide(
     Refuses: an unknown verdict; a reviewer who is the proposer or not a plain
     name; a ``correct`` without a nature, action and note, or one that repeats
     the proposal; an ``agree`` or ``defer`` that names a nature or action; a
-    ``defer`` without a note; a malformed ``supersedes``.
+    ``defer`` without a note; a malformed ``supersedes``; a ``confirm`` or
+    ``reject`` that supersedes nothing, names a nature or action, or (a reject)
+    has no note. A rule's ``cleared`` is never a person's verdict
+    (:func:`rule_clear`).
     """
     _check_proposal(proposal)
-    if verdict not in VERDICTS:
-        raise DecisionError(f"verdict {verdict!r} is not one of {VERDICTS}")
+    if verdict not in REVIEWER_VERDICTS:
+        raise DecisionError(f"verdict {verdict!r} is not one of {REVIEWER_VERDICTS}")
     if decided_by == PROPOSER or not _REVIEWER_RE.fullmatch(decided_by):
         raise DecisionError(
             f"reviewer {decided_by!r} must be a plain name ({_REVIEWER_RE.pattern}) "
@@ -247,6 +307,14 @@ def decide(
         if not note:
             raise DecisionError("a correction carries a note saying why")
         decided: dict[str, object] | None = {"nature": nature, "action": action}
+    elif verdict in AUDIT_VERDICTS:
+        if nature is not None or action is not None:
+            raise DecisionError(f"a {verdict} names no nature or action")
+        if supersedes is None:
+            raise DecisionError(f"a {verdict} supersedes the rule clear it judges")
+        if verdict == "reject" and not note:
+            raise DecisionError("a reject carries a note saying why the rule was wrong")
+        decided = None
     else:
         if nature is not None or action is not None:
             raise DecisionError(f"a {verdict} names no nature or action")
@@ -268,9 +336,67 @@ def decide(
     return document
 
 
+def rule_clear(
+    proposal: Mapping[str, object],
+    *,
+    rule_id: str,
+    evidence: Sequence[Mapping[str, object]],
+    arithmetic: Mapping[str, object],
+    note: str,
+    decided_at: str,
+) -> dict[str, object]:
+    """The `exception_decision.v1` clear an approved rule files for ``proposal``.
+
+    Refuses a rule id that is not ``R<n>``, a clear with no evidence or with an
+    evidence item that is not ``{"role", "record"}`` naming a store key, an
+    empty or overlong note and a malformed time. Whether the rule is approved
+    is the caller's check (:func:`crucible_trader.exception_rules.clears_for`);
+    this builds the record.
+    """
+    _check_proposal(proposal)
+    decided_by = f"rule:{rule_id}"
+    if not _RULE_REVIEWER_RE.fullmatch(decided_by):
+        raise DecisionError(f"rule id {rule_id!r} is not R<n>")
+    if not _TS_RE.fullmatch(decided_at):
+        raise DecisionError(f"decided_at {decided_at!r} is not YYYY-MM-DDTHH:MM:SSZ")
+    note = note.strip()
+    if not note or len(note) > _NOTE_MAX:
+        raise DecisionError(f"a clear says why in 1..{_NOTE_MAX} characters")
+    cited = [dict(item) for item in evidence]
+    if not cited or any(
+        set(item) != {"role", "record"}
+        or not all(isinstance(item[f], str) and item[f] for f in ("role", "record"))
+        for item in cited
+    ):
+        raise DecisionError("a clear cites at least one {role, record} store key")
+    document: dict[str, object] = {
+        "schema_version": DECISION_SCHEMA_VERSION,
+        **{field: proposal[field] for field in _PROPOSAL_FIELDS},
+        "proposed": {"nature": proposal["nature"], "action": proposal["action"]},
+        "verdict": RULE_VERDICT,
+        "decided": None,
+        "note": note,
+        "decided_by": decided_by,
+        "decided_at": decided_at,
+        "supersedes": None,
+        "rule": {"rule_id": rule_id, "evidence": cited, "arithmetic": dict(arithmetic)},
+    }
+    document["decision_id"] = _decision_id(document)
+    return document
+
+
+def is_rule_clear(document: Mapping[str, object]) -> bool:
+    """Whether ``document`` is a rule's clear rather than a person's call."""
+    return document.get("verdict") == RULE_VERDICT
+
+
 def validate_decision(document: Mapping[str, object]) -> None:
     """Raise :class:`DecisionError` unless ``document`` is a well-formed,
-    self-consistent `exception_decision.v1` record."""
+    self-consistent `exception_decision.v1` record: a person's call, or a
+    rule's clear (:func:`rule_clear`)."""
+    if is_rule_clear(document):
+        _validate_rule_clear(document)
+        return
     if frozenset(document) != _DECISION_KEYS:
         raise DecisionError(
             f"decision fields differ: missing {sorted(_DECISION_KEYS - set(document))}, "
@@ -308,6 +434,109 @@ def validate_decision(document: Mapping[str, object]) -> None:
         )
 
 
+def _validate_rule_clear(document: Mapping[str, object]) -> None:
+    if frozenset(document) != _RULE_CLEAR_KEYS:
+        raise DecisionError(
+            f"rule clear fields differ: missing {sorted(_RULE_CLEAR_KEYS - set(document))}, "
+            f"extra {sorted(set(document) - _RULE_CLEAR_KEYS)}"
+        )
+    if document["schema_version"] != DECISION_SCHEMA_VERSION:
+        raise DecisionError(f"not an {DECISION_SCHEMA_VERSION} document")
+    proposed, rule = document["proposed"], document["rule"]
+    if not isinstance(proposed, dict) or not isinstance(rule, dict):
+        raise DecisionError("proposed and rule are objects")
+    proposed = cast("dict[str, object]", proposed)
+    rule = cast("dict[str, object]", rule)
+    match = _RULE_REVIEWER_RE.fullmatch(str(document["decided_by"]))
+    if match is None or rule.get("rule_id") != match.group(1):
+        raise DecisionError("a clear's reviewer is rule:<its rule id>")
+    if set(rule) != {"rule_id", "evidence", "arithmetic"}:
+        raise DecisionError("a clear's rule names rule_id, evidence and arithmetic")
+    evidence, arithmetic = rule["evidence"], rule["arithmetic"]
+    if not isinstance(evidence, list) or not isinstance(arithmetic, dict):
+        raise DecisionError("a clear's evidence is a list and its arithmetic an object")
+    rebuilt = rule_clear(
+        {
+            "schema_version": PROPOSAL_SCHEMA_VERSION,
+            **{field: document[field] for field in _PROPOSAL_FIELDS},
+            "nature": proposed.get("nature"),
+            "action": proposed.get("action"),
+        },
+        rule_id=cast("str", rule["rule_id"]),
+        evidence=cast("list[dict[str, object]]", evidence),
+        arithmetic=cast("dict[str, object]", arithmetic),
+        note=cast("str", document["note"]),
+        decided_at=cast("str", document["decided_at"]),
+    )
+    if rebuilt != dict(document):
+        raise DecisionError(f"clear {document['decision_id']!r} does not rebuild from its fields")
+
+
+def rule_clears_key(run_day: str) -> str:
+    """The store key of the rule clears the reconcile run of ``run_day`` filed."""
+    return f"{RULE_CLEARS_PREFIX}{_day(run_day)}.json"
+
+
+def load_rule_clears(store: Store, *, until: str | None = None) -> list[dict[str, object]]:
+    """Every stored rule clear filed up to ``until`` inclusive, each validated,
+    and each proposal's first clear only (a same-day re-run carries its earlier
+    clears forward, so a later file never re-clears)."""
+    out: list[dict[str, object]] = []
+    seen: set[object] = set()
+    for key in sorted(store.list_keys(RULE_CLEARS_PREFIX)):
+        filed_on = key.removesuffix(".json").rsplit("/", 1)[-1]
+        if not key.endswith(".json") or (until is not None and filed_on > until):
+            continue
+        document = _json_object(store, key)
+        if document.get("schema_version") != RULE_CLEARS_SCHEMA_VERSION:
+            raise DecisionError(f"{key}: not an {RULE_CLEARS_SCHEMA_VERSION} document")
+        for clear in cast("list[dict[str, object]]", document.get("clears", [])):
+            try:
+                validate_decision(clear)
+            except DecisionError as exc:
+                raise DecisionError(f"{key}: {exc}") from exc
+            if not is_rule_clear(clear):
+                raise DecisionError(f"{key}: {clear.get('decision_id')!r} is not a rule clear")
+            if clear["proposal_id"] not in seen:
+                seen.add(clear["proposal_id"])
+                out.append(clear)
+    return out
+
+
+def demoted_rules(decisions: Iterable[Mapping[str, object]]) -> dict[str, str]:
+    """Rule id -> the decision id of the first ``reject`` of one of its clears.
+
+    One disagreement demotes a rule (Brian 2026-11-16). ``decisions`` holds the
+    clears and the people's calls together, so a reject names the clear it
+    supersedes and that clear names its rule.
+    """
+    by_id = {d["decision_id"]: d for d in decisions}
+    out: dict[str, str] = {}
+    for decision in sorted(decisions, key=lambda d: (str(d["decided_at"]), str(d["decision_id"]))):
+        if decision["verdict"] != "reject":
+            continue
+        judged = by_id.get(decision["supersedes"])
+        if judged is not None and is_rule_clear(judged):
+            rule = cast("Mapping[str, object]", judged["rule"])
+            out.setdefault(cast("str", rule["rule_id"]), cast("str", decision["decision_id"]))
+    return out
+
+
+def audit_sample(clears: Iterable[Mapping[str, object]]) -> set[str]:
+    """The decision ids of the clears that return for audit: per rule, in the
+    order they were filed, the first and every :data:`AUDIT_EVERY`-th after.
+    Deterministic, so anyone rebuilding the score samples the same clears."""
+    by_rule: dict[str, list[Mapping[str, object]]] = {}
+    for clear in clears:
+        rule = cast("Mapping[str, object]", clear["rule"])
+        by_rule.setdefault(cast("str", rule["rule_id"]), []).append(clear)
+    out: set[str] = set()
+    for chain in by_rule.values():
+        ordered = sorted(chain, key=lambda c: (str(c["decided_at"]), str(c["decision_id"])))
+        out.update(cast("str", c["decision_id"]) for c in ordered[::AUDIT_EVERY])
+    return out
+
+
 def _json_object(store: Store, key: str) -> dict[str, object]:
     raw: object = json.loads(store.get_bytes(key).decode("utf-8"))
     if not isinstance(raw, dict):
@@ -331,6 +560,8 @@ def load_proposals(store: Store, *, until: str | None = None) -> list[dict[str, 
     for key in sorted(store.list_keys(PROPOSALS_PREFIX)):
         filed_on = key.removesuffix(".json").rsplit("/", 1)[-1]
         if not key.endswith(".json") or (until is not None and filed_on > until):
+            continue
+        if key.startswith(RULE_CLEARS_PREFIX):
             continue
         document = _json_object(store, key)
         for proposal in cast("list[dict[str, object]]", document.get("proposals", [])):
@@ -456,9 +687,15 @@ def record_decision(store: Store, document: Mapping[str, object]) -> str:
 
     Refuses a decision on a proposal that already has a standing decision
     unless it supersedes exactly that one, and one that supersedes a decision
-    that does not stand. Writing the same decision twice is a no-op.
+    that does not stand. A rule's clear stands like a person's call: a
+    ``confirm`` or ``reject`` must supersede a standing clear, and nothing else
+    may (an audit is judged before it is re-decided). A rule clear itself is
+    never written here (:data:`RULE_CLEARS_PREFIX`). Writing the same decision
+    twice is a no-op.
     """
     validate_decision(document)
+    if is_rule_clear(document):
+        raise DecisionError("a rule clear is filed by the reconcile job, never as a decision")
     day = cast("str", document["trading_day"])
     key = decision_key(day, cast("str", document["decision_id"]))
     payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -468,13 +705,22 @@ def record_decision(store: Store, document: Mapping[str, object]) -> str:
         return key
     prior = [
         d
-        for d in load_decisions(store, prefix=f"{DECISIONS_PREFIX}{day}/")
+        for d in [
+            *load_decisions(store, prefix=f"{DECISIONS_PREFIX}{day}/"),
+            *load_rule_clears(store),
+        ]
         if d["proposal_id"] == document["proposal_id"]
     ]
     state = effective_decisions(prior).get(cast("str", document["proposal_id"]))
-    standing = state[1]["decision_id"] if state is not None and state[1] is not None else None
+    standing_doc = state[1] if state is not None else None
+    standing = standing_doc["decision_id"] if standing_doc is not None else None
     if state is not None and state[0] == "conflicted":
         raise DecisionError("this proposal has conflicting decisions; settle them by hand first")
+    judges_a_clear = standing_doc is not None and is_rule_clear(standing_doc)
+    if (document["verdict"] in AUDIT_VERDICTS) != judges_a_clear:
+        raise DecisionError(
+            "a rule clear is judged with confirm or reject, and only a rule clear is"
+        )
     if document["supersedes"] != standing:
         raise DecisionError(
             f"this decision must supersede the standing decision {standing!r}, "
@@ -503,8 +749,21 @@ def score(
     as_of: str,
     generated_at: str,
     exceptions: Mapping[str, Mapping[str, object]] | None = None,
+    clears: Sequence[Mapping[str, object]] = (),
+    rules: Sequence[Mapping[str, object]] = (),
+    packs: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """The `exception_score.v1` document over every proposal up to ``as_of``.
+
+    ``clears`` are the rule clears (:func:`load_rule_clears`) and ``rules`` the
+    rule registry (:func:`crucible_trader.exception_rules.registry`). A cleared
+    proposal leaves the queue and counts as ``cleared``, unless the clear is in
+    the audit sample (:func:`audit_sample`) or its rule is demoted
+    (:func:`demoted_rules`): then it stays as an ``audit`` item until a person
+    confirms or rejects it. A rejected clear is a ``rejected`` queue item until
+    a person makes the real call. ``rule_clears`` lists every clear, newest
+    first, with its status (the daily log), and ``rules`` each rule's state and
+    its counts.
 
     Decisions about proposals not among ``proposals`` are counted as
     ``orphan_decisions`` and score nothing.
@@ -515,9 +774,19 @@ def score(
     (:func:`cash_tier`) and ``cited_records``; with no such record those are
     null and an empty list (a month-end close line has none under
     ``trader/exceptions/``).
+
+    ``packs`` are the tier-3 evidence packs
+    (:func:`crucible_trader.tier3_evidence.cash_pack`) by exception id; each
+    queue item carries its own as ``tier3``, null when it has none
+    (`alpha-engine-config-I14134`).
     """
     _day(as_of)
-    effective = effective_decisions(decisions)
+    clears = [c for c in clears if str(c["trading_day"]) <= as_of]
+    every = [*decisions, *clears]
+    effective = effective_decisions(every)
+    by_id = {cast("str", d["decision_id"]): d for d in every}
+    demoted = demoted_rules(every)
+    sampled = audit_sample(clears)
     known = {cast("str", p["proposal_id"]) for p in proposals}
     groups: dict[tuple[str, str, str, str], dict[str, object]] = {}
     queue: list[dict[str, object]] = []
@@ -541,7 +810,18 @@ def score(
                 "nature": proposal["nature"],
                 "promotable": False,
                 "proposals": 0,
-                **dict.fromkeys(("agree", "correct", "defer", "undecided", "conflicted"), 0),
+                **dict.fromkeys(
+                    (
+                        "agree",
+                        "correct",
+                        "defer",
+                        "undecided",
+                        "conflicted",
+                        "cleared",
+                        "rejected",
+                    ),
+                    0,
+                ),
                 "consecutive_agree": 0,
                 "auto_apply": AUTO_APPLY,
             },
@@ -550,11 +830,27 @@ def score(
         group["promotable"] = group["promotable"] or proposal["promotable"] is True
         status, decision = effective.get(cast("str", proposal["proposal_id"]), ("undecided", None))
         verdict = cast("str", decision["verdict"]) if decision is not None else status
-        group[verdict] = cast("int", group[verdict]) + 1
+        bucket = {RULE_VERDICT: "cleared", "confirm": "cleared", "reject": "rejected"}
+        group[bucket.get(verdict, verdict)] = cast("int", group[bucket.get(verdict, verdict)]) + 1
         if decision is not None and verdict in ("agree", "correct"):
             calls.setdefault(group_key, []).append((cast("str", decision["decided_at"]), verdict))
             continue
-        age = _age(cast("str", proposal["trading_day"]), as_of)
+        clear: Mapping[str, object] | None = None
+        if decision is not None and verdict == RULE_VERDICT:
+            clear = decision
+            rule_id = cast("str", cast("Mapping[str, object]", clear["rule"])["rule_id"])
+            if clear["decision_id"] not in sampled and rule_id not in demoted:
+                continue
+        elif decision is not None and verdict == "confirm":
+            continue
+        elif decision is not None and verdict == "reject":
+            clear = by_id.get(cast("str", decision["supersedes"]))
+        # An audit item has been cleared, not left: its clock starts the day
+        # the rule cleared it, not the break day (alpha-engine-config-I14054).
+        since = cast("str", proposal["trading_day"])
+        if verdict == RULE_VERDICT:
+            since = cast("str", cast("Mapping[str, object]", decision)["decided_at"])[:10]
+        age = _age(since, as_of)
         record = (exceptions or {}).get(cast("str", proposal["exception_id"]))
         if record is not None and record.get("tenant") != proposal["tenant"]:
             record = None
@@ -565,13 +861,20 @@ def score(
                 "action": proposal["action"],
                 "rationale": proposal.get("rationale"),
                 "held": proposal.get("held"),
-                "status": "deferred" if verdict == "defer" else verdict,
+                "status": {"defer": "deferred", RULE_VERDICT: "audit", "reject": "rejected"}.get(
+                    verdict, verdict
+                ),
+                "review": "audit" if verdict == RULE_VERDICT else "break",
+                "supersedes": clear["decision_id"] if verdict == RULE_VERDICT and clear else None,
                 "note": decision["note"] if decision is not None else None,
                 "standing_decision_id": decision["decision_id"] if decision is not None else None,
                 "age_trading_days": age,
                 "overdue": age > AGE_LIMIT_TRADING_DAYS,
-                "expires": _expires(cast("str", proposal["trading_day"])),
+                "expires": _expires(since),
                 **_evidence(record),
+                **plain_fields(proposal, record),
+                "tier3": (packs or {}).get(cast("str", proposal["exception_id"])),
+                "rule_clear": _clear_view(clear, sampled=sampled, demoted=demoted),
             }
         )
     classes: list[dict[str, object]] = []
@@ -589,6 +892,7 @@ def score(
     agree = sum(cast("int", g["agree"]) for g in classes)
     correct = sum(cast("int", g["correct"]) for g in classes)
     queue.sort(key=lambda q: (-cast("int", q["age_trading_days"]), str(q["proposal_id"])))
+    log = _rule_clear_log(clears, effective, sampled=sampled, demoted=demoted)
     return {
         "schema_version": SCORE_SCHEMA_VERSION,
         "trading_day": as_of,
@@ -608,11 +912,111 @@ def score(
             "oldest_age_trading_days": max(
                 (cast("int", q["age_trading_days"]) for q in queue), default=None
             ),
-            "orphan_decisions": sum(1 for d in decisions if d["proposal_id"] not in known),
+            "orphan_decisions": sum(1 for d in every if d["proposal_id"] not in known),
+            "cleared": sum(cast("int", g["cleared"]) for g in classes),
+            "rejected": sum(cast("int", g["rejected"]) for g in classes),
+            "audit": sum(1 for q in queue if q["status"] == "audit"),
         },
         "classes": classes,
         "queue": queue,
+        "rules": _rule_rows(rules, log, demoted),
+        "rule_clears": log,
     }
+
+
+def _clear_view(
+    clear: Mapping[str, object] | None, *, sampled: set[str], demoted: Mapping[str, str]
+) -> dict[str, object] | None:
+    """A queue item's view of the rule clear it holds for audit, or ``None``."""
+    if clear is None:
+        return None
+    rule = cast("Mapping[str, object]", clear["rule"])
+    return {
+        "decision_id": clear["decision_id"],
+        "rule_id": rule["rule_id"],
+        "note": clear["note"],
+        "evidence": rule["evidence"],
+        "arithmetic": rule["arithmetic"],
+        "decided_at": clear["decided_at"],
+        "sampled": clear["decision_id"] in sampled,
+        "rule_demoted": rule["rule_id"] in demoted,
+    }
+
+
+def _rule_clear_log(
+    clears: Sequence[Mapping[str, object]],
+    effective: Mapping[str, tuple[str, Mapping[str, object] | None]],
+    *,
+    sampled: set[str],
+    demoted: Mapping[str, str],
+) -> list[dict[str, object]]:
+    """Every rule clear, newest first, with where it stands now: ``cleared``,
+    ``audit`` (sampled, or its rule demoted, and nobody has judged it),
+    ``confirmed`` or ``rejected`` (a person judged it), or ``re-decided`` (a
+    person's later call stands)."""
+    out: list[dict[str, object]] = []
+    for clear in clears:
+        rule = cast("Mapping[str, object]", clear["rule"])
+        standing = effective.get(cast("str", clear["proposal_id"]), ("undecided", None))[1]
+        if standing is None or standing["decision_id"] == clear["decision_id"]:
+            pending = clear["decision_id"] in sampled or rule["rule_id"] in demoted
+            status = "audit" if pending else "cleared"
+        else:
+            status = {"confirm": "confirmed", "reject": "rejected"}.get(
+                cast("str", standing["verdict"]), "re-decided"
+            )
+        out.append(
+            {
+                **{f: clear[f] for f in _PROPOSAL_FIELDS},
+                "decision_id": clear["decision_id"],
+                "decided_by": clear["decided_by"],
+                "decided_at": clear["decided_at"],
+                "note": clear["note"],
+                "evidence": rule["evidence"],
+                "arithmetic": rule["arithmetic"],
+                "cleared_by_rule": rule["rule_id"],
+                "sampled": clear["decision_id"] in sampled,
+                "status": status,
+            }
+        )
+    out.sort(key=lambda c: (str(c["decided_at"]), str(c["decision_id"])), reverse=True)
+    return out
+
+
+def _rule_rows(
+    rules: Sequence[Mapping[str, object]],
+    log: Sequence[Mapping[str, object]],
+    demoted: Mapping[str, str],
+) -> list[dict[str, object]]:
+    """Per rule: its registry entry, its effective state (``demoted`` once a
+    person rejected one of its clears) and its counts."""
+    ids = sorted({str(r["rule_id"]) for r in rules} | {str(c["cleared_by_rule"]) for c in log})
+    registry = {str(r["rule_id"]): r for r in rules}
+    rows: list[dict[str, object]] = []
+    for rule_id in ids:
+        mine = [c for c in log if c["cleared_by_rule"] == rule_id]
+        declared = registry.get(rule_id, {"rule_id": rule_id, "state": "unregistered"})
+        rows.append(
+            {
+                **declared,
+                "effective_state": "demoted" if rule_id in demoted else declared["state"],
+                "demoted_by": demoted.get(rule_id),
+                "clears": len(mine),
+                "sampled": sum(1 for c in mine if c["sampled"]),
+                **{
+                    s: sum(1 for c in mine if c["status"] == s)
+                    for s in ("audit", "confirmed", "rejected")
+                },
+            }
+        )
+    return rows
+
+
+def _registry() -> list[dict[str, object]]:
+    # Imported here: exception_rules builds on this module.
+    from crucible_trader.exception_rules import registry  # noqa: PLC0415
+
+    return registry()
 
 
 def _now() -> str:
@@ -635,7 +1039,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     rec = sub.add_parser("record", help="write one decision, create-only")
     rec.add_argument("--proposal-id", required=True)
-    rec.add_argument("--verdict", required=True, choices=VERDICTS)
+    rec.add_argument("--verdict", required=True, choices=REVIEWER_VERDICTS)
     rec.add_argument("--by", required=True, help="the reviewer (never the proposer)")
     rec.add_argument("--note", default="")
     rec.add_argument("--nature", default=None, choices=NATURES)
@@ -675,6 +1079,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # As the job's step 5f scores (codex 09f52012): without the records
             # every item's amount, unit, tier and cited records read empty.
             exceptions=load_exception_records(reader, (str(p["trading_day"]) for p in proposals)),
+            clears=load_rule_clears(reader, until=as_of),
+            rules=_registry(),
         )
     except DecisionError as exc:
         sys.stderr.write(f"refused: {exc}\n")

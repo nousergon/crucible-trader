@@ -195,3 +195,28 @@ class TestDecidableFromTheScreen:
         page = self.page({"exception_id": "e1", "detail": "something odd"})
         assert 'class="sides"' not in page and "<summary>Evidence</summary>" not in page
         assert "something odd" in page
+
+
+class TestChangeTheFixAndTodayLine:
+    def test_the_change_choices_read_as_sentences_but_submit_the_codes(self) -> None:
+        page = render_queue_page(
+            queue_items([proposal(1)], [], tenants=[TENANT]),
+            reviewer="brian",
+            tenants=[TENANT],
+            nonce="n",
+        )
+        assert '<option value="investigate_cash">Find the missing or wrong cash entry' in page
+        assert '<option value="defect">A mistake on our side</option>' in page
+        for code in (*ACTIONS, *NATURES):
+            assert f">{code}</option>" not in page
+
+    def test_one_line_answers_whether_the_books_are_right_today(self) -> None:
+        waiting = render_queue_page(
+            queue_items([proposal(1)], [], tenants=[TENANT]),
+            reviewer="brian",
+            tenants=[TENANT],
+            nonce="n",
+        )
+        assert "Are the books right today?</b> Not yet: 1 difference" in waiting
+        empty = render_queue_page([], reviewer="brian", tenants=[TENANT], nonce="n")
+        assert "Are the books right today?</b> Yes" in empty

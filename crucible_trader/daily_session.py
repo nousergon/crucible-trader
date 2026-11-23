@@ -119,6 +119,7 @@ import datetime as dt
 import functools
 import json
 import logging
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -157,7 +158,12 @@ from crucible_trader.kill_switch import (
     utcnow,
 )
 from crucible_trader.order_router import RouterConfig, ShadowRouter, build_router
-from crucible_trader.paper_smoke import installed_crucible_version, open_configured_store
+from crucible_trader.paper_smoke import (
+    RELEASE_SHA_VAR,
+    installed_crucible_version,
+    open_configured_store,
+    staging_running_wheel_disagreement,
+)
 from crucible_trader.session import session_cycle
 from crucible_trader.settings import Settings
 from crucible_trader.simulated_broker import (
@@ -360,6 +366,7 @@ def daily_session_cycle(
     contract_resolver: Callable[[Store, str], ResolvedContract] = resolve,
     construct: Callable[..., TargetBook] | None = None,
     environ: Mapping[str, str] | None = None,
+    wheel_check: Callable[[Store, str], str | None] | None = None,
 ) -> dict[str, Any]:
     """The job body. Returns the session document; raises on every refusal.
 
@@ -397,6 +404,7 @@ def daily_session_cycle(
             if sizing is None
             else functools.partial(constructor, sizing=sizing),
             hard_risk_facts=_hard_risk_facts(router),
+            wheel_check=wheel_check,
         )
         # Orders still working past the per-batch fill bound are waited on
         # (bounded) so the stops below and the shortfall filed after size from
@@ -634,6 +642,9 @@ def run_staging_session(
             installed_version=installed_version,
             clock=clock,
             environ=environ,
+            wheel_check=lambda _store, version: staging_running_wheel_disagreement(
+                version, (os.environ if environ is None else environ).get(RELEASE_SHA_VAR)
+            ),
         )
         if not isinstance(router, SimulatedFillRouter) or result["outcome"] != "served":
             return result
