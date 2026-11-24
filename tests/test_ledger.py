@@ -14,7 +14,7 @@ from crucible.runner import RunContext
 from crucible.store import LocalStore
 
 from crucible_trader.broker_statement import BrokerStatement
-from crucible_trader.exception_decision import decide, decision_key, record_decision
+from crucible_trader.exception_decision import decide, decision_key, record_decision, rule_clear
 from crucible_trader.exception_proposal import PROPOSAL_SCHEMA_VERSION
 from crucible_trader.exception_record import PAPER_FUND_TENANT, exception_id
 from crucible_trader.ledger import (
@@ -975,6 +975,58 @@ class TestClearingADecidedBreak:
         assert ledger.suspense(T, "DU1")["cash_cents"] == -30
         # An agree that supersedes the deferral clears it.
         assert list(clearing_decisions([deferred, other], T, before=NEXT)) == [exception]
+
+
+class TestAConfirmedRuleClear:
+    """alpha-engine-config-I14224: a person's ``confirm`` of a rule clear settles
+    the gap; the clear alone, or a ``reject``, books nothing."""
+
+    def clear_on(self, exception):
+        proposal = decision_on(exception)
+        return rule_clear(
+            {
+                "schema_version": PROPOSAL_SCHEMA_VERSION,
+                "proposal_id": proposal["proposal_id"],
+                "exception_id": exception,
+                "tenant": T,
+                "trading_day": DAY,
+                "source": "reconciler",
+                "class": "cash_delta",
+                "ruleset_version": "1",
+                "rule_id": "r",
+                "nature": "defect",
+                "action": "investigate_cash",
+            },
+            rule_id="R1",
+            evidence=[{"role": "r", "record": "k"}],
+            arithmetic={},
+            note="interest posted",
+            decided_at="2026-11-03T21:00:00Z",
+        )
+
+    def test_a_confirm_clears_the_gap_and_cites_the_person(self):
+        ledger, gap = gapped_ledger(DAY)
+        exception = gap.evidence["exception_ids"][0]
+        clear = self.clear_on(exception)
+        confirm = decision_on(exception, "confirm", supersedes=clear["decision_id"])
+        # The ledger loads decisions only, so the clear the confirm supersedes is
+        # absent from the list; the confirm still stands.
+        (adjustment,) = next_day(ledger, [confirm]).entries
+        assert adjustment.postings == tuple(clearing_postings(gap))
+        assert adjustment.evidence["decision_id"] == confirm["decision_id"]
+        assert ledger.suspense(T, "DU1")["cash_cents"] == 0
+
+    def test_the_clear_alone_or_a_reject_clears_nothing(self):
+        ledger, gap = gapped_ledger(DAY)
+        exception = gap.evidence["exception_ids"][0]
+        clear = self.clear_on(exception)
+        reject = decision_on(
+            exception, "reject", supersedes=clear["decision_id"], note="not interest"
+        )
+        for decisions in ([clear], [reject], [clear, reject]):
+            assert clearing_decisions(decisions, T, before=NEXT) == {}
+        assert next_day(ledger, [clear, reject]).entries == ()
+        assert ledger.suspense(T, "DU1")["cash_cents"] == -30
 
 
 class TestClearingThroughThePostingStep:
