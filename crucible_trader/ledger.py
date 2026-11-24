@@ -224,8 +224,12 @@ _PER_INSTRUMENT = (
 #: Only these accounts hold shares.
 _QUANTITY_ACCOUNTS = (SECURITIES, SUSPENSE_POSITION, SHARE_ADJUSTMENTS)
 
-#: The verdicts that settle a break; ``defer`` leaves it in suspense.
-CLEARING_VERDICTS = frozenset({"agree", "correct"})
+#: The verdicts that settle a break; ``defer`` leaves it in suspense. A
+#: ``confirm`` is a person agreeing with an approved rule's clear of the break
+#: (alpha-engine-config-I14224): the same maker-checker act as ``agree``. A rule
+#: clear itself (verdict ``cleared``) books nothing, and a ``reject`` returns the
+#: break to people.
+CLEARING_VERDICTS = frozenset({"agree", "correct", "confirm"})
 _GAP_KINDS = ("cash_gap", "position_gap")
 #: The month-end close's classes for a gap still in suspense at the close.
 CLOSE_SUSPENSE_CASH = "close_suspense_cash"
