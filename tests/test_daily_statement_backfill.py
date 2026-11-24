@@ -268,7 +268,10 @@ def test_existing_later_ledger_refuses_historical_insertion(world):
     before = snapshot(backend.root)
     row = run_step(backend)
     assert row["status"] == "FAIL" and DAY in row["status_reason"]
-    assert "no journal and ledger view" in row["status_reason"]
+    # The backfill refuses a day behind a live journal before its reconcile
+    # runs (prior-period book, alpha-engine-config-I13232), naming the book.
+    assert "is never inserted behind it" in row["status_reason"]
+    assert "--book pre-v2" in row["status_reason"]
     assert snapshot(backend.root) == before
 
 

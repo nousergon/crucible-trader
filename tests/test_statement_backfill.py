@@ -644,7 +644,7 @@ class TestRehearseClose:
     @pytest.mark.parametrize(
         ("extra", "message"),
         [
-            (("--close", "2026-09", "--apply"), "dry run"),
+            (("--close", "2026-09", "--apply"), "give --book"),
             (("--close", "2026-09"), "needs --out"),
             (("--day", "2026-09-10"), "one --statement per --day"),
         ],
@@ -797,3 +797,341 @@ class TestRehearseInDateOrder:
                 now="2026-11-03T05:30:00Z",
                 corporate_actions=CA,
             )
+
+
+# -- the prior-period book (owner decision 2026-11-12 on aec#13232) ----------------
+
+BOOK = "pre-v2"
+
+
+class TestPriorPeriodBook:
+    """A day before the live book opened is posted into its declared
+    prior-period book, never behind the live book's journals."""
+
+    def test_a_day_behind_the_live_book_is_refused_naming_the_book(self, root):
+        LocalStore(root).put_bytes(journal_key("nous-ergon-paper", "2026-11-03"), b"{}")
+        with pytest.raises(BackfillRefused, match="--book pre-v2"):
+            backfill_day(LocalStore(root), _statement(), corporate_actions=CA)
+
+    def test_the_day_posts_into_the_book_and_applies_there(self, root):
+        backend = LocalStore(root)
+        backend.put_bytes(journal_key("nous-ergon-paper", "2026-11-03"), b"{}")
+        view, summary = backfill_day(backend, _statement(), corporate_actions=CA, book=BOOK)
+        assert summary["book"] == BOOK and summary["has_ledger"], summary
+        keys = summary["keys_to_write"]
+        assert journal_key("nous-ergon-paper", DAY, BOOK) in keys
+        assert f"trader/ledger/books/{BOOK}/reconciliation/nous-ergon-paper/{DAY}.json" in keys
+        assert not [k for k in keys if k.startswith("trader/ledger/journal/")]
+        apply_writes(backend, view, summary, now=OUTSIDE)
+        assert backend.exists(journal_key("nous-ergon-paper", DAY, BOOK))
+        assert not backend.exists(journal_key("nous-ergon-paper", DAY))
+        assert backend.get_bytes(journal_key("nous-ergon-paper", "2026-11-03")) == b"{}"
+
+    def test_the_rehearsal_books_and_closes_the_month_in_the_book(self, gap_root):
+        live = journal_key("nous-ergon-paper", "2026-11-03")
+        LocalStore(gap_root).put_bytes(live, b"{}")
+        before = snapshot(gap_root)
+        view, summary = statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [_statement()],
+            month="2026-09",
+            now="2026-11-03T05:30:00Z",
+            corporate_actions=CA,
+            book=BOOK,
+        )
+        assert snapshot(gap_root) == before
+        assert summary["book"] == BOOK and summary["backfill"][0]["has_ledger"]
+        written = summary["keys_written"]
+        assert {journal_key("nous-ergon-paper", d, BOOK) for d in (DAY, LATER)} <= set(written)
+        assert not [
+            k for k in written if k.startswith(("trader/ledger/journal/", "trader/ledger/close/"))
+        ]
+        assert any(k.startswith(f"trader/ledger/books/{BOOK}/close/") for k in written)
+        rows = {row["trading_day"]: row["status"] for row in summary["ledger"]}
+        assert rows[DAY] == "OK"  # LATER books too; it lacks only a settled close, as live
+        assert "already exist" not in str(summary["ledger"])
+        assert view.get_bytes(live) == b"{}"
+
+    def test_cli_rehearsal_reports_the_bridge_for_the_books_last_month(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        from crucible_trader import ledger
+
+        monkeypatch.setattr(ledger, "PRIOR_PERIOD_BOOKS", {BOOK: "2026-09"})
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        out = tmp_path / "out"
+        args = ["--store", str(gap_root), "--day", DAY, "--statement", str(stmt), "--book", BOOK]
+        assert main([*args, "--close", "2026-09", "--out", str(out), "--now", NOW_STAMP]) == 0
+        err = capsys.readouterr().err
+        assert "bridge to the live opening does NOT tie" in err
+        summary = json.loads((out / "summary.json").read_text())
+        assert summary["close"]["bridge"]["ties"] is False
+        assert "close_input_missing" in {e["class"] for e in summary["close"]["exceptions"]}
+
+    def test_a_single_day_apply_ahead_of_unbooked_days_is_refused(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        day = "2026-09-11"
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1", period="September 11, 2026"), encoding="utf-8")
+        args = ["--store", str(gap_root), "--day", day, "--statement", str(stmt), "--book", BOOK]
+        before = snapshot(gap_root)
+        assert main([*args, "--apply"], clock=lambda: OUTSIDE) == 1
+        assert f"no journal yet for ['{LATER}']" in capsys.readouterr().err
+        assert snapshot(gap_root) == before
+
+    def test_an_undeclared_book_is_a_no_go(self, root, tmp_path, capsys):
+        stmt = tmp_path / "stmt.csv"
+        stmt.write_text(csv_text(account="DU1"), encoding="utf-8")
+        args = ["--store", str(root), "--day", DAY, "--statement", str(stmt), "--book", "x"]
+        assert main(args) == 1
+        assert "not a declared prior-period book" in capsys.readouterr().err
+
+
+NOW_STAMP = "2026-11-03T05:30:00Z"
+
+
+# -- codex review of crucible-trader#160 ---------------------------------------------
+
+
+class TestBookEnd:
+    """A prior-period book holds nothing past its declared final month."""
+
+    def test_a_backfill_past_the_books_end_is_refused(self, root, monkeypatch):
+        from crucible_trader import ledger
+
+        monkeypatch.setattr(ledger, "PRIOR_PERIOD_BOOKS", {BOOK: "2026-08"})
+        with pytest.raises(BackfillRefused, match="after 2026-08, the last month"):
+            backfill_day(LocalStore(root), _statement(), corporate_actions=CA, book=BOOK)
+
+
+SEP11 = "2026-09-11"
+
+
+class TestWholeBookApply:
+    """A month with a stored reconciliation (LATER) between missing days (DAY,
+    09-11) is applied into the book from its rehearsal, create-only and in
+    date order: the stored day cannot be backfilled (it is not missing) and a
+    missing day alone ahead of it is refused."""
+
+    def _args(self, gap_root, tmp_path, *extra):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        args = ["--store", str(gap_root), "--book", BOOK]
+        for day, period in ((DAY, "September 9, 2026"), (SEP11, "September 11, 2026")):
+            path = tmp_path / f"{day}.csv"
+            path.write_text(csv_text(account="DU1", period=period), encoding="utf-8")
+            args += ["--day", day, "--statement", str(path)]
+        out = tmp_path / "out"
+        return [*args, "--close", "2026-09", "--out", str(out), "--now", NOW_STAMP, *extra], out
+
+    def _rehearse(self, gap_root):
+        return statement_backfill.rehearse_close(
+            LocalStore(gap_root),
+            [_statement(), BrokerStatement("DU1", SEP11, {"AAA": 10}, 1_000.0)],
+            month="2026-09",
+            now=NOW_STAMP,
+            corporate_actions=CA,
+            book=BOOK,
+        )
+
+    def test_stored_and_missing_days_book_in_date_order(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        from crucible_trader.exception_proposal import exception_proposals_key
+
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        args, out = self._args(gap_root, tmp_path, "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 0, capsys.readouterr().err
+        assert "applied" in capsys.readouterr().err
+        backend = LocalStore(gap_root)
+        journals = [journal_key("nous-ergon-paper", d, BOOK) for d in (DAY, LATER, SEP11)]
+        for key in journals:
+            assert backend.exists(key), key
+        for day in (DAY, LATER, SEP11):
+            assert not backend.exists(journal_key("nous-ergon-paper", day))
+        assert backend.exists(trader_reconciliation_key(DAY))
+        assert backend.exists(trader_reconciliation_key(SEP11))
+        applied = json.loads((out / "summary.json").read_text())["applied"]
+        at = [applied.index(k) for k in journals]
+        assert at == sorted(at)
+        assert applied.index(trader_reconciliation_key(DAY)) < at[1]
+        # the dry run's own review-queue rehearsal is not applied
+        assert exception_proposals_key(LATER) not in applied
+        assert not backend.exists(exception_proposals_key(LATER))
+        # the applied days are no longer missing: a re-run is refused, nothing written
+        before = snapshot(gap_root)
+        args, _ = self._args(gap_root, tmp_path / "again", "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 1
+        assert "not a missing day" in capsys.readouterr().err
+        assert snapshot(gap_root) == before
+
+    def test_create_only_refuses_before_the_first_write(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        taken = (
+            f"trader/ledger/books/{BOOK}/close/nous-ergon-paper/2026-09/attempts/2026-10-01.json"
+        )
+        LocalStore(gap_root).put_bytes(taken, b"{}")
+        before = snapshot(gap_root)
+        args, out = self._args(gap_root, tmp_path, "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 1
+        assert "create-only" in capsys.readouterr().err
+        assert snapshot(gap_root) == before
+        assert (out / "summary.json").exists()  # the rehearsal is kept
+
+    def test_a_refused_lock_exits_2(self, gap_root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        monkeypatch.setattr(
+            statement_backfill, "lock_books_records", lambda *_a, **_k: ([], {"k": "denied"})
+        )
+        args, _ = self._args(gap_root, tmp_path, "--apply")
+        assert main(args, clock=lambda: OUTSIDE) == 2
+        assert "NOT under WORM retention" in capsys.readouterr().err
+
+    def test_the_period_lock_is_applied_before_the_close(self):
+        root = f"trader/ledger/books/{BOOK}/"
+        closing = [
+            f"{root}statements/nous-ergon-paper/2026-09.json",
+            f"{root}close/nous-ergon-paper/2026-09.json",
+            f"{root}periods/nous-ergon-paper/2026-09.json",
+        ]
+        order = statement_backfill._closing_order(closing, root)
+        assert order[0] == f"{root}periods/nous-ergon-paper/2026-09.json"
+        assert order.index(f"{root}close/nous-ergon-paper/2026-09.json") == 1
+
+    def test_a_close_without_its_period_lock_is_refused(self, gap_root):
+        view, summary = self._rehearse(gap_root)
+        LocalStore(gap_root).put_bytes(
+            f"trader/ledger/books/{BOOK}/close/nous-ergon-paper/2026-09.json", b"{}"
+        )
+        before = snapshot(gap_root)
+        with pytest.raises(BackfillRefused, match="close but no period lock"):
+            statement_backfill.apply_book(
+                LocalStore(gap_root), view, summary, book=BOOK, now=OUTSIDE
+            )
+        assert snapshot(gap_root) == before
+
+    @pytest.mark.parametrize(
+        ("spoil", "message"),
+        [
+            (lambda s: s["backfill"][0].update(has_ledger=False), "no reconciliation, journal"),
+            (lambda s: s["backfill"][0].update(locked_writes=["x"]), "Object Lock"),
+            (lambda s: s["days_with_reconciliation"].append("2026-09-30"), "no pre-v2 journal"),
+        ],
+    )
+    def test_refusals_write_nothing(self, gap_root, spoil, message):
+        view, summary = self._rehearse(gap_root)
+        spoil(summary)
+        before = snapshot(gap_root)
+        with pytest.raises(BackfillRefused, match=message):
+            statement_backfill.apply_book(
+                LocalStore(gap_root), view, summary, book=BOOK, now=OUTSIDE
+            )
+        assert snapshot(gap_root) == before
+
+    @pytest.mark.parametrize(
+        ("book", "now", "message"), [(None, OUTSIDE, "give --book"), (BOOK, INSIDE, "09:00-16:30")]
+    )
+    def test_no_book_or_inside_the_window_is_refused(self, gap_root, book, now, message):
+        view, summary = self._rehearse(gap_root)
+        with pytest.raises(BackfillRefused, match=message):
+            statement_backfill.apply_book(LocalStore(gap_root), view, summary, book=book, now=now)
+
+
+class TestWholeBookResume:
+    """Codex re-review of crucible-trader#160: an apply stopped part-way is
+    finished by re-running it, with no --day once every missing day has its
+    reconciliation; and the book's close proposals reach the review queue."""
+
+    def _stop_at(self, backend, monkeypatch, target):
+        """The apply (not the rehearsal before it: the capturing view copies
+        the backend's attributes) meets a writer at ``target`` and stops."""
+        from crucible.store import PointerConflictError
+
+        real_apply, real_cas = statement_backfill.apply_book, backend.compare_and_swap
+
+        def cas(key, expected, payload):
+            if key == target:
+                raise PointerConflictError(key)
+            return real_cas(key, expected, payload)
+
+        def apply_book(*a, **k):
+            monkeypatch.setattr(backend, "compare_and_swap", cas)
+            try:
+                return real_apply(*a, **k)
+            finally:
+                monkeypatch.setattr(backend, "compare_and_swap", real_cas)
+                monkeypatch.setattr(statement_backfill, "apply_book", real_apply)
+
+        monkeypatch.setattr(statement_backfill, "apply_book", apply_book)
+
+    def _main(self, backend, tmp_path, *days):
+        args = ["--book", BOOK]
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        for day in days:
+            path = tmp_path / f"{day}.csv"
+            period = dt.date.fromisoformat(day).strftime("%B %-d, %Y")
+            path.write_text(csv_text(account="DU1", period=period), encoding="utf-8")
+            args += ["--day", day, "--statement", str(path)]
+        out = tmp_path / "out"
+        args += ["--close", "2026-09", "--out", str(out), "--now", NOW_STAMP, "--apply"]
+        code = main(args, opener=lambda _uri: backend, clock=lambda: OUTSIDE)
+        return code, out
+
+    ATTEMPT = f"trader/ledger/books/{BOOK}/close/nous-ergon-paper/2026-09/attempts/2026-10-01.json"
+
+    def test_resume_with_no_missing_day_left_finishes_the_close(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        backend = LocalStore(gap_root)
+        self._stop_at(backend, monkeypatch, self.ATTEMPT)
+        code, _ = self._main(backend, tmp_path / "first", DAY, SEP11)
+        assert code == 1 and "written during the apply" in capsys.readouterr().err
+        assert backend.exists(trader_reconciliation_key(SEP11))
+        assert not backend.exists(self.ATTEMPT)
+        code, _ = self._main(backend, tmp_path / "resume")
+        assert code == 0, capsys.readouterr().err
+        assert backend.exists(self.ATTEMPT)
+        for day in (DAY, LATER, SEP11):
+            assert backend.exists(journal_key("nous-ergon-paper", day, BOOK))
+
+    def test_resume_after_a_stop_between_days(self, gap_root, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        backend = LocalStore(gap_root)
+        self._stop_at(backend, monkeypatch, journal_key("nous-ergon-paper", LATER, BOOK))
+        code, _ = self._main(backend, tmp_path / "first", DAY, SEP11)
+        assert code == 1
+        assert backend.exists(trader_reconciliation_key(DAY))
+        assert not backend.exists(journal_key("nous-ergon-paper", LATER, BOOK))
+        assert not backend.exists(trader_reconciliation_key(SEP11))
+        code, _ = self._main(backend, tmp_path / "resume", SEP11)  # DAY is no longer missing
+        assert code == 0, capsys.readouterr().err
+        for day in (DAY, LATER, SEP11):
+            assert backend.exists(journal_key("nous-ergon-paper", day, BOOK))
+        assert backend.exists(self.ATTEMPT)
+
+    def test_the_close_proposals_are_applied_with_the_close(
+        self, gap_root, tmp_path, capsys, monkeypatch
+    ):
+        from crucible_trader.exception_proposal import close_proposals_key
+
+        monkeypatch.setattr(statement_backfill, "live_corporate_action_source", lambda: CA)
+        backend = LocalStore(gap_root)
+        code, out = self._main(backend, tmp_path, DAY, SEP11)
+        assert code == 0, capsys.readouterr().err
+        key = close_proposals_key("nous-ergon-paper", "2026-09", "2026-10-01")
+        applied = json.loads((out / "summary.json").read_text())["applied"]
+        assert key in applied and backend.exists(key)
+        assert applied.index(key) > applied.index(self.ATTEMPT)
+        assert json.loads(backend.get_bytes(key))["proposals"]
+
+
+def test_a_single_day_run_needs_its_day(root, capsys):
+    with pytest.raises(SystemExit):
+        main(["--store", str(root)])
+    assert "give the missing --day" in capsys.readouterr().err

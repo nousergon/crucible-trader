@@ -125,6 +125,10 @@ MONTH_END_CLOSE_CLASSES: frozenset[str] = frozenset(
         "close_input_missing",
         "close_checks_failed",
         "close_attribution",
+        # A prior-period book's last close against the live book's opening
+        # (the bridge across the cutover, alpha-engine-config-I13232).
+        "close_bridge_cash",
+        "close_bridge_shares",
     }
 )
 
@@ -160,6 +164,8 @@ _UNIT_BY_CLASS: Mapping[tuple[str, str], str] = {
     (SOURCE_MONTH_END_CLOSE, "close_suspense_cash"): "usd",
     (SOURCE_MONTH_END_CLOSE, "close_suspense_shares"): "shares",
     (SOURCE_MONTH_END_CLOSE, "close_attribution"): "usd",
+    (SOURCE_MONTH_END_CLOSE, "close_bridge_cash"): "usd",
+    (SOURCE_MONTH_END_CLOSE, "close_bridge_shares"): "shares",
 }
 
 _ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")

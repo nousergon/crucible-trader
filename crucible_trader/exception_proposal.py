@@ -286,6 +286,19 @@ _RULES: Mapping[tuple[str, str], Callable[[Mapping[str, object]], _Rule]] = {
         "investigate_detector",
         "P&L attribution does not tie to the NAV change; the close's arithmetic is wrong",
     ),
+    (_C, "close_bridge_cash"): _fixed(
+        "close.bridge_cash",
+        "defect",
+        "investigate_cash",
+        "the prior-period book's closing cash or receivable differs from what the live "
+        "book opened with",
+    ),
+    (_C, "close_bridge_shares"): _fixed(
+        "close.bridge_shares",
+        "defect",
+        "investigate_shares",
+        "the prior-period book's closing share count differs from what the live book opened with",
+    ),
 }
 
 
