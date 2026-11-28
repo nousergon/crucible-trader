@@ -290,9 +290,13 @@ def test_a_refused_plan_still_saves_the_order_book(store) -> None:
 def test_a_book_with_no_order_gets_one_sign_of_life_order_before_the_router(store) -> None:
     """alpha-engine-config-I14646: the rule runs after construction and before
     routing, and the manifest carries what it decided."""
-    from test_sign_of_life import _book, _held_weights
+    from test_sign_of_life import _book, _held_weights, _plan
 
-    ib, router = FakeIB(), Router(n_batches=1)
+    class PlanningRouter(Router):
+        def plan(self, book):
+            return _plan(book)
+
+    ib, router = FakeIB(), PlanningRouter(n_batches=1)
     ctx = ctx_for(store, "trader.session")
     session_cycle(
         ctx,

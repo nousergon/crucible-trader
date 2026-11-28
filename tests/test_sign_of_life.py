@@ -27,7 +27,6 @@ from crucible_trader.sign_of_life import (
     SIGN_OF_LIFE_METRIC,
     apply_sign_of_life,
     metric_record,
-    planned_order_count,
 )
 
 DAY = "2026-11-25"
@@ -51,8 +50,8 @@ def _held_weights() -> dict[str, float]:
     return {**HELD, CASH: 1.0 - sum(HELD.values())}
 
 
-def _positions() -> dict[str, int]:
-    return {t: round(w * NOTIONAL / PRICES[t]) for t, w in HELD.items()}
+def _positions(weights=HELD) -> dict[str, int]:
+    return {t: round(w * NOTIONAL / PRICES[t]) for t, w in weights.items() if t in PRICES and w}
 
 
 def _book(**overrides) -> TargetBook:
@@ -135,24 +134,32 @@ def _locked(*names: str, multiplier: float | None = None) -> HardRiskDecision:
     )
 
 
-def _plan(book: TargetBook):
-    sells, buys = plan_orders(
-        book,
-        positions=_positions(),
-        quote=PRICES.get,
-        clock=lambda: dt.datetime(2026, 11, 25, 14, 30, tzinfo=dt.UTC),
-        max_order_notional_usd=50_000.0,
-        max_session_notional_usd=100_000.0,
-    )
-    return [*sells, *buys]
+def _planner(positions=None, prices=PRICES, session_cap=100_000.0):
+    """The router's own plan (`plan_orders`) over ``positions`` (default: the held book)."""
+    held = _positions() if positions is None else positions
+
+    def plan(book: TargetBook):
+        sells, buys = plan_orders(
+            book,
+            positions=held,
+            quote=prices.get,
+            clock=lambda: dt.datetime(2026, 11, 25, 14, 30, tzinfo=dt.UTC),
+            max_order_notional_usd=50_000.0,
+            max_session_notional_usd=session_cap,
+        )
+        return [*sells, *buys]
+
+    return plan
+
+
+_plan = _planner()
 
 
 def test_the_replayed_zero_order_day_places_exactly_one_order() -> None:
     book = _book()
     assert _plan(book) == []  # the day as it ran: every step banded away
-    assert planned_order_count(book, _held_weights()) == 0
 
-    stepped, outcome = apply_sign_of_life(book, _held_weights())
+    stepped, outcome = apply_sign_of_life(book, _plan)
 
     (order,) = _plan(stepped)
     # The top deferred entry, at the band (1% of the book), not its 4% aim.
@@ -162,6 +169,7 @@ def test_the_replayed_zero_order_day_places_exactly_one_order() -> None:
         "ticker": "FFF",
         "side": "buy",
         "weight": pytest.approx(0.01),
+        "shares": 1000,
         "notional_usd": pytest.approx(10_000.0),
         "source": "deferred_entry",
         "full_step": 0.04,
@@ -178,7 +186,7 @@ def test_a_banded_resize_is_not_banded_away_again_by_the_router() -> None:
     # banded +0.6%, a resize of a held name the router would otherwise band.
     alpha = {**_book().alpha, "FFF": -0.001}
     book = _book(alpha=alpha, hard_risk=_locked("GGG"))
-    stepped, outcome = apply_sign_of_life(book, _held_weights())
+    stepped, outcome = apply_sign_of_life(book, _plan)
     (order,) = _plan(stepped)
     assert (order.decision.symbol, order.action, order.decision.quantity) == ("CCC", "BUY", 300)
     assert outcome.order is not None and outcome.order.source == "banded_change"
@@ -192,7 +200,7 @@ def test_a_book_that_already_has_orders_is_unchanged() -> None:
     book = _book()
     weights = {**book.weights, "DDD": 0.10, CASH: book.weights[CASH] + 0.02}
     trading = dataclasses.replace(book, weights=weights)
-    stepped, outcome = apply_sign_of_life(trading, _held_weights())
+    stepped, outcome = apply_sign_of_life(trading, _plan)
     assert stepped is trading
     assert (outcome.status, outcome.planned_orders, outcome.order) == ("not_needed", 1, None)
     record = metric_record(outcome, trading_day=DAY, now_utc="2026-11-25T14:30:00Z")
@@ -205,7 +213,7 @@ def test_a_day_where_every_candidate_is_locked_out_records_unmeasurable() -> Non
     assert optimizer is not None
     solved = {**optimizer["solved"], "rebalance_band": {"held": held}}
     book = _book(optimizer={**optimizer, "solved": solved}, hard_risk=_locked("FFF", "GGG", "CCC"))
-    stepped, outcome = apply_sign_of_life(book, _held_weights())
+    stepped, outcome = apply_sign_of_life(book, _plan)
     assert stepped is book and _plan(stepped) == []
     assert outcome.status == "unmeasurable" and outcome.order is None
     for name in ("FFF", "GGG", "CCC"):
@@ -232,8 +240,8 @@ def test_no_buy_qualifies_past_a_risk_check_and_the_sell_goes_instead(overrides,
         weights = _book().weights
         kwargs["weights"] = {**weights, CASH: cash, "EEE": weights["EEE"] + weights[CASH] - cash}
     book = _book(**kwargs)
-    held = _held_weights() if "weights" not in kwargs else {**kwargs["weights"]}
-    stepped, outcome = apply_sign_of_life(book, held)
+    held = _positions(kwargs.get("weights", HELD))
+    stepped, outcome = apply_sign_of_life(book, _planner(held))
     assert why in outcome.reason
     assert outcome.order is not None
     assert (outcome.order.ticker, outcome.order.side) == ("BBB", "sell")
@@ -245,14 +253,14 @@ def test_the_ladder_scales_a_buy_down_never_to_zero() -> None:
     book = _book(hard_risk=_locked(multiplier=0.25))
     weights = {**book.weights, "FFF": 0.22, CASH: book.weights[CASH] - 0.22}
     book = dataclasses.replace(book, weights=weights)
-    stepped, outcome = apply_sign_of_life(book, {**_held_weights(), "FFF": 0.22, CASH: 0.06})
+    stepped, outcome = apply_sign_of_life(book, _planner(_positions({**HELD, "FFF": 0.22})))
     assert outcome.order is not None and outcome.order.ticker == "FFF"
     assert outcome.order.weight == pytest.approx(0.25 * (0.25 - 0.22))  # under the 25% cap
     assert stepped.weights["FFF"] <= 0.25
 
 
 def test_nothing_to_step_toward_records_unmeasurable() -> None:
-    stepped, outcome = apply_sign_of_life(_book(optimizer=BAND_ONLY), _held_weights())
+    stepped, outcome = apply_sign_of_life(_book(optimizer=BAND_ONLY), _plan)
     assert stepped.weights == _book().weights
     assert outcome.status == "unmeasurable" and "no deferred entry or banded change" in (
         outcome.reason
@@ -260,7 +268,7 @@ def test_nothing_to_step_toward_records_unmeasurable() -> None:
 
 
 def test_a_book_over_its_budget_gets_no_order_on_top() -> None:
-    _, outcome = apply_sign_of_life(_book(turnover_one_way_ratio=0.02), _held_weights())
+    _, outcome = apply_sign_of_life(_book(turnover_one_way_ratio=0.02), _plan)
     assert outcome.status == "unmeasurable" and "already over its budget" in outcome.reason
 
 
@@ -273,14 +281,72 @@ def test_a_candidate_outside_the_universe_or_with_nothing_left_is_refused() -> N
         },
         aim_weights=None,
     )
-    _, outcome = apply_sign_of_life(book, _held_weights())
+    _, outcome = apply_sign_of_life(book, _plan)
     assert outcome.status == "unmeasurable"
     assert "ZZZ not in the book's universe" in outcome.reason
     assert "GGG nothing left to trade" in outcome.reason
 
 
 def test_an_inception_book_with_entries_needs_no_sign_of_life() -> None:
-    assert planned_order_count(_book(), None) == 5
+    _, outcome = apply_sign_of_life(_book(), _planner({}, session_cap=1e7))
+    assert (outcome.status, outcome.planned_orders) == ("not_needed", 5)
+
+
+def _one_name_book(weights: dict[str, float], solved: dict) -> TargetBook:
+    """A $1m book holding only ``weights`` (the rest cash), with ``solved`` recorded."""
+    full = {t: 0.0 for t in (*PRICES, "SPY")} | weights
+    full[CASH] = 1.0 - sum(full.values())
+    optimizer = _book().optimizer
+    assert optimizer is not None
+    return _book(weights=full, optimizer={**optimizer, "solved": solved}, aim_weights=None)
+
+
+def test_a_step_the_router_sizes_to_no_whole_share_is_passed_over_for_the_next() -> None:
+    # Codex on crucible-trader-PR187: 400 AAA at $500 and a +0.01% banded step
+    # is a $100 buy, under one share. The router plans nothing for it, so the
+    # rule must not report it and must try the next candidate (BBB's -0.008%).
+    prices = {"AAA": 500.0, "BBB": 10.0, "FFF": 10.0}
+    positions = {"AAA": 400, "BBB": 10_000}
+    held = [{"ticker": "AAA", "delta": 0.0001}, {"ticker": "BBB", "delta": -0.00008}]
+    book = _one_name_book({"AAA": 0.2, "BBB": 0.1}, {"rebalance_band": {"held": held}})
+    plan = _planner(positions, prices)
+    assert plan(book) == []
+
+    stepped, outcome = apply_sign_of_life(book, plan)
+
+    assert outcome.status == "fired" and outcome.order is not None
+    assert "AAA the router plans no whole-share order for it" in outcome.reason
+    (order,) = plan(stepped)
+    assert (order.decision.symbol, order.action, order.decision.quantity) == ("BBB", "SELL", 8)
+    assert (outcome.order.ticker, outcome.order.shares) == ("BBB", 8)
+    assert outcome.order.notional_usd == pytest.approx(80.0)
+
+
+def test_a_plan_the_router_bands_to_nothing_on_whole_shares_still_gets_its_order() -> None:
+    # Codex on crucible-trader-PR187: 333 shares at $600 (19.98%) toward
+    # 20.981% is a 1.001% change, over the 1% band by weight; but the router
+    # floors it to 349 shares and holds the $9,600 resize under its $10,000
+    # band, so the day has no order and the sign-of-life order must go.
+    prices = {"AAA": 600.0, "FFF": 10.0}
+    solved = {"aim_adjustment": {"entries_deferred": ["FFF"]}}
+    book = dataclasses.replace(_one_name_book({"AAA": 0.20981}, solved), aim_weights={"FFF": 0.04})
+    plan = _planner({"AAA": 333}, prices)
+    assert plan(book) == []
+
+    stepped, outcome = apply_sign_of_life(book, plan)
+
+    assert outcome.status == "fired" and outcome.order is not None
+    (order,) = plan(stepped)
+    assert (order.decision.symbol, order.action, order.decision.quantity) == ("FFF", "BUY", 1000)
+
+
+def test_a_step_the_router_refuses_is_passed_over_for_the_next() -> None:
+    # FFF has no decision price: the router refuses that plan, so GGG goes.
+    prices = {t: p for t, p in PRICES.items() if t != "FFF"}
+    stepped, outcome = apply_sign_of_life(_book(), _planner(prices=prices))
+    assert outcome.order is not None and outcome.order.ticker == "GGG"
+    assert "FFF the router refused it (no usable decision price for FFF" in outcome.reason
+    assert [o.decision.symbol for o in _planner(prices=prices)(stepped)] == ["GGG"]
 
 
 def test_the_aim_weights_are_read_from_the_engines_diagnostics() -> None:
@@ -303,7 +369,7 @@ def _close(run: dict) -> list[m.Check]:
 
 
 def test_the_close_alert_names_the_sign_of_life_order() -> None:
-    _, outcome = apply_sign_of_life(_book(), _held_weights())
+    _, outcome = apply_sign_of_life(_book(), _plan)
     record = metric_record(outcome, trading_day=DAY, now_utc="2026-11-25T14:30:00Z")
     run = {"status": "ok", "metrics": [{"name": "other"}, record]}
     texts = [c.text for c in _close(run)]
@@ -311,7 +377,7 @@ def test_the_close_alert_names_the_sign_of_life_order() -> None:
 
 
 def test_the_close_alert_fails_when_no_sign_of_life_order_qualified() -> None:
-    _, outcome = apply_sign_of_life(_book(optimizer=BAND_ONLY), _held_weights())
+    _, outcome = apply_sign_of_life(_book(optimizer=BAND_ONLY), _plan)
     record = metric_record(outcome, trading_day=DAY, now_utc="2026-11-25T14:30:00Z")
     (check,) = [c for c in _close({"status": "ok", "metrics": [record]}) if "Sign" in c.text]
     assert check.mark == "fail" and check.text.startswith("Sign-of-life order: none placed (")
@@ -319,6 +385,8 @@ def test_the_close_alert_fails_when_no_sign_of_life_order_qualified() -> None:
 
 def test_the_close_alert_is_silent_when_the_plan_had_its_own_orders() -> None:
     record = metric_record(
-        apply_sign_of_life(_book(), None)[1], trading_day=DAY, now_utc="2026-11-25T14:30:00Z"
+        apply_sign_of_life(_book(), _planner({}, session_cap=1e7))[1],
+        trading_day=DAY,
+        now_utc="2026-11-25T14:30:00Z",
     )
     assert not [c for c in _close({"status": "ok", "metrics": [record]}) if "Sign" in c.text]

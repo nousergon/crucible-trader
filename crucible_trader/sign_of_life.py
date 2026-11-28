@@ -10,17 +10,20 @@ holds throughout: risk controls scale participation down, never to zero, and
 no risk check is weakened to make this work.
 
 **When it fires.** After the target book is built and before it is routed
-(`crucible_trader.session.session_cycle`): if the book, measured against the
-book held into the session, plans no order -- every change zero or inside the
-band the router holds (:func:`planned_order_count`) -- the session adds exactly
-one order. A book that already plans an order is returned unchanged.
+(`crucible_trader.session.session_cycle`): if the router's own plan for the
+book (``plan``: `order_router.plan_orders` over the account's shares and
+prices, sending nothing) has no order -- every change under one whole share or
+inside the band the router holds -- the session adds exactly one order. A book
+that already plans an order is returned unchanged.
 
 **Which order.** The largest single step toward the aim, from what the
 construction recorded: a DEFERRED ENTRY (``aim_adjustment.entries_deferred``,
 a name whose stepped weight fell below ``min_position_pct``; its step is the
 aim weight) or a BANDED CHANGE (``rebalance_band.held``; its step is the engine's
 own target minus the held weight). Candidates are taken largest step first, and
-the first that qualifies is the order. Its size is the smallest of the full step,
+the first that qualifies AND that the router then plans as a whole-share order
+of that name is the order; a step the router would size to no order is passed
+over for the next. Its size is the smallest of the full step,
 ``max(rebalance_band_pct, $1,000)`` of the book, and -- for a buy -- what the
 hard-risk ladder allows (``buy_multiplier`` times the room under the per-name
 cap, as `crucible.portfolio._name_caps` throttles it) and the cash above the
@@ -42,22 +45,23 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, cast
 
 from crucible.keys import manifest_key
 
 from crucible_trader.construction import TargetBook
+from crucible_trader.order_router import PlannedOrder, RoutingRefusedError
 
 __all__ = [
     "MIN_NOTIONAL_USD",
     "SIGN_OF_LIFE_METRIC",
     "Candidate",
+    "Planner",
     "SignOfLifeOrder",
     "SignOfLifeOutcome",
     "apply_sign_of_life",
     "metric_record",
-    "planned_order_count",
 ]
 
 SIGN_OF_LIFE_METRIC = "sign_of_life_order"
@@ -72,6 +76,9 @@ _DUST = 1e-6
 
 Side = Literal["buy", "sell"]
 Source = Literal["deferred_entry", "banded_change"]
+
+#: The router's plan for a book, sending nothing (`PaperOrderRouter.plan`).
+Planner = Callable[[TargetBook], Sequence[PlannedOrder]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +98,8 @@ class SignOfLifeOrder:
     ticker: str
     side: Side
     weight: float
+    #: The router's planned order: its whole shares, and their notional at its price.
+    shares: int
     notional_usd: float
     source: Source
     full_step: float
@@ -146,28 +155,6 @@ def _list(value: object) -> list[object]:
 def _band(book: TargetBook) -> float:
     band = _number(_section(book, "settings", "rebalance_band_pct"))
     return band if band is not None and band > 0 else 0.0
-
-
-def planned_order_count(book: TargetBook, previous_weights: Mapping[str, float] | None) -> int:
-    """How many names the book changes by an order the router would send.
-
-    Measured against ``previous_weights`` (the book held into the session; None
-    is all cash). A change of dust is none, and a resize of a name held on both
-    sides inside the band is held there by the router (`order_router.plan_orders`).
-    """
-    held = dict(previous_weights or {})
-    sentinels = _sentinels(book)
-    band = _band(book)
-    count = 0
-    for ticker in sorted((set(book.weights) | set(held)) - sentinels):
-        target, before = book.weights.get(ticker, 0.0), held.get(ticker, 0.0)
-        change = abs(target - before)
-        if change <= _DUST:
-            continue
-        if before > 0 and target > 0 and change < band and ticker not in book.unbanded:
-            continue
-        count += 1
-    return count
 
 
 def _candidates(book: TargetBook) -> list[Candidate]:
@@ -229,11 +216,42 @@ def _size(book: TargetBook, candidate: Candidate) -> tuple[float, str | None]:
     return min(size, room, cash), None
 
 
-def apply_sign_of_life(
-    book: TargetBook, previous_weights: Mapping[str, float] | None
-) -> tuple[TargetBook, SignOfLifeOutcome]:
-    """``book`` with one sign-of-life order added when it plans none, and what was decided."""
-    planned = planned_order_count(book, previous_weights)
+def _stepped(book: TargetBook, candidate: Candidate, size: float) -> TargetBook:
+    """``book`` with ``candidate`` stepped by ``size`` out of (or into) cash, and unbanded."""
+    signed = math.copysign(size, candidate.step)
+    weights = dict(book.weights)
+    weights[candidate.ticker] += signed
+    weights[_cash_ticker(book)] -= signed
+    budget = book.turnover_budget
+    return dataclasses.replace(
+        book,
+        weights=weights,
+        turnover_one_way_ratio=book.turnover_one_way_ratio + size,
+        turnover_budget=None if budget is None else budget + size,
+        unbanded=book.unbanded | {candidate.ticker},
+    )
+
+
+def _routed(plan: Planner, book: TargetBook, ticker: str) -> tuple[PlannedOrder | None, str | None]:
+    """The router's order of ``ticker`` for ``book``, or ``(None, why it plans none)``."""
+    try:
+        orders = plan(book)
+    except RoutingRefusedError as error:
+        return None, f"the router refused it ({error})"
+    for order in orders:
+        if order.decision.symbol == ticker:
+            return order, None
+    return None, "the router plans no whole-share order for it"
+
+
+def apply_sign_of_life(book: TargetBook, plan: Planner) -> tuple[TargetBook, SignOfLifeOutcome]:
+    """``book`` with one sign-of-life order added when the router plans none, and what was decided.
+
+    ``plan`` is the router's own plan (`PaperOrderRouter.plan`): the book plans
+    an order when it returns one, and a candidate is the order only when the
+    router plans a whole-share order of that name for the stepped book.
+    """
+    planned = len(plan(book))
     if planned:
         return book, SignOfLifeOutcome("not_needed", f"the plan has {planned} order(s)", planned)
     candidates = _candidates(book)
@@ -257,19 +275,23 @@ def apply_sign_of_life(
     refused: list[str] = []
     for candidate in candidates:
         size, why = _size(book, candidate)
-        if why is not None or size <= _DUST:
-            refused.append(f"{candidate.ticker} {why or 'nothing left to trade'}")
+        if why is None and size <= _DUST:
+            why = "nothing left to trade"
+        stepped, routed = book, None
+        if why is None:
+            stepped = _stepped(book, candidate, size)
+            routed, why = _routed(plan, stepped, candidate.ticker)
+        if routed is None:
+            refused.append(f"{candidate.ticker} {why}")
             continue
-        signed = math.copysign(size, candidate.step)
-        side: Side = "buy" if signed > 0 else "sell"
-        weights = dict(book.weights)
-        weights[candidate.ticker] += signed
-        weights[_cash_ticker(book)] -= signed
+        side: Side = "buy" if candidate.step > 0 else "sell"
+        shares = int(routed.decision.quantity)
         order = SignOfLifeOrder(
             ticker=candidate.ticker,
             side=side,
             weight=size,
-            notional_usd=size * book.portfolio_notional_usd,
+            shares=shares,
+            notional_usd=shares * routed.decision.decision_price,
             source=candidate.source,
             full_step=candidate.step,
             reason=(
@@ -277,13 +299,6 @@ def apply_sign_of_life(
                 f"aim ({candidate.source.replace('_', ' ')}, full step {candidate.step:+.4%})"
                 + (f"; passed over: {'; '.join(refused)}" if refused else "")
             ),
-        )
-        stepped = dataclasses.replace(
-            book,
-            weights=weights,
-            turnover_one_way_ratio=book.turnover_one_way_ratio + size,
-            turnover_budget=None if budget is None else budget + size,
-            unbanded=book.unbanded | {candidate.ticker},
         )
         return stepped, SignOfLifeOutcome("fired", order.reason, 0, order)
     return book, SignOfLifeOutcome(
