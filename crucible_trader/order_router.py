@@ -709,12 +709,15 @@ def plan_orders(
         if delta == 0:
             continue
         notional = abs(delta) * price
-        if held > 0 and target > 0 and notional < band_usd:
+        if held > 0 and target > 0 and notional < band_usd and symbol not in book.unbanded:
             # A resize of a name held on both sides that is inside the
             # engine's own no-trade band. The band already held this weight;
             # what is left is the share floor moving with the quote between
             # valuing the book and sizing it (2026-11-13: NVDA 974 -> 973, a
-            # $160 sell). Entries and exits are never banded, as in the engine.
+            # $160 sell). Entries and exits are never banded, as in the engine,
+            # and neither is the day's one sign-of-life order
+            # (`crucible_trader.sign_of_life`), which is smaller than the band
+            # by construction.
             continue
         if notional > max_order_notional_usd:
             # Clipped to the cap, not refused: the cap bounds one order, and an
@@ -1207,6 +1210,7 @@ class PaperOrderRouter:
             prices=quote.priced(),
             band_usd=rebalance_band_usd(book),
             avg_costs=dict(self._avg_costs),
+            unbanded=book.unbanded,
         )
         gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:

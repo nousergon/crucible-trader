@@ -22,7 +22,11 @@ broker by a route that skips one:
    filed before any order (`trader/hard_risk/{day}.json`); a plan that BUYs a
    name the layer forced out today is refused whole, and at the drawdown
    circuit breaker every BUY is dropped so the forced sells still go.
-5. **Before every order batch**, `kill_switch.assert_trading_permitted` raises
+5. **After construction, before the router**, `sign_of_life.apply_sign_of_life`
+   (`alpha-engine-config-I14646`): a book that plans no order on the day gets
+   exactly one, the largest step toward the aim that every risk check allows,
+   or the `sign_of_life_order` metric records ``unmeasurable`` and why.
+6. **Before every order batch**, `kill_switch.assert_trading_permitted` raises
    :class:`~crucible_trader.kill_switch.TradingHaltedError` when flatten or
    freeze is engaged or a hold covers the day. It is re-read per batch, so a
    switch fired mid-session stops the next batch.
@@ -64,6 +68,8 @@ from crucible_trader.hold_book import enforce_hold_book
 from crucible_trader.kill_switch import BrokerControl, assert_trading_permitted, utcnow
 from crucible_trader.order_book import held_sessions_from_order_books, record_order_book
 from crucible_trader.paper_smoke import RunningWheelMismatchError, running_wheel_disagreement
+from crucible_trader.sign_of_life import apply_sign_of_life
+from crucible_trader.sign_of_life import metric_record as sign_of_life_metric
 from crucible_trader.v1_rules_guard import enforce_v1_rules
 
 SESSION_SCHEMA_VERSION = "trader_session.v1"
@@ -139,6 +145,19 @@ def session_cycle(
             hard_risk_key(day),
             json.dumps(cut.to_document(), indent=2, sort_keys=True).encode("utf-8"),
             HARD_RISK_SCHEMA_VERSION,
+        )
+    if getattr(book, "universe", None) is not None:
+        # `alpha-engine-config-I14646`: a book that plans no order gets exactly
+        # one, the largest step toward the aim the risk checks allow; or the
+        # metric says why none qualified. Read leniently: a constructor double
+        # carries no universe and is left as it is.
+        book, outcome = apply_sign_of_life(book, previous_weights)
+        ctx.record_metric(
+            sign_of_life_metric(
+                outcome,
+                trading_day=day,
+                now_utc=clock().astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
         )
 
     def save_order_book() -> None:

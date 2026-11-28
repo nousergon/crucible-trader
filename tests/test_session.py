@@ -285,3 +285,27 @@ def test_a_refused_plan_still_saves_the_order_book(store) -> None:
         )
     assert [m["name"] for m in ctx.metrics][-1] == "trader_order_book_written"
     assert router.sent == []
+
+
+def test_a_book_with_no_order_gets_one_sign_of_life_order_before_the_router(store) -> None:
+    """alpha-engine-config-I14646: the rule runs after construction and before
+    routing, and the manifest carries what it decided."""
+    from test_sign_of_life import _book, _held_weights
+
+    ib, router = FakeIB(), Router(n_batches=1)
+    ctx = ctx_for(store, "trader.session")
+    session_cycle(
+        ctx,
+        broker=IbBrokerControl(ib, FakeSdk(ib)),
+        router=router,
+        installed_version=VERSION,
+        previous_weights=_held_weights(),
+        clock=ib.clock,
+        contract_resolver=_contract(HEALTHY),
+        construct=lambda store_, **kw: _book(),
+    )
+    (routed,) = router.books
+    assert routed.unbanded == frozenset({"FFF"})
+    (metric,) = [m for m in ctx.metrics if m["name"] == "sign_of_life_order"]
+    assert metric["status"] == "OK" and metric["value"] == 1.0
+    assert metric["sign_of_life_order"]["order"]["ticker"] == "FFF"
