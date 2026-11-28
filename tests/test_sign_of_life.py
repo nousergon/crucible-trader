@@ -25,6 +25,7 @@ from crucible_trader.order_book import ShareBasis
 from crucible_trader.order_router import plan_orders
 from crucible_trader.sign_of_life import (
     SIGN_OF_LIFE_METRIC,
+    Planner,
     apply_sign_of_life,
     metric_record,
 )
@@ -134,7 +135,7 @@ def _locked(*names: str, multiplier: float | None = None) -> HardRiskDecision:
     )
 
 
-def _planner(positions=None, prices=PRICES, session_cap=100_000.0):
+def _planner(positions=None, prices=PRICES, session_cap=100_000.0, order_cap=50_000.0):
     """The router's own plan (`plan_orders`) over ``positions`` (default: the held book)."""
     held = _positions() if positions is None else positions
 
@@ -144,7 +145,7 @@ def _planner(positions=None, prices=PRICES, session_cap=100_000.0):
             positions=held,
             quote=prices.get,
             clock=lambda: dt.datetime(2026, 11, 25, 14, 30, tzinfo=dt.UTC),
-            max_order_notional_usd=50_000.0,
+            max_order_notional_usd=order_cap,
             max_session_notional_usd=session_cap,
         )
         return [*sells, *buys]
@@ -347,6 +348,75 @@ def test_a_step_the_router_refuses_is_passed_over_for_the_next() -> None:
     assert outcome.order is not None and outcome.order.ticker == "GGG"
     assert "FFF the router refused it (no usable decision price for FFF" in outcome.reason
     assert [o.decision.symbol for o in _planner(prices=prices)(stepped)] == ["GGG"]
+
+
+def _bbb_drifted(**overrides) -> tuple[TargetBook, Planner]:
+    """Codex on crucible-trader-PR187: a $1m book, a 1% band, BBB's target 18%,
+    its held shares worth $175,000, and a recorded -0.4% banded step."""
+    held = [{"ticker": "BBB", "delta": -0.004, "is_new_position": False}]
+    book = _one_name_book({"BBB": 0.18}, {"rebalance_band": {"held": held}})
+    book = dataclasses.replace(book, **overrides)
+    plan = _planner({"BBB": 3_500}, {"BBB": 50.0})
+    assert plan(book) == []  # the $5,000 resize to 18% is inside the router's band
+    # Unbanded at 17.6%, the router would BUY $1,000 against the $175,000 held.
+    unbanded = dataclasses.replace(
+        book, weights={**book.weights, "BBB": 0.176}, unbanded=frozenset({"BBB"})
+    )
+    (order,) = plan(unbanded)
+    assert (order.action, order.decision.quantity) == ("BUY", 20)
+    return book, plan
+
+
+def test_a_sell_step_the_router_would_route_as_a_buy_is_passed_over() -> None:
+    book, plan = _bbb_drifted()
+    stepped, outcome = apply_sign_of_life(book, plan)
+    assert stepped is book and plan(stepped) == []
+    assert outcome.status == "unmeasurable" and outcome.order is None
+    assert "BBB the router plans a buy of it, not the sell its step asks for" in outcome.reason
+    record = metric_record(outcome, trading_day=DAY, now_utc="2026-11-25T14:30:00Z")
+    assert record["status"] == "unmeasurable" and "value" not in record
+
+
+def test_a_routed_buy_passes_the_buy_checks_on_the_order_itself() -> None:
+    # The same drift with BBB's alpha below zero: the routed BUY is refused by
+    # the buy checks, which the sell step itself never ran.
+    book, plan = _bbb_drifted(alpha={**_book().alpha, "BBB": -0.001})
+    stepped, outcome = apply_sign_of_life(book, plan)
+    assert stepped is book and outcome.order is None
+    assert "BBB the router plans a buy of it, refused: alpha -0.001 is below zero" in (
+        outcome.reason
+    )
+
+
+def test_a_routed_order_larger_than_the_rule_sized_is_passed_over() -> None:
+    # 9,500 FFF held at $10 (9.5%) against a 10% book weight and a +0.4% step:
+    # the router would buy 900 shares, 0.9% of the book, not the 0.4% sized.
+    held = [{"ticker": "FFF", "delta": 0.004, "is_new_position": False}]
+    book = _one_name_book({"FFF": 0.10}, {"rebalance_band": {"held": held}})
+    plan = _planner({"FFF": 9_500}, {"FFF": 10.0})
+    assert plan(book) == []
+    stepped, outcome = apply_sign_of_life(book, plan)
+    assert stepped is book and outcome.order is None
+    assert "FFF the router's buy is 0.9000% of the book, over the 0.4000% the rule sized" in (
+        outcome.reason
+    )
+
+
+def test_the_budget_rises_by_the_order_the_router_planned_after_its_cap() -> None:
+    # Codex on crucible-trader-PR187: a 1% step on a $1m book under a $1,000
+    # per-order cap plans $1,000, so the budget rises by $1,000, not $10,000.
+    book = _book()
+    plan = _planner(order_cap=1_000.0)
+    assert plan(book) == []
+    stepped, outcome = apply_sign_of_life(book, plan)
+    (order,) = plan(stepped)
+    assert (order.decision.symbol, order.action, order.decision.quantity) == ("FFF", "BUY", 100)
+    assert outcome.order is not None
+    assert outcome.order.notional_usd == pytest.approx(1_000.0)
+    assert outcome.order.weight == pytest.approx(0.001)
+    assert book.turnover_budget is not None and stepped.turnover_budget is not None
+    assert (stepped.turnover_budget - book.turnover_budget) * NOTIONAL == pytest.approx(1_000.0)
+    assert stepped.turnover_one_way_ratio == pytest.approx(book.turnover_one_way_ratio + 0.001)
 
 
 def test_the_aim_weights_are_read_from_the_engines_diagnostics() -> None:

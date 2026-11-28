@@ -29,11 +29,19 @@ hard-risk ladder allows (``buy_multiplier`` times the room under the per-name
 cap, as `crucible.portfolio._name_caps` throttles it) and the cash above the
 sleeve.
 
+**The order is judged as the router will send it.** The router's order of the
+name is taken only when its side is the candidate's own (a sell step the
+router plans as a buy, because the held shares sit under the book's weight, is
+passed over), when -- for a buy -- that very order passes every buy check
+below at its own size, and when it trades no more than the rule sized.
+
 **What it never does.** It never buys a name the hard-risk layer forced out or
 locked out, a name the cut made ineligible, or a name with alpha below zero.
 It never takes a name past ``max_position_pct`` and never steps past the
-engine's own target. The book's turnover budget is raised by exactly that one
-order, and the order is refused if the book would otherwise exceed it.
+engine's own target. The book's turnover budget, and its recorded turnover,
+are raised by exactly that one order's planned notional (after the router's
+share floor and per-order cap), and the order is refused if the book would
+otherwise exceed it.
 
 **When nothing qualifies** it places nothing and says so: the
 ``sign_of_life_order`` metric is recorded ``unmeasurable`` with the reason, and
@@ -97,6 +105,7 @@ class SignOfLifeOrder:
 
     ticker: str
     side: Side
+    #: The book weight the router's order trades: its notional over the book.
     weight: float
     #: The router's planned order: its whole shares, and their notional at its price.
     shares: int
@@ -191,11 +200,17 @@ def _size(book: TargetBook, candidate: Candidate) -> tuple[float, str | None]:
     ticker = candidate.ticker
     if ticker not in book.weights:
         return 0.0, "not in the book's universe"
-    current = book.weights[ticker]
     notional = book.portfolio_notional_usd
     size = min(abs(candidate.step), max(_band(book), MIN_NOTIONAL_USD / notional))
     if candidate.step < 0:
-        return min(size, current), None
+        return min(size, book.weights[ticker]), None
+    limit, why = _buy_limit(book, ticker)
+    return (0.0, why) if why is not None else (min(size, limit), None)
+
+
+def _buy_limit(book: TargetBook, ticker: str) -> tuple[float, str | None]:
+    """The most of ``ticker`` (a weight) the rule may buy, or ``(0, why no buy qualifies)``."""
+    current = book.weights[ticker]
     decision = book.hard_risk
     if decision is not None and ticker in decision.forced:
         return 0.0, f"hard risk forced it out ({decision.forced[ticker]})"
@@ -213,7 +228,7 @@ def _size(book: TargetBook, candidate: Candidate) -> tuple[float, str | None]:
     cash = book.weights.get(_cash_ticker(book), 0.0) - sleeve
     if cash <= _DUST:
         return 0.0, "no cash above the sleeve"
-    return min(size, room, cash), None
+    return min(room, cash), None
 
 
 def _stepped(book: TargetBook, candidate: Candidate, size: float) -> TargetBook:
@@ -222,14 +237,46 @@ def _stepped(book: TargetBook, candidate: Candidate, size: float) -> TargetBook:
     weights = dict(book.weights)
     weights[candidate.ticker] += signed
     weights[_cash_ticker(book)] -= signed
+    return dataclasses.replace(book, weights=weights, unbanded=book.unbanded | {candidate.ticker})
+
+
+def _charged(book: TargetBook, weight: float) -> TargetBook:
+    """``book`` with its turnover and its budget both raised by ``weight``, the order taken."""
     budget = book.turnover_budget
     return dataclasses.replace(
         book,
-        weights=weights,
-        turnover_one_way_ratio=book.turnover_one_way_ratio + size,
-        turnover_budget=None if budget is None else budget + size,
-        unbanded=book.unbanded | {candidate.ticker},
+        turnover_one_way_ratio=book.turnover_one_way_ratio + weight,
+        turnover_budget=None if budget is None else budget + weight,
     )
+
+
+def _accepted(
+    book: TargetBook, candidate: Candidate, size: float, order: PlannedOrder
+) -> tuple[float, str | None]:
+    """The book weight the router's ``order`` trades, and why the rule refuses it (``None``: taken).
+
+    Judged on the order the router will really send, never on the step asked
+    for: a routed BUY passes every buy check again at its own size, whatever
+    the candidate's side; its side must be the candidate's; and it may trade
+    no more than the rule sized.
+    """
+    side = order.decision.side
+    wanted: Side = "buy" if candidate.step > 0 else "sell"
+    price = order.decision.decision_price
+    weight = int(order.decision.quantity) * price / book.portfolio_notional_usd
+    limit = size
+    if side == "buy":
+        room, why = _buy_limit(book, candidate.ticker)
+        if why is not None:
+            return weight, f"the router plans a buy of it, refused: {why}"
+        limit = min(limit, room)
+    if side != wanted:
+        return weight, f"the router plans a {side} of it, not the {wanted} its step asks for"
+    if weight > limit + _DUST:
+        return weight, (
+            f"the router's {side} is {weight:.4%} of the book, over the {limit:.4%} the rule sized"
+        )
+    return weight, None
 
 
 def _routed(plan: Planner, book: TargetBook, ticker: str) -> tuple[PlannedOrder | None, str | None]:
@@ -277,19 +324,21 @@ def apply_sign_of_life(book: TargetBook, plan: Planner) -> tuple[TargetBook, Sig
         size, why = _size(book, candidate)
         if why is None and size <= _DUST:
             why = "nothing left to trade"
-        stepped, routed = book, None
+        stepped, routed, weight = book, None, 0.0
         if why is None:
             stepped = _stepped(book, candidate, size)
             routed, why = _routed(plan, stepped, candidate.ticker)
-        if routed is None:
+        if routed is not None:
+            weight, why = _accepted(book, candidate, size, routed)
+        if routed is None or why is not None:
             refused.append(f"{candidate.ticker} {why}")
             continue
-        side: Side = "buy" if candidate.step > 0 else "sell"
+        side = routed.decision.side
         shares = int(routed.decision.quantity)
         order = SignOfLifeOrder(
             ticker=candidate.ticker,
             side=side,
-            weight=size,
+            weight=weight,
             shares=shares,
             notional_usd=shares * routed.decision.decision_price,
             source=candidate.source,
@@ -300,7 +349,9 @@ def apply_sign_of_life(book: TargetBook, plan: Planner) -> tuple[TargetBook, Sig
                 + (f"; passed over: {'; '.join(refused)}" if refused else "")
             ),
         )
-        return stepped, SignOfLifeOutcome("fired", order.reason, 0, order)
+        # The budget and the recorded turnover rise by the order as the router
+        # sized it (share floor, per-order cap), not by the step asked for.
+        return _charged(stepped, weight), SignOfLifeOutcome("fired", order.reason, 0, order)
     return book, SignOfLifeOutcome(
         "unmeasurable", "the plan has no order and no candidate qualified: " + "; ".join(refused), 0
     )
