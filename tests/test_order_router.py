@@ -498,6 +498,25 @@ def test_a_contract_ib_cannot_qualify_is_refused_at_send(store) -> None:
     assert ib.order_calls == []
 
 
+def test_the_batches_after_a_plan_are_priced_on_the_plans_prices(store) -> None:
+    # The sign-of-life rule judges `plan` (alpha-engine-config-I14646): the
+    # batches sent after it must be sized at the very prices it judged.
+    prices = iter([100.0, 90.0, 80.0])
+    asked: list[str] = []
+
+    def quote(symbol: str) -> float:
+        asked.append(symbol)
+        return next(prices)
+
+    router = _router(store, RoutingIB(), quote=quote)
+    (planned,) = router.plan(_book({"AAA": 0.1}))
+    ((sent,),) = router.batches(_book({"AAA": 0.1}))
+    assert sent.decision == planned.decision and sent.decision.decision_price == 100.0
+    assert asked == ["AAA"]
+    ((later,),) = router.batches(_book({"AAA": 0.1}))  # a fresh plan prices afresh
+    assert later.decision.decision_price == 90.0
+
+
 def test_a_book_for_another_day_is_refused(store) -> None:
     with pytest.raises(RoutingRefusedError, match="opened for"):
         _router(store, RoutingIB()).batches(_book(day="2026-09-09"))

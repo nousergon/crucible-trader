@@ -157,7 +157,11 @@ from crucible.slots.strategy import CASH_TICKER
 from crucible.store import Store
 
 from crucible_trader.broker_session import GatewayAddress, connect, load_sdk
-from crucible_trader.broker_statement import PAPER_ACCOUNT_PREFIX, IbPaperStatementSource
+from crucible_trader.broker_statement import (
+    PAPER_ACCOUNT_PREFIX,
+    BrokerStatement,
+    IbPaperStatementSource,
+)
 from crucible_trader.construction import SessionSizing, TargetBook
 from crucible_trader.entry_timing import (
     NYSE_ZONE,
@@ -709,12 +713,15 @@ def plan_orders(
         if delta == 0:
             continue
         notional = abs(delta) * price
-        if held > 0 and target > 0 and notional < band_usd:
+        if held > 0 and target > 0 and notional < band_usd and symbol not in book.unbanded:
             # A resize of a name held on both sides that is inside the
             # engine's own no-trade band. The band already held this weight;
             # what is left is the share floor moving with the quote between
             # valuing the book and sizing it (2026-11-13: NVDA 974 -> 973, a
-            # $160 sell). Entries and exits are never banded, as in the engine.
+            # $160 sell). Entries and exits are never banded, as in the engine,
+            # and neither is the day's one sign-of-life order
+            # (`crucible_trader.sign_of_life`), which is smaller than the band
+            # by construction.
             continue
         if notional > max_order_notional_usd:
             # Clipped to the cap, not refused: the cap bounds one order, and an
@@ -1137,6 +1144,8 @@ class PaperOrderRouter:
         self._live_quote = live_quote or quote
         self._fill_timeout_s = fill_timeout_s
         self._planned: tuple[PlannedOrder, ...] = ()
+        #: The prices :meth:`plan` read, which the next :meth:`batches` plans on.
+        self._plan_quote: _MemoQuote | None = None
         self._share_basis: ShareBasis | None = None
         self._avg_costs: dict[str, float] = {}
         self._records: list[ExecutionRecord] = []
@@ -1165,41 +1174,10 @@ class PaperOrderRouter:
         return SessionSizing(ceiling_usd=ceiling_usd, nav_usd=self._net_liquidation())
 
     def batches(self, book: TargetBook) -> Iterable[Sequence[Any]]:
-        if book.trading_day != self._day:
-            raise RoutingRefusedError(
-                f"the book is for {book.trading_day}; this router was opened for {self._day}"
-            )
-        # The chokepoint for live sizing: whatever built the book, it is never
-        # sized past the money the account holds (parity audit row 5).
-        nav = self._net_liquidation()
-        if book.portfolio_notional_usd > nav * (1 + _GROSS_TOLERANCE):
-            raise RiskCapExceededError(
-                f"the book is sized on ${book.portfolio_notional_usd:,.2f}, over the account's "
-                f"{NAV_TAG} ${nav:,.2f}: a live book is sized on min(declared notional, NAV)"
-            )
-        statement = IbPaperStatementSource(self._client).read_statement(self._day)
-        inherited = inherited_for(self._day)
-        # A held name the book dropped is this trader's to sell when its own
-        # filled orders still leave it shares (I13237: an intent alone is not a
-        # holding); only an undeclared name it never bought is foreign (I13164).
-        owned = bought_by_this_trader(
-            self._store,
-            set(statement.positions) - set(_tradable(book)) - inherited,
-            account=self._config.account,  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
-            before=self._day,
-        )
-        # Memoised: the timed path values the held book at the very prices it planned on.
-        quote = _MemoQuote(self._quote)
-        sells, buys = plan_orders(
-            book,
-            positions=statement.positions,
-            quote=quote,
-            clock=self._clock,
-            max_order_notional_usd=self._config.max_order_notional_usd,  # type: ignore[arg-type]
-            max_session_notional_usd=self._config.max_session_notional_usd,  # type: ignore[arg-type]
-            inherited=inherited,
-            owned=owned,
-        )
+        # Memoised: the timed path values the held book at the very prices it
+        # planned on, and those are the prices a :meth:`plan` before it read.
+        quote, self._plan_quote = self._plan_quote or _MemoQuote(self._quote), None
+        statement, inherited, owned, sells, buys = self._plan_orders(book, quote)
         # For the order book's share columns only (`order_book.ShareBasis`):
         # the positions and the memoised prices the plan above was sized at.
         self._share_basis = ShareBasis(
@@ -1207,6 +1185,7 @@ class PaperOrderRouter:
             prices=quote.priced(),
             band_usd=rebalance_band_usd(book),
             avg_costs=dict(self._avg_costs),
+            unbanded=book.unbanded,
         )
         gapped: frozenset[str] = frozenset()
         if self._config.gap_stop_pct is not None:
@@ -1235,6 +1214,65 @@ class PaperOrderRouter:
             book_cash=book_cash(book, statement.positions, quote=quote),
             urgent=urgent,
         )
+
+    def plan(self, book: TargetBook) -> tuple[PlannedOrder, ...]:
+        """The orders `plan_orders` sizes for ``book`` against the account. Sends nothing.
+
+        Asked before routing by the sign-of-life rule
+        (`crucible_trader.sign_of_life`), so it judges the router's own
+        whole-share sizing, band and caps. Every price it reads is kept, and the
+        next :meth:`batches` plans on those same prices: the order judged is
+        the order sent.
+        """
+        if self._plan_quote is None:
+            self._plan_quote = _MemoQuote(self._quote)
+        *_, sells, buys = self._plan_orders(book, self._plan_quote)
+        return sells + buys
+
+    def _plan_orders(
+        self, book: TargetBook, quote: _MemoQuote
+    ) -> tuple[
+        BrokerStatement,
+        frozenset[str],
+        frozenset[str],
+        tuple[PlannedOrder, ...],
+        tuple[PlannedOrder, ...],
+    ]:
+        """(statement, inherited, owned, sells, buys) for ``book``, priced on ``quote``."""
+        if book.trading_day != self._day:
+            raise RoutingRefusedError(
+                f"the book is for {book.trading_day}; this router was opened for {self._day}"
+            )
+        # The chokepoint for live sizing: whatever built the book, it is never
+        # sized past the money the account holds (parity audit row 5).
+        nav = self._net_liquidation()
+        if book.portfolio_notional_usd > nav * (1 + _GROSS_TOLERANCE):
+            raise RiskCapExceededError(
+                f"the book is sized on ${book.portfolio_notional_usd:,.2f}, over the account's "
+                f"{NAV_TAG} ${nav:,.2f}: a live book is sized on min(declared notional, NAV)"
+            )
+        statement = IbPaperStatementSource(self._client).read_statement(self._day)
+        inherited = inherited_for(self._day)
+        # A held name the book dropped is this trader's to sell when its own
+        # filled orders still leave it shares (I13237: an intent alone is not a
+        # holding); only an undeclared name it never bought is foreign (I13164).
+        owned = bought_by_this_trader(
+            self._store,
+            set(statement.positions) - set(_tradable(book)) - inherited,
+            account=self._config.account,  # pyright: ignore[reportArgumentType]  # __init__'s assert_paper refused a None account
+            before=self._day,
+        )
+        sells, buys = plan_orders(
+            book,
+            positions=statement.positions,
+            quote=quote,
+            clock=self._clock,
+            max_order_notional_usd=self._config.max_order_notional_usd,  # type: ignore[arg-type]
+            max_session_notional_usd=self._config.max_session_notional_usd,  # type: ignore[arg-type]
+            inherited=inherited,
+            owned=owned,
+        )
+        return statement, inherited, owned, sells, buys
 
     def _gap_stop(
         self,

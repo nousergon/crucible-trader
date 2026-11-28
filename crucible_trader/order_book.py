@@ -138,6 +138,8 @@ class ShareBasis:
     #: The broker's average cost per share held into the session (IB
     #: ``avgCost``, read for the hard-risk layer); empty when not read.
     avg_costs: Mapping[str, float] = field(default_factory=lambda: dict[str, float]())
+    #: Names the plan did not band (`TargetBook.unbanded`: the sign-of-life order).
+    unbanded: frozenset[str] = frozenset()
 
     def target_shares(self, symbol: str, weight: float, notional_usd: float) -> int | None:
         """``floor(weight * notional / price)``, as the plan sizes it; None unpriced.
@@ -152,7 +154,8 @@ class ShareBasis:
             return None
         target = math.floor(weight * notional_usd / price + _SHARE_EPSILON)
         held = int(self.positions.get(symbol, 0))
-        if held > 0 and target > 0 and abs(target - held) * price < self.band_usd:
+        banded = abs(target - held) * price < self.band_usd and symbol not in self.unbanded
+        if held > 0 and target > 0 and banded:
             return held
         return target
 

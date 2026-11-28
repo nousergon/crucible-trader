@@ -799,6 +799,37 @@ def _trades_check(f: CloseFacts) -> Check:
     return _ok(text)
 
 
+def _sign_of_life_check(f: CloseFacts) -> list[Check]:
+    """The day's sign-of-life order (alpha-engine-config-I14646), when the rule had to act.
+
+    Nothing when the session's own plan already had orders, or the run recorded
+    no such metric; a line naming the one order it added; a failure naming why
+    no candidate qualified, so a day with no order never reads as all clear.
+    """
+    for metric in _docs(f.run, "metrics"):
+        if metric.get("name") != "sign_of_life_order":
+            continue
+        block = _sub(metric, "sign_of_life_order")
+        if metric.get("status") == "unmeasurable":
+            return [
+                _fail(
+                    f"Sign-of-life order: none placed ({_plain(block.get('reason'))})",
+                    "no order today: the session showed no sign of life",
+                    "read the sign_of_life_order metric on the run and clear what blocked it.",
+                )
+            ]
+        order = _sub(block, "order")
+        if order:
+            return [
+                _ok(
+                    f"Sign-of-life order: {_plain(order.get('side'))} "
+                    f"{_plain(order.get('ticker'))} {_money(_num(order, 'notional_usd'))} "
+                    "(the plan had no other order)"
+                )
+            ]
+    return []
+
+
 def _timed_check(f: CloseFacts) -> Check:
     entries = _docs(f.watch, "entries")
     waiting = [_plain(e.get("symbol")) for e in entries if e.get("status") == "waiting"]
@@ -858,6 +889,7 @@ def close_checks(f: CloseFacts) -> list[Check]:
     return [
         _close_session_check(f),
         _trades_check(f),
+        *_sign_of_life_check(f),
         _timed_check(f),
         _broker_check(f),
         *_unreadable_checks(f.unreadable),

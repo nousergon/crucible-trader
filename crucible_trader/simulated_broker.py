@@ -515,6 +515,7 @@ class SimulatedFillRouter:
         #: The names the plan priced, for the order book's share columns.
         self._sized_names: frozenset[str] | None = None
         self._band_usd = 0.0
+        self._unbanded: frozenset[str] = frozenset()
         self._records: list[ExecutionRecord] = []
         self._opening, self._carried_from = opening_positions(store, trading_day)
         self._splits: list[dict[str, object]] | None = None
@@ -575,7 +576,9 @@ class SimulatedFillRouter:
     def records(self) -> tuple[ExecutionRecord, ...]:
         return tuple(self._records)
 
-    def batches(self, book: TargetBook) -> list[tuple[PlannedOrder, ...]]:
+    def _plan_orders(
+        self, book: TargetBook
+    ) -> tuple[tuple[PlannedOrder, ...], tuple[PlannedOrder, ...]]:
         if book.trading_day != self._day:
             raise RoutingRefusedError(
                 f"the book is for {book.trading_day}; this router was opened for {self._day}"
@@ -583,7 +586,7 @@ class SimulatedFillRouter:
         order_cap = self._config.max_order_notional_usd
         session_cap = self._config.max_session_notional_usd
         assert order_cap is not None and session_cap is not None  # __post_init__ refuses None
-        sells, buys = plan_orders(
+        return plan_orders(
             book,
             positions=self._opening,
             quote=self._closes,
@@ -591,8 +594,20 @@ class SimulatedFillRouter:
             max_order_notional_usd=order_cap,
             max_session_notional_usd=session_cap,
         )
+
+    def plan(self, book: TargetBook) -> tuple[PlannedOrder, ...]:
+        """The orders :meth:`batches` would plan for ``book``. Sends nothing.
+
+        Asked before routing by the sign-of-life rule (`crucible_trader.sign_of_life`).
+        """
+        sells, buys = self._plan_orders(book)
+        return sells + buys
+
+    def batches(self, book: TargetBook) -> list[tuple[PlannedOrder, ...]]:
+        sells, buys = self._plan_orders(book)
         self._planned = sells + buys
         self._band_usd = rebalance_band_usd(book)
+        self._unbanded = book.unbanded
         self._sized_names = frozenset(t for t, w in book.weights.items() if w > 0) | set(
             self._opening
         )
@@ -607,7 +622,12 @@ class SimulatedFillRouter:
         if self._sized_names is None:
             return None
         prices = {s: p for s in sorted(self._sized_names) if (p := self._closes(s)) is not None}
-        return ShareBasis(positions=dict(self._opening), prices=prices, band_usd=self._band_usd)
+        return ShareBasis(
+            positions=dict(self._opening),
+            prices=prices,
+            band_usd=self._band_usd,
+            unbanded=self._unbanded,
+        )
 
     def send(self, batch: Sequence[PlannedOrder]) -> None:
         for order in batch:

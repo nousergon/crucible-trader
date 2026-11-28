@@ -224,6 +224,16 @@ class TargetBook:
     #: and the console's optimizer page (:func:`optimizer_record`). ``None``
     #: from a test double.
     optimizer: dict[str, object] | None = None
+    #: The aim book the engine stepped toward, by ticker (the engine's
+    #: ``aim_weights`` diagnostic), or ``None`` when the aim adjustment is off
+    #: or the constructor does not carry it. Read by the sign-of-life rule
+    #: (`crucible_trader.sign_of_life`) to size a deferred entry's step.
+    aim_weights: dict[str, float] | None = None
+    #: Names the router must NOT hold inside the no-trade band: the one
+    #: sign-of-life order (`crucible_trader.sign_of_life`, alpha-engine-config-
+    #: I14646), whose step is by construction smaller than the band. Empty for
+    #: every book the engine alone built.
+    unbanded: frozenset[str] = frozenset()
 
 
 #: The diagnostics a session's turnover is attributed from. Copied verbatim;
@@ -711,4 +721,13 @@ def construct_target_book(
         sizing=sizing,
         hard_risk=decision,
         optimizer=optimizer_record(diagnostics, params),
+        aim_weights=_aim_weights(diagnostics),
     )
+
+
+def _aim_weights(diagnostics: Mapping[str, object]) -> dict[str, float] | None:
+    """The engine's ``aim_weights`` diagnostic as plain floats, or None when it recorded none."""
+    raw = diagnostics.get("aim_weights")
+    if not isinstance(raw, Mapping):
+        return None
+    return {str(t): float(w) for t, w in cast(Mapping[object, float], raw).items()}
